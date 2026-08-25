@@ -1,0 +1,24 @@
+[Unit]
+Description=tRPC Agent Service Redis
+After=network.target
+
+[Service]
+Type=notify
+User=trpcagent
+Group=trpcagent
+ExecStart=/usr/bin/redis-server /www/wwwroot/tx.nstarzx.cn/config/redis.conf --supervised systemd
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/www/wwwroot/tx.nstarzx.cn/data/redis
+ReadOnlyPaths=/www/wwwroot/tx.nstarzx.cn/config/redis.conf /www/wwwroot/tx.nstarzx.cn/secrets/redis.acl
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
