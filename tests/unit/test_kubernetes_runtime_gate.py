@@ -76,6 +76,93 @@ def test_image_transform_requires_immutable_reference_shape() -> None:
         _image_transform("registry.example/trpc-service")
 
 
+def test_production_image_contract_requires_registry_digest_references() -> None:
+    initial = "ghcr.io/acme/trpc-service@sha256:" + "a" * 64
+    upgrade = "ghcr.io/acme/trpc-service@sha256:" + "b" * 64
+    valid, reasons = runtime_gate._production_image_contract(initial, upgrade)
+    assert valid
+    assert reasons == ()
+
+    valid, reasons = runtime_gate._production_image_contract(
+        "trpc-service@sha256:" + "a" * 64,
+        upgrade,
+    )
+    assert not valid
+    assert any("registry-qualified" in reason for reason in reasons)
+
+    valid, reasons = runtime_gate._production_image_contract(
+        "ghcr.io/acme/trpc-service@sha256:abc",
+        upgrade,
+    )
+    assert not valid
+    assert any("registry-qualified" in reason for reason in reasons)
+
+    for invalid in (
+        "https://ghcr.io/acme/trpc-service@sha256:" + "a" * 64,
+        "registry.example:abc/acme/trpc-service@sha256:" + "a" * 64,
+        "ghcr.io@sha256:" + "a" * 64,
+    ):
+        valid, reasons = runtime_gate._production_image_contract(invalid, upgrade)
+        assert not valid
+        assert any("registry-qualified" in reason for reason in reasons)
+
+
+def test_rollback_probe_keeps_registry_and_uses_unavailable_digest() -> None:
+    image = "registry.internal:5000/team/trpc-service@sha256:" + "a" * 64
+    probe = runtime_gate._rollback_probe_image(image)
+    assert probe == (
+        "registry.internal:5000/team/trpc-service/__trpc_runtime_gate_failure__@sha256:"
+        + "0" * 64
+    )
+
+
+def test_failure_rollback_requires_failed_rollout_and_restores_known_good_image(
+    monkeypatch,
+) -> None:
+    kubectl_calls: list[list[str]] = []
+
+    def fake_kubectl(arguments, **_kwargs):
+        kubectl_calls.append(arguments)
+        return CommandResult(status="pass")
+
+    rollout_results = iter(
+        [
+            CommandResult(status="fail", reason="ImagePullBackOff"),
+            CommandResult(status="pass"),
+        ]
+    )
+    monkeypatch.setattr(runtime_gate, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(
+        runtime_gate,
+        "_rollout_deployment",
+        lambda *args, **kwargs: next(rollout_results),
+    )
+    known_good = ("sha256:" + "b" * 64,)
+    monkeypatch.setattr(
+        runtime_gate,
+        "_deployment_image_ids",
+        lambda *args, **kwargs: (CommandResult(status="pass"), known_good),
+    )
+
+    result, details = runtime_gate._failure_rollback(
+        "trpc-worker",
+        "worker",
+        "ghcr.io/acme/trpc-service@sha256:" + "b" * 64,
+        known_good,
+        namespace="runtime-gate",
+        context="prod",
+        timeout_seconds=60,
+    )
+
+    assert result.status == "pass"
+    assert details["failure_injected"] is True
+    assert details["failure_observed"] is True
+    assert details["undo_observed"] is True
+    assert details["readiness_recovered"] is True
+    assert [call[0] for call in kubectl_calls] == ["set", "rollout"]
+    assert kubectl_calls[0][3].startswith("worker=ghcr.io/acme/trpc-service/")
+
+
 def test_deployment_image_ids_normalise_common_cri_image_id_forms(monkeypatch) -> None:
     payload = {
         "items": [
@@ -524,6 +611,15 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
         "upgrade": deepcopy(upgrade_image_ids),
         "changed": {deployment: True for deployment in initial_image_ids},
     }
+    checks["rolling_upgrade"]["rollback"] = {
+        "status": "pass",
+        "deployment": "trpc-worker",
+        "failure_injected": True,
+        "failure_observed": True,
+        "undo_observed": True,
+        "readiness_recovered": True,
+        "restored_image_ids": deepcopy(upgrade_image_ids["trpc-worker"]),
+    }
     candidate = {
             "namespace": "isolated",
             "run_nonce": "a" * 32,
@@ -553,6 +649,12 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
     valid, reasons = _runtime_attestation_contract(candidate)
     assert valid
     assert reasons == ()
+
+    candidate_without_rollback = deepcopy(candidate)
+    candidate_without_rollback["checks"]["rolling_upgrade"].pop("rollback")
+    valid, reasons = _runtime_attestation_contract(candidate_without_rollback)
+    assert not valid
+    assert any("failure rollback" in reason for reason in reasons)
 
     candidate_with_stale_check = deepcopy(candidate)
     candidate_with_stale_check["checks"]["initial_image_ids"]["trpc-worker"] = [

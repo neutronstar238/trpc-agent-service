@@ -113,15 +113,15 @@ Kubernetes 控制面。真实运行态验收由 `scripts/kubernetes_runtime_gate
 ```bash
 export TRPC_K8S_RUNTIME_TESTS_ENABLED=true
 export TRPC_K8S_RUNTIME_CONTEXT=your-context
-export TRPC_K8S_RUNTIME_IMAGE=registry.example/trpc-agent-service@sha256:<64-hex-digest-a>
-export TRPC_K8S_RUNTIME_UPGRADE_IMAGE=registry.example/trpc-agent-service@sha256:<64-hex-digest-b>
+export TRPC_K8S_RUNTIME_IMAGE=<registry-host>/<org>/trpc-agent-service@sha256:<64-hex-digest-a>
+export TRPC_K8S_RUNTIME_UPGRADE_IMAGE=<registry-host>/<org>/trpc-agent-service@sha256:<64-hex-digest-b>
 export TRPC_K8S_RUNTIME_SECRET_MANIFEST=/secure/trpc-runtime-secrets.yaml
 export TRPC_K8S_RUNTIME_HPA_DRIVER=E:/trpc-agent-service/scripts/kubernetes_hpa_load_driver.py
 export TRPC_K8S_RUNTIME_HPA_DRIVER_SHA256=<64-hex-sha256-of-driver>
 export TRPC_K8S_RUNTIME_HPA_DRIVER_KUBECONFIG=/secure/hpa-driver-kubeconfig
 export TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT=system:serviceaccount:runtime-gate:hpa-driver
 export TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT=dedicated-driver-context
-export TRPC_K8S_RUNTIME_HPA_JOB_IMAGE=registry.example/trpc-hpa-backlog@sha256:<64-hex-digest>
+export TRPC_K8S_RUNTIME_HPA_JOB_IMAGE=<registry-host>/<org>/trpc-hpa-backlog@sha256:<64-hex-digest>
 export TRPC_K8S_RUNTIME_HPA_JOB_COMMAND='["python","-m","your_bounded_backlog_probe"]'
 export TRPC_K8S_RUNTIME_NODE_NAME=dedicated-runtime-node
 export TRPC_K8S_RUNTIME_NODE_LABEL=trpc-runtime-gate=dedicated-gate
@@ -133,8 +133,9 @@ python scripts/kubernetes_runtime_gate.py --timeout-seconds 900 --require-runtim
 
 PowerShell 等价写法是 `$env:TRPC_K8S_RUNTIME_TESTS_ENABLED = "true"`。Secret 清单必须由外部
 Secret 管理系统生成，至少包含 `trpc-service-secrets` 和 `trpc-migration-secrets`；文件内容不会被
-写入报告、日志或命令输出。镜像必须带不同的不可变 sha256 digest；tag-only、example/replace
-占位镜像会被拒绝，升级镜像必须是可拉取的不同 digest。
+写入报告、日志或命令输出。生产镜像必须带 registry host 的完整
+`registry/repository@sha256:<64-hex-digest>` 引用；本地 Docker image ID、未限定名、tag-only、
+example/replace 占位镜像会被拒绝，升级镜像必须是可拉取的不同 digest。
 
 运行器会先执行 server-side dry-run，然后在随机的 `trpc-runtime-gate-*` namespace 中部署生产
 overlay，检查所有 Deployment readiness、滚动升级、worker 扩容、HPA `AbleToScale=True`、
@@ -144,7 +145,9 @@ namespace-scoped Pod Eviction/PDB 恢复、专用节点 cordon/drain/uncordon �
 成功失败都删除该 namespace。节点 drain 只允许在显式标签、全量 Pod inventory 和二次 cordon 后
 preflight 均证明专用的节点上执行；该测试允许删除这些生产 Pod 的临时 `/tmp` `emptyDir` 数据，
 不会触碰其他 namespace 的工作负载。`--require-runtime` 用于发布门禁；未设置 opt-in 或缺少集群、权限、镜像、Secret
-时，报告为 `gate=not_run` 并返回非零。默认本地调用对这种未请求的 `not_run` 返回零，避免离线开发
+时，报告为 `gate=not_run` 并返回非零。运行器还会在隔离 namespace 中用一个不可用的 registry
+digest 注入一次失败 rollout，要求 `rollout undo` 后 readiness 和已知良好 digest 恢复，再继续
+Pod 驱逐与节点 drain。默认本地调用对这种未请求的 `not_run` 返回零，避免离线开发
 误触发集群操作。
 
 HPA 负载触发器必须是当前 checkout `scripts/` 目录下的绝对路径、非符号链接 Python 文件；默认驱动

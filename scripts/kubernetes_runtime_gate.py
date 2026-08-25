@@ -77,6 +77,9 @@ OVERLAY_ROOT = ROOT / "deploy" / "kustomize" / "overlays" / "production"
 BASE_ROOT = ROOT / "deploy" / "kustomize" / "base"
 PRODUCER = "scripts.kubernetes_runtime_gate"
 IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-fA-F]{64}")
+_IMAGE_REFERENCE_RE = re.compile(
+    r"^(?P<name>[^@\s]+)@(?P<digest>sha256:[0-9a-fA-F]{64})$"
+)
 # Kubernetes/CRI implementations expose ``imageID`` in more than one
 # equivalent form (for example ``docker-pullable://repo@sha256:...`` or
 # ``containerd://sha256:...``).  The release evidence deliberately retains
@@ -106,6 +109,8 @@ RELEASE_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{32,256}")
 MAX_TIMEOUT_SECONDS = 3600.0
 HPA_DRIVER_PHASES = frozenset({"load", "clear"})
 HPA_DRIVER_MAX_BYTES = 1024 * 1024
+_ROLLBACK_PROBE_TIMEOUT_SECONDS = 120.0
+_ROLLBACK_PROBE_DEPLOYMENT = "trpc-worker"
 HPA_DRIVER_SCRIPT = ROOT / "scripts" / "kubernetes_hpa_load_driver.py"
 HPA_DRIVER_OWNER_LABEL = "trpc.io/hpa-gate"
 HPA_DRIVER_OWNER_VALUE = "bounded-job-driver"
@@ -361,21 +366,57 @@ def _image_transform(image: str) -> dict[str, str]:
     return {"newName": image[:colon], "newTag": image[colon + 1 :]}
 
 
+def _registry_digest_reference(image: str) -> tuple[str, str] | None:
+    """Return a registry-qualified immutable image reference.
+
+    Kubernetes accepts an unqualified image name and resolves it through a
+    default registry. That is not sufficient for production evidence: the
+    exact registry and content digest must be visible in the rendered
+    Deployment. A registry host is identified by the same syntax used by
+    OCI/Docker references (a dot, a port, or the literal ``localhost`` in
+    the first path component).
+    """
+
+    match = _IMAGE_REFERENCE_RE.fullmatch(image.strip())
+    if match is None:
+        return None
+    name = match.group("name")
+    if name != name.lower() or "://" in name or "/" not in name:
+        return None
+    first_component, repository_path = name.split("/", 1)
+    if not repository_path or ":" in repository_path:
+        return None
+    host = first_component
+    has_port = ":" in first_component
+    if has_port:
+        host, port = first_component.rsplit(":", 1)
+        if not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
+            return None
+    if not (
+        host == "localhost"
+        or "." in host
+        or has_port
+    ):
+        return None
+    return name, match.group("digest").lower()
+
+
 def _production_image_contract(image: str, upgrade_image: str) -> tuple[bool, tuple[str, ...]]:
-    """Require two distinct immutable, non-example production image refs."""
+    """Require two distinct registry-qualified immutable production refs."""
 
     reasons: list[str] = []
     values = (image.strip(), upgrade_image.strip())
     digests: list[str] = []
     for label, value in zip(("initial", "upgrade"), values, strict=True):
-        if "@sha256:" not in value:
-            reasons.append(f"{label} runtime image must use a sha256 digest")
+        parsed = _registry_digest_reference(value)
+        if parsed is None:
+            reasons.append(
+                f"{label} runtime image must use a registry-qualified "
+                "name@sha256:<64-hex-digest> reference"
+            )
             continue
-        name, digest = value.split("@", 1)
-        if not name or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
-            reasons.append(f"{label} runtime image digest is malformed")
-        else:
-            digests.append(digest.lower())
+        name, digest = parsed
+        digests.append(digest)
         if any(token in name.lower() for token in ("example", "replace", "latest")):
             reasons.append(f"{label} runtime image uses a placeholder registry/reference")
     if values[0] == values[1] or (len(digests) == 2 and digests[0] == digests[1]):
@@ -1585,8 +1626,12 @@ def _production_render_contract(
         containers = pod_spec.get("containers", []) if isinstance(pod_spec, Mapping) else []
         for container in containers if isinstance(containers, list) else ():
             image = container.get("image") if isinstance(container, Mapping) else None
-            if not allow_local_images and (not isinstance(image, str) or "@sha256:" not in image):
-                reasons.append("production Deployment image is not digest-pinned")
+            if not allow_local_images:
+                if not isinstance(image, str) or _registry_digest_reference(image) is None:
+                    reasons.append(
+                        "production Deployment image is not a registry-qualified "
+                        "name@sha256:<64-hex-digest> reference"
+                    )
     if allow_local_images:
         reasons = [reason for reason in reasons if "placeholder" not in reason]
     return not reasons, tuple(dict.fromkeys(reasons))
@@ -1743,6 +1788,11 @@ def _report(
                 "metric": "trpc_session_ready_backlog",
                 "manual_scale_is_not_evidence": True,
                 "required_phases": ["before", "during", "after"],
+            },
+            "rollback_policy": {
+                "deployment": _ROLLBACK_PROBE_DEPLOYMENT,
+                "failure_image_is_registry_local_and_unavailable": True,
+                "requires_failed_rollout_undo_and_ready_recovery": True,
             },
             "static_manifest_checks_do_not_upgrade_runtime_gate": True,
         },
@@ -2010,6 +2060,33 @@ def _runtime_attestation_contract(
         )
         if not image_ok:
             reasons.extend(image_reasons)
+    rolling = checks.get("rolling_upgrade")
+    rollback = rolling.get("rollback") if isinstance(rolling, Mapping) else None
+    if not isinstance(rollback, Mapping) or rollback.get("status") != "pass":
+        reasons.append("rolling upgrade failure rollback was not observed")
+    else:
+        if rollback.get("deployment") != _ROLLBACK_PROBE_DEPLOYMENT:
+            reasons.append("rolling upgrade rollback probe deployment is invalid")
+        for field in (
+            "failure_injected",
+            "failure_observed",
+            "undo_observed",
+            "readiness_recovered",
+        ):
+            if rollback.get(field) is not True:
+                reasons.append(f"rolling upgrade rollback {field} was not observed")
+        restored = rollback.get("restored_image_ids")
+        expected_upgrade = None
+        if isinstance(rolling, Mapping):
+            rolling_images = rolling.get("image_ids")
+            if isinstance(rolling_images, Mapping):
+                upgrade = rolling_images.get("upgrade")
+                if isinstance(upgrade, Mapping):
+                    expected_upgrade = upgrade.get(_ROLLBACK_PROBE_DEPLOYMENT)
+        if not isinstance(restored, list) or restored != expected_upgrade:
+            reasons.append(
+                "rolling upgrade rollback did not restore the known-good worker image IDs"
+            )
     return not reasons, tuple(dict.fromkeys(reasons))
 
 
@@ -3554,6 +3631,152 @@ def _wait_for_deployment_image_ids(
     return CommandResult(status="fail", reason=last_reason), (), poll_count
 
 
+def _rollback_probe_image(image: str) -> str:
+    """Derive an intentionally unavailable image in the same registry.
+
+    The failure probe is used only inside the disposable acceptance namespace.
+    Keeping the registry host and changing the repository path avoids testing
+    a second registry while the all-zero digest makes accidental reuse of a
+    real release image infeasible.
+    """
+
+    parsed = _registry_digest_reference(image)
+    repository = parsed[0] if parsed is not None else image.split("@", 1)[0].strip()
+    slash = repository.rfind("/")
+    colon = repository.rfind(":")
+    if colon > slash:
+        repository = repository[:colon]
+    return f"{repository}/__trpc_runtime_gate_failure__@sha256:{'0' * 64}"
+
+
+def _failure_rollback(
+    deployment: str,
+    container: str,
+    known_good_image: str,
+    known_good_image_ids: tuple[str, ...],
+    *,
+    namespace: str,
+    context: str | None,
+    timeout_seconds: float,
+) -> tuple[CommandResult, dict[str, Any]]:
+    """Prove a failed rollout is recoverable in the isolated namespace.
+
+    The gate first points one representative worker Deployment at a
+    deliberately unavailable immutable image and requires rollout status to
+    fail. It then invokes the controller's own ``rollout undo`` and requires
+    both readiness and the previously observed image digest to return. The
+    probe is bounded so a broken registry cannot turn the acceptance into an
+    unbounded wait.
+    """
+
+    probe_image = _rollback_probe_image(known_good_image)
+    probe_timeout = min(timeout_seconds, _ROLLBACK_PROBE_TIMEOUT_SECONDS)
+    details: dict[str, Any] = {
+        "deployment": deployment,
+        "failure_injected": False,
+        "failure_observed": False,
+        "undo_observed": False,
+        "readiness_recovered": False,
+        "restored_image_ids": [],
+    }
+    set_failed = _kubectl(
+        [
+            "set",
+            "image",
+            f"deployment/{deployment}",
+            f"{container}={probe_image}",
+            "--namespace",
+            namespace,
+        ],
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["failure_injection"] = _result_payload(set_failed)
+    details["failure_injected"] = set_failed.status == "pass"
+    if set_failed.status != "pass":
+        return (
+            CommandResult(
+                status="fail",
+                reason=set_failed.reason or "rollback failure image could not be applied",
+            ),
+            details,
+        )
+
+    failed_rollout = _rollout_deployment(
+        deployment,
+        namespace=namespace,
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["failed_rollout"] = _result_payload(failed_rollout)
+    details["failure_observed"] = failed_rollout.status != "pass"
+    if not details["failure_observed"]:
+        return (
+            CommandResult(
+                status="fail",
+                reason="injected failure rollout unexpectedly became ready",
+            ),
+            details,
+        )
+
+    undo = _kubectl(
+        [
+            "rollout",
+            "undo",
+            f"deployment/{deployment}",
+            "--namespace",
+            namespace,
+        ],
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["undo"] = _result_payload(undo)
+    details["undo_observed"] = undo.status == "pass"
+    if undo.status != "pass":
+        return (
+            CommandResult(status="fail", reason=undo.reason or "rollout undo failed"),
+            details,
+        )
+
+    recovered_rollout = _rollout_deployment(
+        deployment,
+        namespace=namespace,
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["rollback_rollout"] = _result_payload(recovered_rollout)
+    if recovered_rollout.status != "pass":
+        return (
+            CommandResult(
+                status="fail",
+                reason=recovered_rollout.reason or "rollback rollout did not become ready",
+            ),
+            details,
+        )
+
+    image_result, restored_image_ids = _deployment_image_ids(
+        deployment,
+        namespace=namespace,
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["restored_image_ids"] = list(restored_image_ids)
+    details["readiness_recovered"] = (
+        image_result.status == "pass"
+        and restored_image_ids == tuple(sorted(set(known_good_image_ids)))
+    )
+    details["restored_image_read"] = _result_payload(image_result)
+    if not details["readiness_recovered"]:
+        return (
+            CommandResult(
+                status="fail",
+                reason="rollback readiness did not restore the known-good immutable image",
+            ),
+            details,
+        )
+    return CommandResult(status="pass"), details
+
+
 def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> dict[str, Any]:
     """Derive a one-shot schema-head Job from the rendered migration Job.
 
@@ -4533,6 +4756,27 @@ def _run_live_once(
             checks["rolling_upgrade"]["status"] = "fail"
             reasons.append(
                 "rolling upgrade did not converge every deployment to one new immutable image ID"
+            )
+            return 1 if require_runtime else 0
+
+        rollback_result, rollback_details = _failure_rollback(
+            _ROLLBACK_PROBE_DEPLOYMENT,
+            dict(DEPLOYMENTS)[_ROLLBACK_PROBE_DEPLOYMENT],
+            upgrade_image,
+            upgraded_image_ids[_ROLLBACK_PROBE_DEPLOYMENT],
+            namespace=namespace,
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        checks["rolling_upgrade"]["rollback"] = {
+            "status": rollback_result.status,
+            **rollback_details,
+        }
+        if rollback_result.status != "pass":
+            checks["rolling_upgrade"]["status"] = "fail"
+            reasons.append(
+                rollback_result.reason
+                or "failed rollout did not recover through controller rollback"
             )
             return 1 if require_runtime else 0
 

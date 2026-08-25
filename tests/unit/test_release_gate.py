@@ -1610,6 +1610,15 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "upgrade": upgrade,
             "changed": {name: True for name in initial},
         },
+        "rollback": {
+            "status": "pass",
+            "deployment": "trpc-worker",
+            "failure_injected": True,
+            "failure_observed": True,
+            "undo_observed": True,
+            "readiness_recovered": True,
+            "restored_image_ids": upgrade["trpc-worker"],
+        },
     }
     checks["initial_image_ids"] = initial
     candidate = {
