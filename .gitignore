@@ -1,8 +1,14 @@
 .idea
 .vscode
 .DS_Store
-*.lock
 *.log
+.env
+.env.*
+!.env.example
+*.env
+*.kubeconfig
+*.crt
+*.tar
 
 *.egg-info
 
@@ -14,10 +20,14 @@ venv*
 __pycache__
 
 .coverage
+.coverage*
 htmlcov
 cov.tmp
 coverage.xml
 .pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
 
 node_modules
 package-lock.json
@@ -25,3 +35,22 @@ pyrightconfig.json
 
 # spec-workflow tool artifacts
 .spec-workflow
+
+# Generated verification artifacts. Keep only reusable acceptance wrappers;
+# reports, child evidence, local registries, kubeconfigs, coverage, and image
+# archives must never enter repository history.
+/runs/**
+!/runs/multitenant/
+!/runs/multitenant/run-final-fault-gate.ps1
+!/runs/multitenant/run-final-runtime-gates.ps1
+!/runs/multitenant/fault-runtime-health.override.yml
+!/runs/multitenant/performance-health.override.yml
+!/runs/multitenant/runtime-delay-0_5.override.yml
+!/runs/multitenant/runtime-delay-3.override.yml
+
+# Kind gate work directories are generated beside the repository root.
+/trpc-k8s-gate-*/
+
+# yqzl runtime.env is host-specific service configuration.  Keep only the
+# reviewed, secret-free example in version control.
+/deploy/yqzl/runtime.env
