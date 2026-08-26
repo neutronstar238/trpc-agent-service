@@ -111,8 +111,10 @@ fault-stage 项目同名；`trpc-perf-*` 性能项目也不能直接作为 `real
 
 下面的顺序从空闲本机创建一个正常 Toxiproxy 项目和一个 fault-stage 项目。端口明确
 分开：正常项目使用 35432/36379/39000/39001，fault-stage 项目使用
-45432/46379/49000/49001；正常项目的 Toxiproxy 代理监听仍是基础 Compose 固定的
-15432/16379/19000，`TOXIPROXY_API_PORT` 使用 38474。若这些端口已被其他项目占用，
+45432/46379/49000/49001；正常项目的 Toxiproxy 代理容器监听仍是
+15432/16379/19000，宿主机映射分别由 `TOXIPROXY_POSTGRES_PORT`、
+`TOXIPROXY_REDIS_PORT`、`TOXIPROXY_S3_PORT` 配置，API 映射由
+`TOXIPROXY_API_PORT` 配置。若这些端口已被其他项目占用，
 先停止那个项目并保留其卷；不要把两个验收项目映射到同一宿主机端口。
 
 ```powershell

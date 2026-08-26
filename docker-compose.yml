@@ -424,9 +424,9 @@ services:
       - ./deploy/toxiproxy.json:/config/toxiproxy.json:ro
     ports:
       - "127.0.0.1:${TOXIPROXY_API_PORT:-8474}:8474"
-      - "127.0.0.1:15432:15432"
-      - "127.0.0.1:16379:16379"
-      - "127.0.0.1:19000:19000"
+      - "127.0.0.1:${TOXIPROXY_POSTGRES_PORT:-15432}:15432"
+      - "127.0.0.1:${TOXIPROXY_REDIS_PORT:-16379}:16379"
+      - "127.0.0.1:${TOXIPROXY_S3_PORT:-19000}:19000"
     depends_on:
       postgres:
         condition: service_healthy

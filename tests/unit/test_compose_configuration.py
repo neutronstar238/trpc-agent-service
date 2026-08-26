@@ -371,6 +371,12 @@ def test_fault_runtime_routes_and_attests_session_recovery() -> None:
         "http://127.0.0.1:8474",
         "list",
     ]
+    assert compose["services"]["toxiproxy"]["ports"] == [
+        "127.0.0.1:${TOXIPROXY_API_PORT:-8474}:8474",
+        "127.0.0.1:${TOXIPROXY_POSTGRES_PORT:-15432}:15432",
+        "127.0.0.1:${TOXIPROXY_REDIS_PORT:-16379}:16379",
+        "127.0.0.1:${TOXIPROXY_S3_PORT:-19000}:19000",
+    ]
 
 
 def test_kustomize_session_recovery_uses_only_database_secret() -> None:
