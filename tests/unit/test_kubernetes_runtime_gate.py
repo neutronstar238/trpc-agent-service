@@ -138,11 +138,18 @@ def test_failure_rollback_requires_failed_rollout_and_restores_known_good_image(
         lambda *args, **kwargs: next(rollout_results),
     )
     known_good = ("sha256:" + "b" * 64,)
+    image_observations = iter(
+        [
+            (CommandResult(status="fail", reason="terminating rollback pod"), ()),
+            (CommandResult(status="pass"), known_good),
+        ]
+    )
     monkeypatch.setattr(
         runtime_gate,
         "_deployment_image_ids",
-        lambda *args, **kwargs: (CommandResult(status="pass"), known_good),
+        lambda *args, **kwargs: next(image_observations),
     )
+    monkeypatch.setattr(runtime_gate.time, "sleep", lambda _seconds: None)
 
     result, details = runtime_gate._failure_rollback(
         "trpc-worker",
@@ -159,6 +166,7 @@ def test_failure_rollback_requires_failed_rollout_and_restores_known_good_image(
     assert details["failure_observed"] is True
     assert details["undo_observed"] is True
     assert details["readiness_recovered"] is True
+    assert details["rollback_image_poll_count"] == 2
     assert [call[0] for call in kubectl_calls] == ["set", "rollout"]
     assert kubectl_calls[0][3].startswith("worker=ghcr.io/acme/trpc-service/")
 

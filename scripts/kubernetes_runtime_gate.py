@@ -3754,12 +3754,13 @@ def _failure_rollback(
             details,
         )
 
-    image_result, restored_image_ids = _deployment_image_ids(
+    image_result, restored_image_ids, image_poll_count = _wait_for_deployment_image_ids(
         deployment,
         namespace=namespace,
         context=context,
         timeout_seconds=probe_timeout,
     )
+    details["rollback_image_poll_count"] = image_poll_count
     details["restored_image_ids"] = list(restored_image_ids)
     details["readiness_recovered"] = (
         image_result.status == "pass"
