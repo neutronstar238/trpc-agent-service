@@ -455,6 +455,7 @@ K8S_REQUIRED_CHECKS = (
     "kube_context",
     "kustomize_render",
     "production_manifest_contract",
+    "image_pull_secret_contract",
     "namespace_create",
     "server_side_dry_run",
     "manifest_contract",

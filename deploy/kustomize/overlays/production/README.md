@@ -15,6 +15,23 @@ least:
 - `TRPC_SERVICE_OIDC_ISSUER`
 - `TRPC_SERVICE_OIDC_AUDIENCE`
 
+For a private image registry, include one additional Secret of type
+`kubernetes.io/dockerconfigjson` in the same external Secret manifest. Keep
+its `metadata.namespace` unset so the acceptance gate can bind it to its
+disposable namespace, and set the non-sensitive
+`TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET` value to that Secret's name. The gate
+validates only kind/name/namespace/type metadata before any server-side
+dry-run, injects the reference into the migration Job and all Deployments,
+and passes the same name to the bounded HPA load Job. Registry credentials are
+never copied into the evidence report.
+
+For a direct Kustomize deployment outside the runtime gate, copy
+`image-pull-secret-patch.example.yaml` into the environment-specific overlay,
+replace the placeholder with the same Secret name, and target both
+`Deployment` and `Job` resources from that overlay's `kustomization.yaml`.
+The example patch is deliberately not enabled by default, so public-registry
+deployments do not contain a hard-coded pull Secret name.
+
 The worker Secret must also provide `TRPC_SERVICE_WORKER_DATABASE_DSN`,
 `TRPC_SERVICE_WORKER_DATABASE_DSN_REF`,
 `TRPC_SERVICE_WORKER_DATABASE_PASSWORD`, and

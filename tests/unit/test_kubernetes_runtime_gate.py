@@ -319,6 +319,108 @@ def test_generated_overlay_pins_runtime_pods_to_controlled_label(tmp_path) -> No
     assert 'trpc-runtime-gate: "acceptance"' in patch
 
 
+def test_generated_overlay_configures_private_registry_for_deployments_and_jobs(
+    tmp_path,
+) -> None:
+    path = _write_overlay(
+        tmp_path,
+        namespace="trpc-runtime-gate-test",
+        image="registry.example/trpc-service:test",
+        image_pull_secret="ghcr-pull",
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.count("path: image-pull-secret-patch.yaml") == 2
+    assert "kind: Deployment" in rendered
+    assert "kind: Job" in rendered
+    patch = yaml.safe_load(
+        (tmp_path / "image-pull-secret-patch.yaml").read_text(encoding="utf-8")
+    )
+    assert patch == [
+        {
+            "op": "add",
+            "path": "/spec/template/spec/imagePullSecrets",
+            "value": [{"name": "ghcr-pull"}],
+        }
+    ]
+
+
+def test_generated_overlay_rejects_invalid_image_pull_secret_name(tmp_path) -> None:
+    with pytest.raises(ValueError, match="image pull Secret name is invalid"):
+        _write_overlay(
+            tmp_path,
+            namespace="trpc-runtime-gate-test",
+            image="registry.example/trpc-service:test",
+            image_pull_secret="registry/secret",
+        )
+
+
+def test_image_pull_secret_metadata_contract_reports_metadata_only(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_kubectl(arguments, **_kwargs):
+        calls.append(arguments)
+        return CommandResult(
+            status="pass",
+            stdout=(
+                "Secret\ttrpc-service-secrets\t\tOpaque\n"
+                "Secret\tghcr-pull\t\tkubernetes.io/dockerconfigjson\n"
+            ),
+        )
+
+    monkeypatch.setattr(runtime_gate, "_kubectl", fake_kubectl)
+    result = runtime_gate._image_pull_secret_metadata_contract(
+        "C:/secure/runtime-secrets.yaml",
+        "ghcr-pull",
+        namespace="runtime-gate",
+        context="prod",
+        timeout_seconds=30,
+    )
+
+    assert result.status == "pass"
+    assert result.evidence == {
+        "configured": True,
+        "secret_name": "ghcr-pull",
+        "secret_type": "kubernetes.io/dockerconfigjson",
+        "namespace_bound": False,
+    }
+    report_payload = runtime_gate._result_payload(result)
+    assert "stdout" not in report_payload
+    assert "data" not in report_payload
+    assert "stringData" not in report_payload
+    assert calls[0][:2] == ["create", "--dry-run=client"]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "reason"),
+    [
+        ("Secret\tother\t\tkubernetes.io/dockerconfigjson\n", "exactly one"),
+        ("Secret\tghcr-pull\t\tOpaque\n", "dockerconfigjson"),
+        (
+            "Secret\tghcr-pull\tother\tkubernetes.io/dockerconfigjson\n",
+            "different namespace",
+        ),
+    ],
+)
+def test_image_pull_secret_metadata_contract_fails_closed(
+    monkeypatch, stdout, reason
+) -> None:
+    monkeypatch.setattr(
+        runtime_gate,
+        "_kubectl",
+        lambda *_args, **_kwargs: CommandResult(status="pass", stdout=stdout),
+    )
+    result = runtime_gate._image_pull_secret_metadata_contract(
+        "C:/secure/runtime-secrets.yaml",
+        "ghcr-pull",
+        namespace="runtime-gate",
+        context="prod",
+        timeout_seconds=30,
+    )
+    assert result.status == "fail"
+    assert reason in result.reason
+
+
 def test_generated_kind_overlay_uses_bounded_local_capacity(tmp_path) -> None:
     path = _write_overlay(
         tmp_path,
@@ -429,6 +531,95 @@ def test_live_gate_requires_opt_in(monkeypatch, tmp_path) -> None:
     assert report["production_gate"] == "not_run"
 
 
+def test_config_preflight_failure_stops_before_live_gate(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "kubernetes-runtime.json"
+    preflight_output = tmp_path / "deployment-preflight.json"
+
+    def unexpected_live_gate(**_kwargs):
+        raise AssertionError("live gate must not run after configuration preflight failure")
+
+    monkeypatch.setattr(runtime_gate, "_run_live", unexpected_live_gate)
+
+    assert (
+        runtime_gate.main(
+            [
+                "--config",
+                str(tmp_path / "missing-runtime-gate.yaml"),
+                "--preflight-output",
+                str(preflight_output),
+                "--output",
+                str(output),
+                "--require-runtime",
+            ]
+        )
+        == 1
+    )
+    preflight = json.loads(preflight_output.read_text(encoding="utf-8"))
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert preflight["gate"] == "fail"
+    assert report["gate"] == "not_run"
+    assert report["candidate"]["checks"]["configuration_preflight"]["status"] == "fail"
+
+
+def test_config_projects_context_and_timeout_once_before_live_gate(
+    monkeypatch, tmp_path
+) -> None:
+    output = tmp_path / "kubernetes-runtime.json"
+    preflight_output = tmp_path / "deployment-preflight.json"
+    calls: list[dict[str, object]] = []
+    projected = {
+        "TRPC_K8S_RUNTIME_TESTS_ENABLED": "true",
+        "TRPC_K8S_RUNTIME_CONTEXT": "config-context",
+        "TRPC_K8S_RUNTIME_TIMEOUT_SECONDS": "123",
+    }
+
+    monkeypatch.setattr(
+        runtime_gate,
+        "build_preflight",
+        lambda *_args, **_kwargs: (
+            {"gate": "pass", "rejection_reasons": [], "checks": []},
+            projected,
+        ),
+    )
+
+    def fake_live_gate(**kwargs):
+        calls.append(kwargs)
+        output.write_text('{"gate":"pass"}\n', encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runtime_gate, "_run_live", fake_live_gate)
+
+    assert (
+        runtime_gate.main(
+            [
+                "--config",
+                str(tmp_path / "runtime-gate.yaml"),
+                "--preflight-output",
+                str(preflight_output),
+                "--output",
+                str(output),
+                "--require-runtime",
+            ]
+        )
+        == 0
+    )
+    assert len(calls) == 1
+    assert calls[0]["context"] == "config-context"
+    assert calls[0]["timeout_seconds"] == 123.0
+
+
+def test_config_rejects_duplicate_cli_context(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        runtime_gate.main(
+            [
+                "--config",
+                str(tmp_path / "runtime-gate.yaml"),
+                "--context",
+                "other-context",
+            ]
+        )
+
+
 def test_required_runtime_checks_include_schema_migration(tmp_path) -> None:
     from scripts.kubernetes_runtime_gate import _report
 
@@ -469,6 +660,15 @@ def test_kind_prerequisites_can_skip_production_release_binding(monkeypatch) -> 
     )
 
     assert not any("TRPC_RELEASE_" in reason for reason in missing)
+
+
+def test_runtime_prerequisites_reject_invalid_image_pull_secret(monkeypatch) -> None:
+    monkeypatch.setenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "registry/secret")
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=True,
+        require_release_binding=False,
+    )
+    assert "TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET is invalid" in missing
 
 
 def test_runtime_report_rejects_symlink_output(tmp_path) -> None:
@@ -1449,6 +1649,7 @@ def test_hpa_driver_cannot_supply_evidence_file(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("TMP", raising=False)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-inherit")
     monkeypatch.setenv("TRPC_SERVICE_DATABASE_DSN", "postgresql://secret")
+    monkeypatch.setenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "ghcr-pull")
 
     def fake_run(command, **kwargs):
         captured["command"] = command
@@ -1513,10 +1714,12 @@ def test_hpa_driver_cannot_supply_evidence_file(monkeypatch, tmp_path) -> None:
         "TRPC_K8S_HPA_DRIVER_SUBJECT",
         "TRPC_K8S_HPA_DRIVER_JOB_IMAGE",
         "TRPC_K8S_HPA_DRIVER_JOB_COMMAND",
+        "TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET",
     }
     assert "TMP" not in environment
     assert "AWS_SECRET_ACCESS_KEY" not in environment
     assert "TRPC_SERVICE_DATABASE_DSN" not in environment
+    assert environment["TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET"] == "ghcr-pull"
 
 
 def test_driver_kubectl_keeps_required_os_runtime_env_without_parent_secrets(monkeypatch) -> None:
@@ -1586,6 +1789,7 @@ def _install_driver_scope_mocks(
     rolebindings: list[dict[str, object]] | None = None,
     clusterrolebindings: list[dict[str, object]] | None = None,
     extra_target_rules: list[dict[str, object]] | None = None,
+    transient_review_failures: dict[str, int] | None = None,
 ) -> tuple[str, str, list[str], list[list[str]]]:
     subject = "system:serviceaccount:trpc-hpa-driver:trpc-hpa-driver"
     namespace = "runtime-gate"
@@ -1612,6 +1816,7 @@ def _install_driver_scope_mocks(
         }
     ]
     clusterrolebindings = clusterrolebindings or []
+    remaining_review_failures = dict(transient_review_failures or {})
 
     def fake_driver_json(
         arguments, *, kubeconfig_path, context, timeout_seconds, input_text=None
@@ -1633,6 +1838,9 @@ def _install_driver_scope_mocks(
         body = json.loads(str(input_text))
         review_namespace = body["spec"]["namespace"]
         review_namespaces.append(review_namespace)
+        if remaining_review_failures.get(review_namespace, 0) > 0:
+            remaining_review_failures[review_namespace] -= 1
+            return CommandResult(status="fail"), None
         identity_rules = [
             {
                 "apiGroups": ["authorization.k8s.io"],
@@ -1704,6 +1912,30 @@ def test_driver_scope_allows_standard_discovery_and_audits_bindings(monkeypatch)
         "matching_rolebinding_count": 1,
         "matching_clusterrolebinding_count": 0,
     }
+
+
+def test_driver_scope_retries_transient_rules_review_failure(monkeypatch) -> None:
+    subject, namespace, review_namespaces, _ = _install_driver_scope_mocks(
+        monkeypatch,
+        transient_review_failures={"kube-system": 1},
+    )
+    server_identity = "v1.33.1|commit|linux/amd64"
+    cluster_fingerprint = hashlib.sha256(server_identity.encode("utf-8")).hexdigest()
+
+    allowed, reasons, attestation = runtime_gate._driver_identity_and_scope(
+        kubeconfig_path="driver.kubeconfig",
+        driver_context="trpc-hpa-driver-gate2",
+        admin_context="kind-trpc-runtime-gate2",
+        subject=subject,
+        namespace=namespace,
+        cluster_fingerprint=cluster_fingerprint,
+        timeout_seconds=5,
+    )
+
+    assert allowed, reasons
+    assert reasons == []
+    assert review_namespaces == [namespace, "default", "kube-system", "kube-system"]
+    assert attestation["rule_audit"]["complete"] is True
 
 
 @pytest.mark.parametrize(
@@ -1915,6 +2147,150 @@ def test_controlled_node_drain_refuses_other_workloads(monkeypatch) -> None:
     )
     assert result.status == "not_run"
     assert details["preflight"]["blocking_pod_count"] == 1
+    assert calls == []
+
+
+def test_controlled_node_drain_allows_ready_pdb_protected_system_replica(
+    monkeypatch,
+) -> None:
+    cordoned = False
+    calls: list[list[str]] = []
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        if arguments[:2] == ["get", "node"]:
+            return CommandResult(status="pass"), {
+                "metadata": {"labels": {"trpc-runtime-gate": "true"}},
+                "spec": {"unschedulable": cordoned},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            }
+        if arguments[:2] == ["get", "pdb"]:
+            return CommandResult(status="pass"), {
+                "items": [
+                    {
+                        "metadata": {"namespace": "kube-system", "generation": 3},
+                        "spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}},
+                        "status": {
+                            "observedGeneration": 3,
+                            "disruptionsAllowed": 1,
+                            "currentHealthy": 2,
+                            "desiredHealthy": 1,
+                        },
+                    }
+                ]
+            }
+        return CommandResult(status="pass"), {
+            "items": [
+                {
+                    "metadata": {
+                        "namespace": "runtime-gate",
+                        "ownerReferences": [{"kind": "Deployment"}],
+                    }
+                },
+                {
+                    "metadata": {
+                        "namespace": "kube-system",
+                        "labels": {"k8s-app": "kube-dns"},
+                        "ownerReferences": [
+                            {"kind": "ReplicaSet", "controller": True}
+                        ],
+                    },
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}]
+                    },
+                },
+            ]
+        }
+
+    def fake_kubectl(arguments, *, context, timeout_seconds, input_text=None):
+        del context, timeout_seconds, input_text
+        nonlocal cordoned
+        calls.append(arguments)
+        if arguments[0] == "cordon":
+            cordoned = True
+        elif arguments[0] == "uncordon":
+            cordoned = False
+        return CommandResult(status="pass")
+
+    monkeypatch.setattr("scripts.kubernetes_runtime_gate._json_command", fake_json)
+    monkeypatch.setattr("scripts.kubernetes_runtime_gate._kubectl", fake_kubectl)
+    result, details = _controlled_node_drain(
+        "node-1",
+        namespace="runtime-gate",
+        label_key="trpc-runtime-gate",
+        label_value="true",
+        context="test",
+        timeout_seconds=5,
+    )
+    assert result.status == "pass"
+    assert details["blocking_pod_count"] == 0
+    assert details["pdb_protected_system_pod_count"] == 1
+    assert [call[0] for call in calls] == ["cordon", "drain", "uncordon"]
+
+
+def test_controlled_node_drain_rejects_system_replica_without_pdb_headroom(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        if arguments[:2] == ["get", "node"]:
+            return CommandResult(status="pass"), {
+                "metadata": {"labels": {"trpc-runtime-gate": "true"}},
+                "spec": {"unschedulable": False},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            }
+        if arguments[:2] == ["get", "pdb"]:
+            return CommandResult(status="pass"), {
+                "items": [
+                    {
+                        "metadata": {"namespace": "kube-system", "generation": 1},
+                        "spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}},
+                        "status": {
+                            "observedGeneration": 1,
+                            "disruptionsAllowed": 0,
+                            "currentHealthy": 1,
+                            "desiredHealthy": 1,
+                        },
+                    }
+                ]
+            }
+        return CommandResult(status="pass"), {
+            "items": [
+                {
+                    "metadata": {
+                        "namespace": "kube-system",
+                        "labels": {"k8s-app": "kube-dns"},
+                        "ownerReferences": [
+                            {"kind": "ReplicaSet", "controller": True}
+                        ],
+                    },
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}]
+                    },
+                }
+            ]
+        }
+
+    def fake_kubectl(arguments, **kwargs):
+        del kwargs
+        calls.append(arguments)
+        return CommandResult(status="pass")
+
+    monkeypatch.setattr("scripts.kubernetes_runtime_gate._json_command", fake_json)
+    monkeypatch.setattr("scripts.kubernetes_runtime_gate._kubectl", fake_kubectl)
+    result, details = _controlled_node_drain(
+        "node-1",
+        namespace="runtime-gate",
+        label_key="trpc-runtime-gate",
+        label_value="true",
+        context="test",
+        timeout_seconds=5,
+    )
+    assert result.status == "not_run"
+    assert details["preflight"]["blocking_pod_count"] == 1
+    assert details["preflight"]["pdb_protected_system_pod_count"] == 0
     assert calls == []
 
 

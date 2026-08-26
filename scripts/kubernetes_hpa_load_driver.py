@@ -11,6 +11,8 @@ The image and command are explicit operator inputs.  The command must be a
 JSON array (not a shell string) and must implement the application-specific
 bounded backlog operation in the image.  ``load`` waits for a successful,
 single-completion Job; ``clear`` deletes that exact nonce-labelled Job.
+``TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET`` may name a pre-created private
+registry pull Secret; the driver receives only that non-sensitive name.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 MAX_TIMEOUT_SECONDS = 300.0
@@ -34,6 +36,8 @@ MAX_IMAGE_BYTES = 512
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 NAMESPACE_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+DNS_1123_LABEL = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+SECRET_NAME_RE = re.compile(rf"{DNS_1123_LABEL}(?:\.{DNS_1123_LABEL})*")
 IMAGE_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 
 OWNER_LABEL = "trpc.io/hpa-gate"
@@ -41,6 +45,23 @@ OWNER_VALUE = "bounded-job-driver"
 RUN_LABEL = "trpc.io/hpa-run"
 PHASE_LABEL = "trpc.io/hpa-phase"
 CLUSTER_LABEL = "trpc.io/hpa-cluster"
+
+_TRANSIENT_KUBECTL_ERRORS = (
+    "context deadline exceeded",
+    "connection reset",
+    "connection was forcibly closed",
+    "eof",
+    "i/o timeout",
+    "request canceled",
+    "tls handshake timeout",
+    "timed out",
+    "timeout",
+    "unexpected end of json input",
+)
+
+
+class _TransientKubectlError(RuntimeError):
+    """A transport failure whose server-side outcome is ambiguous."""
 
 
 def _strict_json(value: str) -> Any:
@@ -98,6 +119,7 @@ def _configuration() -> dict[str, str | list[str]]:
     subject = os.getenv("TRPC_K8S_HPA_DRIVER_SUBJECT", "").strip()
     image = os.getenv("TRPC_K8S_HPA_DRIVER_JOB_IMAGE", "").strip()
     command_text = os.getenv("TRPC_K8S_HPA_DRIVER_JOB_COMMAND", "").strip()
+    image_pull_secret = os.getenv("TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET", "").strip()
     if NAMESPACE_RE.fullmatch(namespace) is None:
         raise ValueError("HPA driver namespace is invalid")
     if NONCE_RE.fullmatch(nonce) is None:
@@ -116,6 +138,11 @@ def _configuration() -> dict[str, str | list[str]]:
         raise ValueError("HPA driver Job image must be an immutable sha256 reference")
     if not command_text:
         raise ValueError("HPA driver Job command is required")
+    if image_pull_secret and (
+        len(image_pull_secret) > 253
+        or SECRET_NAME_RE.fullmatch(image_pull_secret) is None
+    ):
+        raise ValueError("HPA driver image pull Secret name is invalid")
     try:
         command = _strict_json(command_text)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -141,6 +168,7 @@ def _configuration() -> dict[str, str | list[str]]:
         "subject": subject,
         "image": image,
         "command": command,
+        "image_pull_secret": image_pull_secret,
     }
 
 
@@ -182,7 +210,25 @@ def _kubectl(
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("kubectl command timed out") from exc
+        raise _TransientKubectlError("kubectl command timed out") from exc
+
+
+def _transient_kubectl_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in text for marker in _TRANSIENT_KUBECTL_ERRORS)
+
+
+def _retry_transient(operation: Callable[[], Any]) -> Any:
+    last_error: _TransientKubectlError | None = None
+    for attempt in range(3):
+        try:
+            return operation()
+        except _TransientKubectlError as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(0.25)
+    assert last_error is not None
+    raise last_error
 
 
 def _json_output(result: subprocess.CompletedProcess[str], description: str) -> Mapping[str, Any]:
@@ -198,10 +244,10 @@ def _json_output(result: subprocess.CompletedProcess[str], description: str) -> 
 
 
 def _cluster_fingerprint(timeout: float) -> str:
-    payload = _json_output(
-        _kubectl(["version", "--request-timeout=10s", "-o", "json"], timeout=timeout),
-        "Kubernetes version",
-    )
+    result = _kubectl(["version", "--request-timeout=10s", "-o", "json"], timeout=timeout)
+    if result.returncode != 0 and _transient_kubectl_failure(result):
+        raise _TransientKubectlError("Kubernetes version read was interrupted")
+    payload = _json_output(result, "Kubernetes version")
     server = payload.get("serverVersion")
     server_map = server if isinstance(server, Mapping) else {}
     identity = "|".join(
@@ -213,10 +259,10 @@ def _cluster_fingerprint(timeout: float) -> str:
 
 
 def _whoami(timeout: float, expected_subject: str) -> None:
-    payload = _json_output(
-        _kubectl(["auth", "whoami", "-o", "json"], timeout=timeout),
-        "SelfSubjectReview",
-    )
+    result = _kubectl(["auth", "whoami", "-o", "json"], timeout=timeout)
+    if result.returncode != 0 and _transient_kubectl_failure(result):
+        raise _TransientKubectlError("SelfSubjectReview was interrupted")
+    payload = _json_output(result, "SelfSubjectReview")
     status = payload.get("status")
     user_info = status.get("userInfo") if isinstance(status, Mapping) else None
     username = user_info.get("username") if isinstance(user_info, Mapping) else None
@@ -241,7 +287,7 @@ def _labels(config: Mapping[str, str | list[str]]) -> dict[str, str]:
 def _job_manifest(config: Mapping[str, str | list[str]]) -> dict[str, Any]:
     namespace = str(config["namespace"])
     labels = _labels(config)
-    return {
+    manifest: dict[str, Any] = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
@@ -297,6 +343,12 @@ def _job_manifest(config: Mapping[str, str | list[str]]) -> dict[str, Any]:
             },
         },
     }
+    image_pull_secret = str(config.get("image_pull_secret", "")).strip()
+    if image_pull_secret:
+        manifest["spec"]["template"]["spec"]["imagePullSecrets"] = [
+            {"name": image_pull_secret}
+        ]
+    return manifest
 
 
 def _get_job(config: Mapping[str, str | list[str]], timeout: float) -> Mapping[str, Any] | None:
@@ -315,6 +367,8 @@ def _get_job(config: Mapping[str, str | list[str]], timeout: float) -> Mapping[s
     if result.returncode != 0:
         if "notfound" in result.stderr.lower() or "not found" in result.stderr.lower():
             return None
+        if _transient_kubectl_failure(result):
+            raise _TransientKubectlError("HPA load Job read was interrupted")
         raise RuntimeError("HPA load Job could not be read")
     return _json_output(result, "HPA load Job")
 
@@ -342,11 +396,11 @@ def _validate_job(
 
 
 def _load(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, Any]:
-    _whoami(timeout, str(config["subject"]))
-    actual_fingerprint = _cluster_fingerprint(timeout)
+    _retry_transient(lambda: _whoami(timeout, str(config["subject"])))
+    actual_fingerprint = _retry_transient(lambda: _cluster_fingerprint(timeout))
     if actual_fingerprint != config["fingerprint"]:
         raise RuntimeError("driver API server fingerprint does not match the gate")
-    existing = _get_job(config, timeout)
+    existing = _retry_transient(lambda: _get_job(config, timeout))
     if existing is not None:
         uid, labels = _validate_job(existing, config)
         status = existing.get("status")
@@ -373,7 +427,11 @@ def _load(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, An
         raise RuntimeError("bounded HPA load Job could not be created")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        payload = _get_job(config, min(10.0, max(1.0, deadline - time.monotonic())))
+        payload = _retry_transient(
+            lambda: _get_job(
+                config, min(10.0, max(1.0, deadline - time.monotonic()))
+            )
+        )
         if payload is None:
             raise RuntimeError("bounded HPA load Job disappeared before completion")
         uid, labels = _validate_job(payload, config)
@@ -401,11 +459,11 @@ def _load(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, An
 
 
 def _clear(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, Any]:
-    _whoami(timeout, str(config["subject"]))
-    actual_fingerprint = _cluster_fingerprint(timeout)
+    _retry_transient(lambda: _whoami(timeout, str(config["subject"])))
+    actual_fingerprint = _retry_transient(lambda: _cluster_fingerprint(timeout))
     if actual_fingerprint != config["fingerprint"]:
         raise RuntimeError("driver API server fingerprint does not match the gate")
-    existing = _get_job(config, timeout)
+    existing = _retry_transient(lambda: _get_job(config, timeout))
     if existing is None:
         return {
             "schema_version": 1,
@@ -422,26 +480,39 @@ def _clear(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, A
             "already_absent": True,
         }
     uid, labels = _validate_job(existing, config)
-    deleted = _kubectl(
-        [
-            "delete",
-            "job",
-            _job_name(str(config["nonce"])),
-            "--namespace",
-            str(config["namespace"]),
-            "--ignore-not-found",
-            "--wait=false",
-        ],
-        timeout=timeout,
-    )
-    if deleted.returncode != 0:
-        raise RuntimeError("bounded HPA load Job could not be deleted")
     deadline = time.monotonic() + min(timeout, 30.0)
+    delete_arguments = [
+        "delete",
+        "job",
+        _job_name(str(config["nonce"])),
+        "--namespace",
+        str(config["namespace"]),
+        "--ignore-not-found",
+        "--wait=false",
+    ]
+    delete_attempts = 1
+    delete_failed = False
+    try:
+        deleted = _kubectl(delete_arguments, timeout=timeout)
+        if deleted.returncode != 0:
+            if not _transient_kubectl_failure(deleted):
+                raise RuntimeError("bounded HPA load Job could not be deleted")
+            delete_failed = True
+    except _TransientKubectlError:
+        # A timed-out or disconnected delete may still have reached the API
+        # server.  Never infer success from that error: confirm the exact Job
+        # is absent below, using the UID and labels read before deletion.
+        delete_failed = True
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        observed = _get_job(config, max(0.1, min(10.0, remaining)))
+        try:
+            observed = _get_job(config, max(0.1, min(10.0, remaining)))
+        except _TransientKubectlError:
+            # Read failures are not absence evidence. Retry within the same
+            # bounded deadline and fail closed if NotFound is never observed.
+            observed = existing
         if observed is None:
             return {
                 "schema_version": 1,
@@ -460,9 +531,27 @@ def _clear(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, A
         observed_uid, _ = _validate_job(observed, config)
         if observed_uid != uid:
             raise RuntimeError("bounded HPA load Job identity changed during clear")
+        if delete_failed and delete_attempts < 3:
+            delete_attempts += 1
+            try:
+                retried = _kubectl(
+                    delete_arguments,
+                    timeout=max(0.1, min(10.0, deadline - time.monotonic())),
+                )
+                if retried.returncode != 0:
+                    if not _transient_kubectl_failure(retried):
+                        raise RuntimeError("bounded HPA load Job could not be deleted")
+                else:
+                    delete_failed = False
+            except _TransientKubectlError:
+                pass
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(0.25, remaining))
+    if delete_failed:
+        raise RuntimeError(
+            "bounded HPA load Job delete failed and absence was not observed"
+        )
     raise RuntimeError("bounded HPA load Job deletion was not observed")
 
 

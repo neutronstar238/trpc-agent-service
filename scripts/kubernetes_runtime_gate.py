@@ -14,6 +14,9 @@ Required environment for a live run:
 * ``TRPC_K8S_RUNTIME_UPGRADE_IMAGE`` (a different image for the rollout test)
 * ``TRPC_K8S_RUNTIME_SECRET_MANIFEST`` (a manifest containing the runtime and
   migration Secret objects; it is never copied into the report)
+* ``TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET`` (optional, non-sensitive name of a
+  ``kubernetes.io/dockerconfigjson`` Secret in the supplied Secret manifest;
+  the gate never copies registry credentials into its report)
 * ``TRPC_K8S_RUNTIME_HPA_DRIVER`` (an absolute, repository-bound Python
    trigger that creates and clears a bounded backlog; HPA observations are
    always read by this gate through the Kubernetes API)
@@ -54,7 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -69,6 +72,7 @@ import yaml
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.deployment_preflight import build_preflight
 from scripts.evidence_lineage import build_evidence, runtime_fingerprint
 from scripts.report_io import atomic_write_json
 
@@ -181,11 +185,14 @@ _MIN_PRODUCTION_TURN_CAPACITY = 200
 _WORKER_EVICTION_REPLICAS = 4
 _NODE_DRAIN_CONFIRMATION = "I_UNDERSTAND_ISOLATED_NODE_DRAIN"
 _NODE_LABEL_KEY = "trpc-runtime-gate"
+_DNS_1123_LABEL = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+_DNS_1123_SUBDOMAIN_RE = re.compile(rf"{_DNS_1123_LABEL}(?:\.{_DNS_1123_LABEL})*")
 
 _REQUIRED_RUNTIME_CHECKS = (
     "kube_context",
     "kustomize_render",
     "production_manifest_contract",
+    "image_pull_secret_contract",
     "namespace_create",
     "server_side_dry_run",
     "manifest_contract",
@@ -302,6 +309,107 @@ def _kubectl(
         exit_code=completed.returncode,
         stdout=completed.stdout,
         stderr=completed.stderr,
+    )
+
+
+def _valid_image_pull_secret_name(value: str) -> bool:
+    """Return whether *value* is a bounded Kubernetes DNS subdomain name."""
+
+    return len(value) <= 253 and _DNS_1123_SUBDOMAIN_RE.fullmatch(value) is not None
+
+
+def _image_pull_secret_metadata_contract(
+    secret_manifest: str,
+    image_pull_secret: str,
+    *,
+    namespace: str,
+    context: str | None,
+    timeout_seconds: float,
+) -> CommandResult:
+    """Inspect only Secret metadata needed by the private-registry contract.
+
+    ``kubectl`` receives the external Secret manifest but the output template
+    emits only kind/name/namespace/type.  Secret ``data`` and ``stringData``
+    never enter this process or the runtime report.
+    """
+
+    name = image_pull_secret.strip()
+    if not name:
+        return CommandResult(
+            status="pass",
+            evidence={"configured": False},
+        )
+    if not _valid_image_pull_secret_name(name):
+        return CommandResult(
+            status="fail",
+            reason="image pull Secret name is not a valid Kubernetes DNS subdomain",
+            evidence={"configured": True},
+        )
+    metadata_template = (
+        'go-template={{.kind}}{{"\\t"}}{{.metadata.name}}{{"\\t"}}'
+        '{{if .metadata.namespace}}{{.metadata.namespace}}{{end}}{{"\\t"}}'
+        '{{.type}}{{"\\n"}}'
+    )
+    inspection = _kubectl(
+        [
+            "create",
+            "--dry-run=client",
+            "--namespace",
+            namespace,
+            "-f",
+            secret_manifest,
+            "-o",
+            metadata_template,
+        ],
+        context=context,
+        timeout_seconds=min(timeout_seconds, 30),
+    )
+    if inspection.status != "pass":
+        return CommandResult(
+            status=inspection.status,
+            exit_code=inspection.exit_code,
+            reason="Secret manifest metadata inspection failed",
+            stderr="present" if inspection.stderr else "",
+            evidence={"configured": True, "secret_name": name},
+        )
+    records: list[tuple[str, str, str, str]] = []
+    for line in inspection.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4:
+            return CommandResult(
+                status="fail",
+                reason="Secret manifest metadata output is invalid",
+                evidence={"configured": True, "secret_name": name},
+            )
+        records.append(cast(tuple[str, str, str, str], tuple(fields)))
+    matches = [record for record in records if record[0] == "Secret" and record[1] == name]
+    if len(matches) != 1:
+        return CommandResult(
+            status="fail",
+            reason="Secret manifest must contain exactly one configured image pull Secret",
+            evidence={"configured": True, "secret_name": name},
+        )
+    _kind, _name, declared_namespace, resource_type = matches[0]
+    if declared_namespace not in {"", namespace}:
+        return CommandResult(
+            status="fail",
+            reason="image pull Secret targets a different namespace",
+            evidence={"configured": True, "secret_name": name},
+        )
+    if resource_type != "kubernetes.io/dockerconfigjson":
+        return CommandResult(
+            status="fail",
+            reason="image pull Secret must use type kubernetes.io/dockerconfigjson",
+            evidence={"configured": True, "secret_name": name},
+        )
+    return CommandResult(
+        status="pass",
+        evidence={
+            "configured": True,
+            "secret_name": name,
+            "secret_type": resource_type,
+            "namespace_bound": declared_namespace == namespace,
+        },
     )
 
 
@@ -1204,6 +1312,7 @@ def _write_overlay(
     run_nonce: str | None = None,
     cluster_fingerprint: str | None = None,
     expires_at: str | None = None,
+    image_pull_secret: str | None = None,
 ) -> Path:
     image_transform = _image_transform(image)
 
@@ -1309,6 +1418,31 @@ def _write_overlay(
                 "    path: controlled-node-patch.yaml",
             ]
         )
+    if image_pull_secret:
+        if not _valid_image_pull_secret_name(image_pull_secret):
+            raise ValueError("image pull Secret name is invalid")
+        image_pull_secret_patch = directory / "image-pull-secret-patch.yaml"
+        image_pull_secret_patch.write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "op": "add",
+                        "path": "/spec/template/spec/imagePullSecrets",
+                        "value": [{"name": image_pull_secret}],
+                    }
+                ],
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        for kind in ("Deployment", "Job"):
+            lines.extend(
+                [
+                    "  - target:",
+                    f"      kind: {kind}",
+                    "    path: image-pull-secret-patch.yaml",
+                ]
+            )
     lines.append("")
     content = "\n".join(lines)
     path = directory / "kustomization.yaml"
@@ -2394,6 +2528,9 @@ def _run_hpa_driver(
             ),
         }
     )
+    image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
+    if image_pull_secret:
+        environment["TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET"] = image_pull_secret
     if effective_driver_context:
         environment["TRPC_K8S_HPA_CONTEXT"] = effective_driver_context
     before_job: dict[str, Any] | None = None
@@ -2634,15 +2771,30 @@ def _driver_identity_and_scope(
             },
             separators=(",", ":"),
         )
-        result, payload = _driver_json(
-            ["create", "--raw", "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "-f", "-"],
-            kubeconfig_path=kubeconfig_path,
-            context=driver_context,
-            timeout_seconds=timeout_seconds,
-            input_text=body,
-        )
-        status_value = payload.get("status") if isinstance(payload, Mapping) else None
-        if result.status != "pass" or not isinstance(status_value, Mapping):
+        status_value: Mapping[str, Any] | None = None
+        for attempt in range(3):
+            result, payload = _driver_json(
+                [
+                    "create",
+                    "--raw",
+                    "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                    "-f",
+                    "-",
+                ],
+                kubeconfig_path=kubeconfig_path,
+                context=driver_context,
+                timeout_seconds=timeout_seconds,
+                input_text=body,
+            )
+            candidate_status = (
+                payload.get("status") if isinstance(payload, Mapping) else None
+            )
+            if result.status == "pass" and isinstance(candidate_status, Mapping):
+                status_value = candidate_status
+                break
+            if attempt < 2:
+                time.sleep(0.25)
+        if status_value is None:
             return None, None, False, "SelfSubjectRulesReview could not be observed"
         if status_value.get("incomplete") is True:
             return None, None, False, "SelfSubjectRulesReview is incomplete"
@@ -2945,6 +3097,95 @@ def _parse_controlled_node_label(value: str) -> tuple[str, str] | None:
     return key, label_value
 
 
+def _pdb_selector_matches_pod(
+    selector: object,
+    labels: object,
+) -> bool:
+    """Match the conservative PDB selector subset used for safe node drains."""
+
+    if not isinstance(selector, Mapping) or not isinstance(labels, Mapping):
+        return False
+    match_labels = selector.get("matchLabels")
+    if not isinstance(match_labels, Mapping) or not match_labels:
+        return False
+    match_expressions = selector.get("matchExpressions")
+    if match_expressions not in (None, []):
+        return False
+    return all(labels.get(key) == value for key, value in match_labels.items())
+
+
+def _pdb_protected_system_pod(
+    pod: Mapping[str, Any],
+    pdb_items: Sequence[object],
+) -> bool:
+    """Accept one ready kube-system replica only when one fresh PDB permits eviction."""
+
+    metadata_value = pod.get("metadata")
+    metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+    namespace = metadata.get("namespace")
+    labels = metadata.get("labels")
+    owners_value = metadata.get("ownerReferences")
+    owners = owners_value if isinstance(owners_value, list) else []
+    controlled_replica = any(
+        isinstance(owner, Mapping)
+        and owner.get("controller") is True
+        and owner.get("kind") in {"ReplicaSet", "StatefulSet"}
+        for owner in owners
+    )
+    status_value = pod.get("status")
+    status = status_value if isinstance(status_value, Mapping) else {}
+    conditions = status.get("conditions") if isinstance(status, Mapping) else []
+    ready = any(
+        isinstance(condition, Mapping)
+        and condition.get("type") == "Ready"
+        and condition.get("status") == "True"
+        for condition in conditions or ()
+    )
+    if namespace != "kube-system" or not controlled_replica or not ready:
+        return False
+
+    matching: list[Mapping[str, Any]] = []
+    for pdb in pdb_items:
+        if not isinstance(pdb, Mapping):
+            continue
+        pdb_metadata_value = pdb.get("metadata")
+        pdb_metadata = (
+            pdb_metadata_value if isinstance(pdb_metadata_value, Mapping) else {}
+        )
+        if pdb_metadata.get("namespace") != namespace:
+            continue
+        spec_value = pdb.get("spec")
+        spec = spec_value if isinstance(spec_value, Mapping) else {}
+        if _pdb_selector_matches_pod(spec.get("selector"), labels):
+            matching.append(pdb)
+    if len(matching) != 1:
+        return False
+
+    pdb = matching[0]
+    pdb_metadata_value = pdb.get("metadata")
+    pdb_metadata = pdb_metadata_value if isinstance(pdb_metadata_value, Mapping) else {}
+    pdb_status_value = pdb.get("status")
+    pdb_status = pdb_status_value if isinstance(pdb_status_value, Mapping) else {}
+    generation = pdb_metadata.get("generation")
+    observed_generation = pdb_status.get("observedGeneration")
+    fresh = (
+        isinstance(generation, int)
+        and isinstance(observed_generation, int)
+        and generation == observed_generation
+    )
+    disruptions_allowed = pdb_status.get("disruptionsAllowed")
+    current_healthy = pdb_status.get("currentHealthy")
+    desired_healthy = pdb_status.get("desiredHealthy")
+    return (
+        fresh
+        and isinstance(disruptions_allowed, int)
+        and disruptions_allowed >= 1
+        and isinstance(current_healthy, int)
+        and isinstance(desired_healthy, int)
+        and current_healthy > desired_healthy
+    )
+
+
 def _node_drain_preflight(
     node_name: str,
     *,
@@ -2956,7 +3197,7 @@ def _node_drain_preflight(
     require_schedulable: bool = True,
     require_gate_workload: bool = False,
 ) -> tuple[CommandResult, dict[str, Any]]:
-    """Prove the explicitly named node is dedicated before any drain call."""
+    """Prove the named node contains only gate or safely disruptable system pods."""
 
     node_result, node = _json_command(
         ["get", "node", node_name, "-o", "json"],
@@ -2995,6 +3236,7 @@ def _node_drain_preflight(
     )
     items = pods.get("items") if isinstance(pods, Mapping) else None
     blockers: list[dict[str, str]] = []
+    system_candidates: list[Mapping[str, Any]] = []
     gate_namespace_pods = 0
     if isinstance(items, list):
         for item in items:
@@ -3016,9 +3258,44 @@ def _node_drain_preflight(
             mirror_pod = "kubernetes.io/config.mirror" in annotations
             if daemon_owned or mirror_pod:
                 continue
+            if item_namespace == "kube-system":
+                system_candidates.append(item)
+                continue
             blockers.append(
                 {
                     "namespace": item_namespace,
+                    "owner_kind": ",".join(
+                        str(owner.get("kind"))
+                        for owner in owners
+                        if isinstance(owner, Mapping) and owner.get("kind")
+                    )
+                    or "unknown",
+                }
+            )
+    pdb_result = CommandResult(status="not_run", reason="no system pod required PDB review")
+    protected_system_pods = 0
+    if system_candidates:
+        pdb_result, pdbs = _json_command(
+            ["get", "pdb", "--all-namespaces", "-o", "json"],
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        pdb_items = pdbs.get("items") if isinstance(pdbs, Mapping) else None
+        for item in system_candidates:
+            if (
+                pdb_result.status == "pass"
+                and isinstance(pdb_items, list)
+                and _pdb_protected_system_pod(item, pdb_items)
+            ):
+                protected_system_pods += 1
+                continue
+            metadata_value = item.get("metadata")
+            item_metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+            owners_value = item_metadata.get("ownerReferences")
+            owners = owners_value if isinstance(owners_value, list) else []
+            blockers.append(
+                {
+                    "namespace": "kube-system",
                     "owner_kind": ",".join(
                         str(owner.get("kind"))
                         for owner in owners
@@ -3046,8 +3323,10 @@ def _node_drain_preflight(
         "node_ready": ready,
         "node_schedulable": schedulable,
         "pod_inventory": _result_payload(pods_result),
+        "pdb_inventory": _result_payload(pdb_result),
         "blocking_pod_count": len(blockers),
         "blocking_owner_kinds": sorted({item["owner_kind"] for item in blockers}),
+        "pdb_protected_system_pod_count": protected_system_pods,
         "gate_namespace_pod_count": gate_namespace_pods,
     }
     return (
@@ -3362,6 +3641,9 @@ def _missing_prerequisites(
             missing.append("TRPC_RELEASE_NONCE is required for a production runtime acceptance")
     image = required["TRPC_K8S_RUNTIME_IMAGE"] or ""
     upgrade_image = required["TRPC_K8S_RUNTIME_UPGRADE_IMAGE"] or ""
+    image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
+    if image_pull_secret and not _valid_image_pull_secret_name(image_pull_secret):
+        missing.append("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET is invalid")
     if not allow_local_images:
         valid_images, image_reasons = _production_image_contract(image, upgrade_image)
         if not valid_images:
@@ -4149,6 +4431,7 @@ def _run_live_once(
     candidate["namespace"] = namespace
     candidate["run_nonce"] = run_nonce
     secret_manifest = os.environ["TRPC_K8S_RUNTIME_SECRET_MANIFEST"]
+    image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
     image = os.environ["TRPC_K8S_RUNTIME_IMAGE"]
     upgrade_image = os.environ["TRPC_K8S_RUNTIME_UPGRADE_IMAGE"]
     hpa_driver_path = os.environ["TRPC_K8S_RUNTIME_HPA_DRIVER"]
@@ -4196,15 +4479,6 @@ def _run_live_once(
             reasons.append("current Kubernetes context is unavailable")
             return 1 if require_runtime else 0
         cluster_identity = _cluster_identity(cluster_stdout, context)
-        expired_cleanup, expired_cleanup_details = _cleanup_expired_gate_namespaces(
-            context=context,
-            cluster_fingerprint=cluster_identity["fingerprint_sha256"],
-            timeout_seconds=min(timeout_seconds, 30),
-        )
-        candidate["expired_namespace_recovery"] = expired_cleanup_details
-        if expired_cleanup.status != "pass":
-            reasons.append(expired_cleanup.reason or "expired namespace recovery failed")
-            return 1 if require_runtime else 0
         if node_label is None:
             checks["node_eviction"] = {
                 "status": "not_run",
@@ -4226,6 +4500,30 @@ def _run_live_once(
         }
         if node_preflight.status != "pass":
             reasons.append(node_preflight.reason or "controlled node preflight failed")
+            return 1 if require_runtime else 0
+
+        pull_secret_contract = _image_pull_secret_metadata_contract(
+            secret_manifest,
+            image_pull_secret,
+            namespace=namespace,
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        checks["image_pull_secret_contract"] = _result_payload(pull_secret_contract)
+        if pull_secret_contract.status != "pass":
+            reasons.append(
+                pull_secret_contract.reason or "image pull Secret metadata contract failed"
+            )
+            return 1 if require_runtime else 0
+
+        expired_cleanup, expired_cleanup_details = _cleanup_expired_gate_namespaces(
+            context=context,
+            cluster_fingerprint=cluster_identity["fingerprint_sha256"],
+            timeout_seconds=min(timeout_seconds, 30),
+        )
+        candidate["expired_namespace_recovery"] = expired_cleanup_details
+        if expired_cleanup.status != "pass":
+            reasons.append(expired_cleanup.reason or "expired namespace recovery failed")
             return 1 if require_runtime else 0
 
         for verb, resource in (("create", "namespaces"),):
@@ -4252,6 +4550,7 @@ def _run_live_once(
             run_nonce=run_nonce,
             cluster_fingerprint=cluster_identity["fingerprint_sha256"],
             expires_at=str(int(time.time()) + RUNTIME_NAMESPACE_TTL_SECONDS),
+            image_pull_secret=image_pull_secret,
         )
         rendered_manifest = Path(temporary_directory.name) / "runtime-rendered.yaml"
         render = _kubectl(
@@ -5014,23 +5313,69 @@ def _run_live(
     return initial_code
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "strict unified runtime configuration; when supplied, its release, "
+            "image, Kubernetes, HPA, Secret-reference, node, and timeout values "
+            "are validated before any cluster mutation"
+        ),
+    )
+    parser.add_argument(
+        "--preflight-output",
+        type=Path,
+        default=Path("runs/multitenant/deployment-preflight.json"),
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("runs/multitenant/kubernetes-runtime.json")
     )
-    parser.add_argument("--context", default=os.getenv("TRPC_K8S_RUNTIME_CONTEXT"))
+    parser.add_argument("--context")
     parser.add_argument(
         "--timeout-seconds",
         type=float,
-        default=os.getenv("TRPC_K8S_RUNTIME_TIMEOUT_SECONDS", "600"),
+        default=None,
     )
     parser.add_argument(
         "--require-runtime",
         action="store_true",
         help="return non-zero when the live gate is not run because prerequisites are missing",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.config is not None:
+        if args.context is not None or args.timeout_seconds is not None:
+            parser.error("--config cannot be combined with --context or --timeout-seconds")
+        preflight, projected = build_preflight(args.config, environment=os.environ)
+        atomic_write_json(args.preflight_output, preflight)
+        if preflight["gate"] != "pass" or projected is None:
+            candidate = {
+                "mode": "configuration_preflight",
+                "enabled": False,
+                "checks": {
+                    "configuration_preflight": {
+                        "status": "fail",
+                        "report": str(args.preflight_output),
+                    }
+                },
+            }
+            result = _report(
+                args.output,
+                gate="not_run",
+                candidate=candidate,
+                rejection_reasons=list(preflight["rejection_reasons"]),
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1
+        os.environ.update(projected)
+        args.context = projected["TRPC_K8S_RUNTIME_CONTEXT"]
+        args.timeout_seconds = float(projected["TRPC_K8S_RUNTIME_TIMEOUT_SECONDS"])
+    else:
+        if args.context is None:
+            args.context = os.getenv("TRPC_K8S_RUNTIME_CONTEXT")
+        if args.timeout_seconds is None:
+            args.timeout_seconds = float(os.getenv("TRPC_K8S_RUNTIME_TIMEOUT_SECONDS", "600"))
     try:
         timeout_seconds = _validate_timeout_seconds(args.timeout_seconds)
     except ValueError as exc:
