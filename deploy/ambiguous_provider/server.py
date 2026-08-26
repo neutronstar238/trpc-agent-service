@@ -216,7 +216,16 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == AUTH_PATH:
             # FeishuAdapter needs a token before it reaches the response-drop
-            # message route.  The token is test-only and carries no credential.
+            # message route.  Drain the complete bounded request before
+            # replying: closing an HTTP/1.0 connection with unread request
+            # bytes can reset the socket and make a successful token response
+            # appear as a transport failure on Windows.
+            try:
+                _strict_json(self._read_body())
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                self._json_response(400, {"status": "invalid_request"})
+                return
+            # The token is test-only and carries no credential.
             self._json_response(
                 200,
                 {"code": 0, "tenant_access_token": "ambiguous-test-token", "expire": 3600},
