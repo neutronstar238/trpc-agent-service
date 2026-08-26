@@ -12,6 +12,8 @@ from scripts.contract_gate import (
     _backend_production_status,
     _image_digest,
     _junit_counts,
+    _junit_summary,
+    _write_history_report,
     _write_report,
     backend_identities,
 )
@@ -31,6 +33,71 @@ def test_junit_counts_distinguish_executed_and_skipped_tests(tmp_path) -> None:
         "errors": 0,
         "skipped": 1,
     }
+
+
+def test_junit_summary_keeps_only_failed_case_identity(tmp_path) -> None:
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        """<testsuites><testsuite tests="3" failures="1" errors="1" skipped="0">
+        <testcase classname="tests.test_contract" name="test_ok" />
+        <testcase classname="tests.test_contract" name="test_failed">
+          <failure message="database-password">secret traceback</failure>
+          <system-out>secret stdout</system-out>
+        </testcase>
+        <testcase classname="tests.test_contract" name="test_error">
+          <error message="api-token">secret error</error>
+          <system-err>secret stderr</system-err>
+        </testcase>
+        </testsuite></testsuites>""",
+        encoding="utf-8",
+    )
+
+    status, counts, failed_cases = _junit_summary(report)
+
+    assert status == "available"
+    assert counts == {
+        "tests": 3,
+        "passed": 1,
+        "failures": 1,
+        "errors": 1,
+        "skipped": 0,
+    }
+    assert failed_cases == [
+        {
+            "outcome": "failure",
+            "classname": "tests.test_contract",
+            "testcase": "test_failed",
+        },
+        {
+            "outcome": "error",
+            "classname": "tests.test_contract",
+            "testcase": "test_error",
+        },
+    ]
+    serialized = json.dumps(failed_cases)
+    for secret in (
+        "database-password",
+        "secret traceback",
+        "secret stdout",
+        "api-token",
+        "secret error",
+        "secret stderr",
+    ):
+        assert secret not in serialized
+
+
+def test_history_report_is_exclusive_and_cannot_be_overwritten(tmp_path) -> None:
+    history = tmp_path / "history" / "backend-run.json"
+    _write_history_report(history, {"run_id": "first"})
+
+    try:
+        _write_history_report(history, {"run_id": "replacement"})
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("diagnostic history was overwritten")
+
+    assert json.loads(history.read_text(encoding="utf-8")) == {"run_id": "first"}
 
 
 def test_backend_production_status_never_promotes_all_skipped_suite() -> None:
@@ -170,6 +237,11 @@ def test_backend_report_binds_junit_runtime_and_safe_identities(tmp_path, monkey
     assert result["production_gate"] == "pass"
     assert result["candidate"]["runtime_attestation"]["status"] == "pass"
     assert result["candidate"]["lineage"]["image_digest"] == "sha256:" + "a" * 64
+    assert result["candidate"]["junit_status"] == "available"
+    assert result["candidate"]["failed_cases"] == []
+    history = tmp_path / result["candidate"]["diagnostic_history"]["path"]
+    assert history.is_file()
+    assert json.loads(history.read_text(encoding="utf-8"))["run_id"] == result["run_id"]
     serialized = json.dumps(result)
     for canary in (
         "postgres-canary",

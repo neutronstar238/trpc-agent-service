@@ -138,13 +138,17 @@ def backend_identities(
     }
 
 
-def _junit_counts(path: Path) -> dict[str, int]:
-    """Read only aggregate pytest counts from a locally generated JUnit file."""
+def _junit_summary(path: Path) -> tuple[str, dict[str, int], list[dict[str, str]]]:
+    """Read bounded, non-payload diagnostics from a local pytest JUnit file."""
 
     try:
         root = ET.parse(path).getroot()  # noqa: S314 - parses our bounded local pytest output
     except (ET.ParseError, OSError, ValueError):
-        return {"tests": 0, "passed": 0, "failures": 0, "errors": 0, "skipped": 0}
+        return (
+            "unavailable",
+            {"tests": 0, "passed": 0, "failures": 0, "errors": 0, "skipped": 0},
+            [],
+        )
     suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
     totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
     for suite in suites:
@@ -157,7 +161,28 @@ def _junit_counts(path: Path) -> dict[str, int]:
     totals["passed"] = max(
         totals["tests"] - totals["failures"] - totals["errors"] - totals["skipped"], 0
     )
-    return totals
+    failed_cases: list[dict[str, str]] = []
+    for testcase in root.iter("testcase"):
+        outcome = next(
+            (name for name in ("failure", "error") if testcase.find(name) is not None),
+            None,
+        )
+        if outcome is None:
+            continue
+        failed_cases.append(
+            {
+                "outcome": outcome,
+                "classname": testcase.attrib.get("classname", "")[:512],
+                "testcase": testcase.attrib.get("name", "")[:512],
+            }
+        )
+    return "available", totals, failed_cases
+
+
+def _junit_counts(path: Path) -> dict[str, int]:
+    """Compatibility helper returning aggregate pytest counts."""
+
+    return _junit_summary(path)[1]
 
 
 def _backend_production_status(
@@ -215,6 +240,29 @@ def _write_report(path: Path, value: object) -> None:
     atomic_write_json(path, value)
 
 
+def _write_history_report(path: Path, value: object) -> None:
+    """Write one immutable diagnostic snapshot without replacing an existing run."""
+
+    absolute = path.absolute()
+    for component in (absolute, *absolute.parents):
+        if component.exists() and component.is_symlink():
+            raise ValueError(f"diagnostic history path must not contain a symlink: {component}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = (
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("kind", choices=tuple(CASES))
@@ -244,7 +292,7 @@ def main() -> int:
             capture_output=True,
             text=True,
         )
-        test_counts = _junit_counts(junit_path)
+        junit_status, test_counts, failed_cases = _junit_summary(junit_path)
     duration = time.perf_counter() - started
     passed = completed.returncode == 0
     identities: dict[str, dict[str, str]] | None = None
@@ -296,6 +344,8 @@ def main() -> int:
         "exit_code": completed.returncode,
         "duration_seconds": duration,
         "test_counts": test_counts,
+        "junit_status": junit_status,
+        "failed_cases": failed_cases,
     }
     if args.kind == "backend":
         candidate["backend_identities"] = identities or {}
@@ -327,10 +377,18 @@ def main() -> int:
         "run_id": evidence["run_id"],
         "evidence": evidence,
     }
+    history_path = (
+        output.parent / "history" / f"{output.stem}-{evidence['run_id']}.json"
+    )
+    candidate["diagnostic_history"] = {
+        "status": "written",
+        "path": history_path.relative_to(output.parent).as_posix(),
+    }
     rendered = json.dumps(result, indent=2)
     try:
+        _write_history_report(history_path, result)
         _write_report(output, result)
-    except (OSError, ValueError) as error:
+    except (OSError, TypeError, ValueError) as error:
         print(f"contract gate could not write report: {error}", file=sys.stderr)
         return 2
     print(rendered)
