@@ -114,6 +114,30 @@ def test_source_fingerprint_changes_for_real_python_content(tmp_path) -> None:
     assert after["total_bytes"] == before["total_bytes"]
 
 
+def test_source_fingerprint_ignores_local_runtime_config_but_tracks_source(
+    tmp_path,
+) -> None:
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    runtime_config = deploy / "runtime-gate.yaml"
+    runtime_config.write_text("release_id: first\n", encoding="utf-8")
+    source = tmp_path / "source.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    before = source_fingerprint(tmp_path, (".",))
+    runtime_config.write_text("release_id: second\n", encoding="utf-8")
+    after_config_change = source_fingerprint(tmp_path, (".",))
+
+    assert after_config_change["value"] == before["value"]
+    assert after_config_change["file_count"] == before["file_count"]
+    assert after_config_change["total_bytes"] == before["total_bytes"]
+
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    after_source_change = source_fingerprint(tmp_path, (".",))
+
+    assert after_source_change["value"] != before["value"]
+
+
 def test_current_candidate_evidence_has_versioned_safe_runtime_metadata(tmp_path) -> None:
     report = build_evidence(
         root=tmp_path,

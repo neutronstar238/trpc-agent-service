@@ -1,0 +1,47 @@
+schema_version: 1
+
+# Copy this file to deploy/runtime-gate.yaml. Keep raw nonces, registry tokens,
+# kubeconfig contents, DSNs, and Secret values outside this file.
+release:
+  id: replace-with-current-release-id
+  nonce_env: TRPC_RELEASE_NONCE
+  image_binding: ../runs/multitenant/registry-image-binding.json
+
+kubernetes:
+  kubeconfig: C:/secure/ack-admin.kubeconfig
+  context: replace-with-explicit-context
+  timeout_seconds: 1500
+  secret_manifest: C:/secure/trpc-runtime-secrets.yaml
+  image_pull_secret: ghcr-pull
+  # Optional pull-through registry host. Only the initial/upgrade runtime
+  # references are rewritten; repository path and @sha256 digest stay bound
+  # to release.image_binding. Leave this unset to pull from the canonical host.
+  pull_registry: replace-with-pull-registry-host
+  node:
+    name: replace-with-dedicated-node
+    label: trpc-runtime-gate=acceptance
+    drain_confirmation: I_UNDERSTAND_ISOLATED_NODE_DRAIN
+  hpa:
+    driver: ../scripts/kubernetes_hpa_load_driver.py
+    kubeconfig: C:/secure/hpa-driver.kubeconfig
+    context: replace-with-driver-context
+    subject: system:serviceaccount:trpc-runtime-driver:hpa-driver
+    job_image: ghcr.io/owner/trpc-hpa-backlog@sha256:<64-hex-digest>
+    job_command: [python, -c, 'print("bounded-backlog-marker")']
+
+# Explicit host ports are checked together before Compose starts. Container
+# ports remain fixed; these are host-only mappings.
+compose:
+  ports:
+    gateway: 38080
+    admin: 38081
+    postgres: 35432
+    redis: 36379
+    minio: 39000
+    minio_console: 39001
+    toxiproxy_api: 38474
+    toxiproxy_postgres: 45432
+    toxiproxy_redis: 46379
+    toxiproxy_s3: 49000
+    prometheus: 39090
+    jaeger: 36686

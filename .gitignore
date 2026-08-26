@@ -54,3 +54,4 @@ pyrightconfig.json
 # yqzl runtime.env is host-specific service configuration.  Keep only the
 # reviewed, secret-free example in version control.
 /deploy/yqzl/runtime.env
+/deploy/runtime-gate.yaml
