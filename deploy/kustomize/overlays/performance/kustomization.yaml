@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# This overlay is deliberately separate from production.  Applying it is an
+# explicit choice to run the real performance acceptance topology.
+namespace: trpc-service
+
+resources:
+  - namespace.yaml
+  - ../../base
+  - performance-network-policy.yaml
+
+images:
+  - name: trpc-agent-service
+    # Keep every runtime container on the same immutable candidate image.  The
+    # host is the configured Xuanyuan pull-through registry; update only the
+    # digest after publishing a new candidate lock.
+    newName: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service
+    digest: sha256:40b332ac00e3fefa04f90a56513a528dc25d610f312d9e06f76a608cb78003fc
+
+patches:
+  - path: performance-config-patch.yaml
+  - path: performance-replicas-patch.yaml
+  - path: performance-workload-patch.yaml

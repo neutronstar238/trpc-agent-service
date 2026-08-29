@@ -1,0 +1,38 @@
+[Unit]
+Description=tRPC Agent Service (wecom-connector standby)
+After=network-online.target trpc-agent-redis.service trpc-agent-minio.service
+Wants=network-online.target
+Requires=trpc-agent-redis.service trpc-agent-minio.service
+
+[Service]
+Type=simple
+User=trpcagent
+Group=trpcagent
+WorkingDirectory=/www/wwwroot/tx.nstarzx.cn/app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/www/wwwroot/tx.nstarzx.cn/app
+Environment=TRPC_SERVICE_RUNTIME_STATE_DIR=/run/trpc-agent-wecom-standby
+EnvironmentFile=/www/wwwroot/tx.nstarzx.cn/config/runtime.env
+EnvironmentFile=/www/wwwroot/tx.nstarzx.cn/secrets/minio-s3-access.env
+EnvironmentFile=-/www/wwwroot/tx.nstarzx.cn/config/wecom-connector.env
+ExecStart=/www/wwwroot/tx.nstarzx.cn/app/.venv/bin/trpc-service serve --role wecom-connector
+Restart=always
+RestartSec=3
+TimeoutStopSec=70
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/www/wwwroot/tx.nstarzx.cn/data /www/wwwroot/tx.nstarzx.cn/logs
+ReadOnlyPaths=/www/wwwroot/tx.nstarzx.cn/secrets
+RuntimeDirectory=trpc-agent-wecom-standby
+RuntimeDirectoryMode=0750
+UMask=0027
+TasksMax=256
+MemoryHigh=512M
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

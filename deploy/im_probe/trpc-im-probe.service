@@ -1,0 +1,37 @@
+[Unit]
+Description=Independent tRPC Feishu/WeCom acceptance probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trpcagent
+Group=trpcagent
+WorkingDirectory=/www/wwwroot/tx.nstarzx.cn/app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/www/wwwroot/tx.nstarzx.cn/config/im-probe.env
+ExecStartPre=/www/wwwroot/tx.nstarzx.cn/app/.venv/bin/python /www/wwwroot/tx.nstarzx.cn/app/deploy/im_probe/server.py --check
+ExecStart=/www/wwwroot/tx.nstarzx.cn/app/.venv/bin/python /www/wwwroot/tx.nstarzx.cn/app/deploy/im_probe/server.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/www/wwwroot/tx.nstarzx.cn/app /www/wwwroot/tx.nstarzx.cn/secrets
+UMask=0077
+TasksMax=128
+MemoryHigh=256M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
