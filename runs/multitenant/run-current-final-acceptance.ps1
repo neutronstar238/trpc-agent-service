@@ -102,20 +102,45 @@ function Stop-OwnedPortForwards {
 }
 
 function Refresh-HpaDriverCredential {
+    $adminConfig = & $kubectl --kubeconfig $kubeconfig --context $context `
+        config view --raw --minify -o json | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $null -eq $adminConfig.clusters -or $adminConfig.clusters.Count -ne 1) {
+        throw "current ACK cluster configuration could not be read"
+    }
+    $server = [string]$adminConfig.clusters[0].cluster.server
+    $certificateAuthorityData = [string]$adminConfig.clusters[0].cluster.'certificate-authority-data'
+    if ($server -notmatch '^https://[^/]+$' -or [string]::IsNullOrWhiteSpace($certificateAuthorityData)) {
+        throw "current ACK server or certificate authority is invalid"
+    }
     $token = & $kubectl --kubeconfig $kubeconfig --context $context `
         --namespace $hpaDriverNamespace create token $hpaDriverServiceAccount --duration=2h
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
         throw "HPA driver TokenRequest failed"
     }
+    $temporaryKubeconfig = "$hpaDriverKubeconfig.$([Guid]::NewGuid().ToString('N')).tmp"
+    $temporaryCertificateAuthority = "$temporaryKubeconfig.ca"
     try {
-        & $kubectl --kubeconfig $hpaDriverKubeconfig config set-credentials hpa-driver `
+        [IO.File]::WriteAllBytes(
+            $temporaryCertificateAuthority,
+            [Convert]::FromBase64String($certificateAuthorityData)
+        )
+        & $kubectl --kubeconfig $temporaryKubeconfig config set-cluster current-ack `
+            --server=$server --certificate-authority=$temporaryCertificateAuthority --embed-certs=true | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "HPA driver cluster configuration failed" }
+        & $kubectl --kubeconfig $temporaryKubeconfig config set-credentials hpa-driver `
             --token=$($token.Trim()) | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "HPA driver kubeconfig credential update failed"
-        }
+        if ($LASTEXITCODE -ne 0) { throw "HPA driver credential update failed" }
+        & $kubectl --kubeconfig $temporaryKubeconfig config set-context $hpaDriverContext `
+            --cluster=current-ack --user=hpa-driver --namespace=$hpaDriverNamespace | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "HPA driver context configuration failed" }
+        & $kubectl --kubeconfig $temporaryKubeconfig config use-context $hpaDriverContext | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "HPA driver context selection failed" }
+        Move-Item -LiteralPath $temporaryKubeconfig -Destination $hpaDriverKubeconfig -Force
     }
     finally {
         $token = $null
+        Remove-Item -LiteralPath $temporaryKubeconfig -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $temporaryCertificateAuthority -Force -ErrorAction SilentlyContinue
     }
     $actualSubject = & $kubectl --kubeconfig $hpaDriverKubeconfig --context $hpaDriverContext `
         auth whoami -o "jsonpath={.status.userInfo.username}"
@@ -143,9 +168,8 @@ if (
 ) {
     throw "candidate lock identity is incomplete"
 }
-$candidateName = $fp.Substring(0, 12)
 $initialId = $candidateDigest
-$releaseContextPath = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-$candidateName-amd64.json"
+$releaseContextPath = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-$releaseId-amd64.json"
 
 Invoke-Python -Arguments @(
     "-m", "scripts.release_context", "verify",

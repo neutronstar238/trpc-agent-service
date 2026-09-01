@@ -44,6 +44,7 @@ pyrightconfig.json
 !/runs/multitenant/run-final-fault-gate.ps1
 !/runs/multitenant/run-final-runtime-gates.ps1
 !/runs/multitenant/run-final-ack-performance.ps1
+!/runs/multitenant/run-current-candidate-session.ps1
 !/runs/multitenant/run-ack-backend-gate.py
 !/runs/multitenant/bind_published_candidate.py
 !/runs/multitenant/project_kubernetes_secrets.py

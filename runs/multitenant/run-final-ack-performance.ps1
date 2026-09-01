@@ -88,8 +88,8 @@ if (
 $candidateName = $expectedSource.Substring(0, 12)
 $renderedSupport = Join-Path $projectRoot "runs/multitenant/rendered/support-$candidateName"
 $renderedPerformance = Join-Path $projectRoot "runs/multitenant/rendered/performance-$candidateName"
-$privateReleaseContext = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-$candidateName-amd64.json"
-$publicReleaseContext = Join-Path $projectRoot "runs/multitenant/release-context-binding-$candidateName-amd64.json"
+$privateReleaseContext = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-$releaseId-amd64.json"
+$publicReleaseContext = Join-Path $projectRoot "runs/multitenant/release-context-binding-$releaseId-amd64.json"
 
 & $python scripts/release_context.py verify `
     --private-context $privateReleaseContext `

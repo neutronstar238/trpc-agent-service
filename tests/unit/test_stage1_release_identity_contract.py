@@ -22,7 +22,7 @@ def test_stage1_reuses_verified_context_and_binds_canonical_index_digests() -> N
         assert ".images.initial.reference" in script
         assert ".release_binding.release_id" in script
         assert ".binding_sha256" in script
-        assert "release-context-$candidateName-amd64.json" in script
+        assert "release-context-$releaseId-amd64.json" in script
         assert "candidate lock changed while its release context was being verified" in script
 
     assert "scripts/release_context.py verify" in stage1

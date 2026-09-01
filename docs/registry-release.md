@@ -1,30 +1,32 @@
 # Registry candidate release
 
-`scripts/registry_image.py` creates the two immutable image references needed by
+`scripts/candidate_session.py` orchestrates the two immutable image references needed by
 the production Kubernetes gate: an initial candidate and a distinct rollout
-candidate. It computes the current checkout fingerprint, passes it to the
-Dockerfile, verifies the image label, pushes both tags, and reads the registry
-manifest digest from Docker's push result. The output is bound to
-`TRPC_RELEASE_ID` and the SHA-256 of `TRPC_RELEASE_NONCE`; the raw nonce is
-never written or printed.
+candidate. It invokes the registry publisher exactly once, writes that first
+result only as a private receipt, creates one release-specific private context,
+then rebinds the already-published immutable digests to the context nonce. The
+formal binding and lock are staged and installed as a pair only after their
+release ID, nonce hash, source fingerprint, and both image digests agree. The
+raw nonce is never written to a public artifact or printed.
 
 The command uses a single-platform `linux/amd64` build so the digest observed
 by the registry and Kubernetes refers to the same manifest. It does not apply
 Kubernetes resources.
 
 ```powershell
-$env:TRPC_RELEASE_ID = "release-20260825-example"
-$env:TRPC_RELEASE_NONCE = "<inject-a-random-32-byte-url-safe-value>"
 $repository = "ghcr.io/<owner>/trpc-agent-service"
 
-.venv\Scripts\python.exe scripts\registry_image.py publish `
+.venv\Scripts\python.exe -m scripts.candidate_session publish `
   --repository $repository `
   --output runs\multitenant\registry-image-binding.json `
-  --lock-output runs\multitenant\candidate-lock.json
+  --lock-output runs\multitenant\candidate-lock.json `
+  --private-directory runs\multitenant\.ack-runtime-private `
+  --public-directory runs\multitenant
 ```
 
 The Docker credential helper supplies authentication. The command only prints
-the repository, source fingerprint, immutable references, and digest; do not
+the release ID, source fingerprint, immutable references, artifact paths, and
+binding digest; do not
 replace it with `docker login --password` or echo credential variables.
 
 After the command succeeds, load the binding report and pass the values to the

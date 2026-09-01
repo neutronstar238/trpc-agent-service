@@ -62,3 +62,43 @@ def test_binding_rejects_equal_digests(tmp_path: Path) -> None:
             lock_output=tmp_path / "lock.json",
             root=tmp_path,
         )
+
+
+def test_binding_restores_old_pair_when_lock_install_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    source = source_fingerprint(tmp_path)["value"]
+    monkeypatch.setenv("TRPC_RELEASE_ID", "release-test-rollback")
+    monkeypatch.setenv("TRPC_RELEASE_NONCE", "r" * 32)
+    output = tmp_path / "binding.json"
+    lock = tmp_path / "lock.json"
+    output.write_text('{"old":"binding"}\n', encoding="utf-8")
+    lock.write_text('{"old":"lock"}\n', encoding="utf-8")
+    globals_ = module.install_candidate_pair.__globals__
+    original_replace = globals_["_replace_file"]
+    calls = 0
+
+    def fail_second(source_path: Path, target_path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated lock replacement failure")
+        original_replace(source_path, target_path)
+
+    monkeypatch.setitem(globals_, "_replace_file", fail_second)
+    with pytest.raises(OSError, match="simulated"):
+        module.bind_published_candidate(
+            expected_source=source,
+            repository="docker.io/example/service",
+            initial_tag="candidate-a",
+            initial_digest="sha256:" + "a" * 64,
+            upgrade_tag="candidate-b",
+            upgrade_digest="sha256:" + "b" * 64,
+            output=output,
+            lock_output=lock,
+            root=tmp_path,
+        )
+
+    assert output.read_text(encoding="utf-8") == '{"old":"binding"}\n'
+    assert lock.read_text(encoding="utf-8") == '{"old":"lock"}\n'

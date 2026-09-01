@@ -19,9 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.candidate_lock import create_candidate_lock
+from scripts.candidate_session import install_candidate_pair
 from scripts.evidence_lineage import current_release_binding, source_fingerprint
 from scripts.registry_image import registry_reference, validate_repository, validate_tag
-from scripts.report_io import atomic_write_json
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -80,8 +80,8 @@ def bind_published_candidate(
             },
         },
     }
-    atomic_write_json(output, binding)
-    create_candidate_lock(binding, root=root, output=lock_output)
+    lock = create_candidate_lock(binding, root=root)
+    install_candidate_pair(binding, lock, output=output, lock_output=lock_output)
     return binding
 
 
