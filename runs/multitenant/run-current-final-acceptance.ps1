@@ -232,21 +232,25 @@ if ($StartStage -le 3 -and $EndStage -ge 3) {
     if ($LASTEXITCODE -ne 0) {
         throw "backlog exporter did not become ready on the workload node"
     }
-    $migrationJob = & $kubectl --kubeconfig $kubeconfig --context $context `
-        --namespace $serviceNamespace get job/trpc-schema-migration --ignore-not-found -o name
-    if ($LASTEXITCODE -ne 0) {
-        throw "schema migration Job state could not be observed"
-    }
-    if (-not [string]::IsNullOrWhiteSpace($migrationJob)) {
-        & $kubectl --kubeconfig $kubeconfig --context $context --namespace $serviceNamespace `
-            wait --for=condition=complete job/trpc-schema-migration --timeout=60s
+    $completedSchemaJobs = @("trpc-schema-migration", "trpc-schema-head-check")
+    foreach ($schemaJob in $completedSchemaJobs) {
+        $schemaJobResource = "job/$schemaJob"
+        $existingSchemaJob = & $kubectl --kubeconfig $kubeconfig --context $context `
+            --namespace $serviceNamespace get $schemaJobResource --ignore-not-found -o name
         if ($LASTEXITCODE -ne 0) {
-            throw "schema migration Job is not complete and cannot be safely removed"
+            throw "$schemaJob Job state could not be observed"
         }
-        & $kubectl --kubeconfig $kubeconfig --context $context --namespace $serviceNamespace `
-            delete job/trpc-schema-migration --wait=true
-        if ($LASTEXITCODE -ne 0) {
-            throw "completed schema migration Job could not be removed from the drain node"
+        if (-not [string]::IsNullOrWhiteSpace($existingSchemaJob)) {
+            & $kubectl --kubeconfig $kubeconfig --context $context --namespace $serviceNamespace `
+                wait --for=condition=complete $schemaJobResource --timeout=60s
+            if ($LASTEXITCODE -ne 0) {
+                throw "$schemaJob Job is not complete and cannot be safely removed"
+            }
+            & $kubectl --kubeconfig $kubeconfig --context $context --namespace $serviceNamespace `
+                delete $schemaJobResource --wait=true
+            if ($LASTEXITCODE -ne 0) {
+                throw "completed $schemaJob Job could not be removed from the drain node"
+            }
         }
     }
     # Stage 1 pins the performance topology at exactly four workers.  Restore
