@@ -59,6 +59,14 @@ def test_yqzl_provision_keeps_database_passwords_out_of_psql_argv() -> None:
     assert "trap cleanup_sensitive_values EXIT" in script
 
 
+def test_yqzl_provision_makes_the_root_built_venv_executable_by_the_service_group() -> None:
+    script = PROVISION_SCRIPT.read_text(encoding="utf-8")
+
+    assert '[[ ! -x "$APP_ROOT/.venv/bin/trpc-service" ]]' in script
+    assert 'chown -R root:"$SERVICE_GROUP" "$APP_ROOT/.venv"' in script
+    assert 'chmod -R g+rX,o-rwx "$APP_ROOT/.venv"' in script
+
+
 def test_yqzl_role_bootstrap_uses_stdin_getenv_and_preserves_secrets() -> None:
     script = ROLE_BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
 

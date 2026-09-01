@@ -48,6 +48,15 @@ fi
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --home-dir "$SITE_ROOT" --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
+if [[ ! -x "$APP_ROOT/.venv/bin/trpc-service" ]]; then
+  echo "the active release virtual environment is missing trpc-service" >&2
+  exit 1
+fi
+# Release preparation runs as root and may inherit a restrictive umask.  Keep
+# the virtual environment immutable to the service account while ensuring the
+# service group can traverse directories and execute the installed entrypoint.
+chown -R root:"$SERVICE_GROUP" "$APP_ROOT/.venv"
+chmod -R g+rX,o-rwx "$APP_ROOT/.venv"
 
 install -d -m 0755 -o root -g root "$SITE_ROOT"
 install -d -m 0755 -o www -g www "$SITE_ROOT/.well-known" "$SITE_ROOT/.well-known/acme-challenge"
