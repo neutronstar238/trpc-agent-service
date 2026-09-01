@@ -1140,9 +1140,23 @@ def load_runtime_gate_config(path: Path) -> RuntimeGateConfig:
         root["release"],
         path="release",
         allowed={"id", "nonce_env", "image_binding"},
-        required={"id", "nonce_env", "image_binding"},
+        required={"nonce_env", "image_binding"},
     )
-    release_id = _string(release["id"], path="release.id")
+    image_binding = _resolved_path(
+        release["image_binding"], path="release.image_binding", base=base
+    )
+    if "id" in release:
+        release_id = _string(release["id"], path="release.id")
+    else:
+        binding = _image_references(image_binding)[2]
+        release_binding = binding.get("release_binding")
+        binding_release_id = (
+            release_binding.get("release_id") if isinstance(release_binding, Mapping) else None
+        )
+        release_id = _string(
+            binding_release_id,
+            path="release.image_binding.release_binding.release_id",
+        )
     if RELEASE_ID_RE.fullmatch(release_id) is None:
         raise DeploymentConfigError("release.id is invalid")
     nonce_env = _string(release["nonce_env"], path="release.nonce_env")
@@ -1241,11 +1255,16 @@ def load_runtime_gate_config(path: Path) -> RuntimeGateConfig:
     subject = _string(hpa["subject"], path="kubernetes.hpa.subject")
     if SUBJECT_RE.fullmatch(subject) is None:
         raise DeploymentConfigError("kubernetes.hpa.subject is invalid")
-    hpa_job_image = _validate_pull_registry_image(
-        _string(hpa["job_image"], path="kubernetes.hpa.job_image"),
-        pull_registry=pull_registry,
-        path="kubernetes.hpa.job_image",
-    )
+    hpa_job_image_value = _string(hpa["job_image"], path="kubernetes.hpa.job_image")
+    if hpa_job_image_value == "candidate_initial":
+        canonical_initial = _image_references(image_binding)[0]
+        hpa_job_image = _rewrite_image_registry(canonical_initial, pull_registry)
+    else:
+        hpa_job_image = _validate_pull_registry_image(
+            hpa_job_image_value,
+            pull_registry=pull_registry,
+            path="kubernetes.hpa.job_image",
+        )
     job_command = hpa["job_command"]
     if (
         not isinstance(job_command, Sequence)
@@ -1281,9 +1300,7 @@ def load_runtime_gate_config(path: Path) -> RuntimeGateConfig:
         path=resolved,
         release_id=release_id,
         nonce_env=nonce_env,
-        image_binding=_resolved_path(
-            release["image_binding"], path="release.image_binding", base=base
-        ),
+        image_binding=image_binding,
         kubeconfig=_resolved_path(
             kubernetes["kubeconfig"], path="kubernetes.kubeconfig", base=base
         ),

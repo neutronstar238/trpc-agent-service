@@ -16,6 +16,7 @@ import os
 import re
 import socket
 import stat
+import struct
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -52,7 +53,16 @@ BROKER_ACTIONS = {
     "prolonged_outage": "feishu_prolonged_outage",
     "ambiguous": "feishu_ambiguous",
 }
-ACK_CASES = frozenset({"round_trip", "reconnect", "rate_limit_retry_after", "ambiguous"})
+ACK_CASES = frozenset(
+    {
+        "round_trip",
+        "reconnect",
+        "rate_limit_retry_after",
+        "credential_rotation",
+        "prolonged_outage",
+        "ambiguous",
+    }
+)
 REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -60,6 +70,9 @@ REQUEST_FIELDS = frozenset(
         "run_id",
         "run_nonce",
         "expected_image_digest",
+        "release_id",
+        "release_nonce_sha256",
+        "source_fingerprint",
         "control_profile_sha256",
         "cases",
     }
@@ -163,6 +176,8 @@ OBSERVATION_FIELDS = {
 PROFILE_ENV = "TRPC_IM_PROBE_FEISHU_CONTROL_PROFILE_FILE"
 ACCOUNT_ENV = "TRPC_IM_PROBE_FEISHU_APP_ID"
 BROKER_SOCKET_ENV = "TRPC_IM_PROBE_CONTROL_SOCKET"
+BROKER_UID_ENV = "TRPC_IM_PROBE_BROKER_UID"
+BROKER_GID_ENV = "TRPC_IM_PROBE_BROKER_GID"
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -172,6 +187,7 @@ _AF_UNIX = cast(int | None, getattr(socket, "AF_UNIX", None))
 
 SocketValidator = Callable[[str, str], Path]
 Exchange = Callable[[Path, bytes, float, int], bytes]
+BrokerExchange = Callable[[Path, bytes, float, int, int, int], bytes]
 
 
 class DriverError(RuntimeError):
@@ -254,12 +270,21 @@ def _parse_request(value: object) -> dict[str, Any]:
     run_id = value.get("run_id")
     run_nonce = value.get("run_nonce")
     digest = value.get("expected_image_digest")
+    release_id = value.get("release_id")
     if not isinstance(run_id, str) or SAFE_ID_RE.fullmatch(run_id) is None:
         raise DriverError("request run binding is invalid")
     if not isinstance(run_nonce, str) or NONCE_RE.fullmatch(run_nonce) is None:
         raise DriverError("request nonce is invalid")
     if not isinstance(digest, str) or IMAGE_RE.fullmatch(digest) is None:
         raise DriverError("request image digest is invalid")
+    if not isinstance(release_id, str) or SAFE_ID_RE.fullmatch(release_id) is None:
+        raise DriverError("request release id is invalid")
+    release_nonce_sha256 = _safe_hash(
+        value.get("release_nonce_sha256"), label="request release nonce hash"
+    )
+    deployed_source_fingerprint = _safe_hash(
+        value.get("source_fingerprint"), label="request source fingerprint"
+    )
     profile_hash = _safe_hash(
         value.get("control_profile_sha256"), label="request control profile hash"
     )
@@ -276,6 +301,9 @@ def _parse_request(value: object) -> dict[str, Any]:
         "run_id": run_id,
         "run_nonce": run_nonce,
         "expected_image_digest": digest,
+        "release_id": release_id,
+        "release_nonce_sha256": release_nonce_sha256,
+        "source_fingerprint": deployed_source_fingerprint,
         "control_profile_sha256": profile_hash,
         "cases": list(REQUIRED_CASES),
     }
@@ -388,6 +416,44 @@ def _broker_socket(environment: Mapping[str, str], socket_validator: SocketValid
     return socket_validator(raw, "broker socket")
 
 
+def _broker_identity(environment: Mapping[str, str]) -> tuple[int, int]:
+    try:
+        uid = int(environment.get(BROKER_UID_ENV, ""))
+        gid = int(environment.get(BROKER_GID_ENV, ""))
+    except ValueError as error:
+        raise DriverError("broker identity is invalid") from error
+    if uid < 0 or gid < 0:
+        raise DriverError("broker identity is invalid")
+    if sys.platform.startswith("linux"):
+        current_euid = getattr(os, "geteuid", None)
+        if current_euid is None or uid == current_euid():
+            raise DriverError("control broker must use a dedicated uid")
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise DriverError("Linux SO_PEERCRED is unavailable")
+    return uid, gid
+
+
+def _verify_connected_broker_peer(
+    connection: socket.socket,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        raw = connection.getsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_PEERCRED,
+            struct.calcsize("3i"),
+        )
+        _pid, uid, gid = struct.unpack("3i", raw)
+    except (OSError, struct.error) as error:
+        raise DriverError("control broker peer identity is unavailable") from error
+    if uid != expected_uid or gid != expected_gid:
+        raise DriverError("control broker peer identity does not match")
+
+
 def _unix_exchange(path: Path, payload: bytes, timeout: float, limit: int) -> bytes:
     if _AF_UNIX is None:
         raise DriverError("control socket is unavailable")
@@ -405,6 +471,44 @@ def _unix_exchange(path: Path, payload: bytes, timeout: float, limit: int) -> by
             if not chunk:
                 break
             received.extend(chunk)
+    except OSError as error:
+        raise DriverError("control socket exchange failed") from error
+    finally:
+        connection.close()
+    return bytes(received).split(b"\n", 1)[0]
+
+
+def _authenticated_broker_exchange(
+    path: Path,
+    payload: bytes,
+    timeout: float,
+    limit: int,
+    expected_uid: int,
+    expected_gid: int,
+) -> bytes:
+    if _AF_UNIX is None:
+        raise DriverError("control socket is unavailable")
+    if timeout <= 0:
+        raise DriverError("driver time budget is exhausted")
+    connection = socket.socket(_AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(timeout)
+    received = bytearray()
+    try:
+        connection.connect(str(path))
+        _verify_connected_broker_peer(
+            connection,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        connection.sendall(payload + b"\n")
+        connection.shutdown(socket.SHUT_WR)
+        while len(received) <= limit:
+            chunk = connection.recv(min(4096, limit + 1 - len(received)))
+            if not chunk:
+                break
+            received.extend(chunk)
+    except DriverError:
+        raise
     except OSError as error:
         raise DriverError("control socket exchange failed") from error
     finally:
@@ -719,11 +823,29 @@ def run_driver(
     environment: Mapping[str, str],
     *,
     exchange: Exchange = _unix_exchange,
+    broker_exchange: BrokerExchange | None = None,
     socket_validator: SocketValidator = _validate_unix_socket,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     request = _parse_request(request_value)
     broker_socket = _broker_socket(environment, socket_validator)
+    broker_uid, broker_gid = _broker_identity(environment)
+    if broker_exchange is None:
+        if exchange is _unix_exchange:
+            broker_exchange = _authenticated_broker_exchange
+        else:
+
+            def injected_broker_exchange(
+                path: Path,
+                payload: bytes,
+                timeout: float,
+                limit: int,
+                _uid: int,
+                _gid: int,
+            ) -> bytes:
+                return exchange(path, payload, timeout, limit)
+
+            broker_exchange = injected_broker_exchange
     profile = _load_profile(
         environment,
         expected_sha256=cast(str, request["control_profile_sha256"]),
@@ -747,11 +869,13 @@ def run_driver(
                 "observer_profile_sha256": profile.observer_profile_sha256,
             },
         }
-        broker_raw = exchange(
+        broker_raw = broker_exchange(
             broker_socket,
             _canonical_json(broker_request),
             _remaining(deadline, monotonic),
             MAX_BROKER_RESPONSE_BYTES,
+            broker_uid,
+            broker_gid,
         )
         observation, callback_query, callback_expected, witness_binding = _parse_broker_response(
             broker_raw,
@@ -803,6 +927,7 @@ def check_configuration(
     socket_validator: SocketValidator = _validate_unix_socket,
 ) -> dict[str, str]:
     _broker_socket(environment, socket_validator)
+    _broker_identity(environment)
     _load_profile(
         environment,
         expected_sha256=None,

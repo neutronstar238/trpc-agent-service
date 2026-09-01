@@ -85,6 +85,12 @@ Job 内部入口必须使用 `python -m scripts.dr_functional_job`，不要改�
 `runs/multitenant/disaster-recovery-functional.json`，功能检查通过也不能用于
 `scripts.disaster_recovery_gate.py --require-production`。
 
+发布聚合默认仍要求上述破坏性生产灾备真实 `pass`。只有发布者显式给 release gate 和 manifest 都传入
+`--allow-functional-dr`，才能用当前候选的功能灾备 `pass` 授权破坏性报告保持 `not_run`；聚合结果必须
+记录 `authorized_not_run_gates=[disaster_recovery]`。破坏性报告为 `fail`、功能报告缺少三个组件、cleanup、
+lineage 或正确 producer 时都不能授权，`online_im` 和其他门禁也不受影响。该模式的 manifest 绑定功能
+灾备报告和 policy，排除未运行的破坏性报告；policy 或所绑定报告被篡改时最终门禁失败。
+
 调度器 `v1` 与 `v2` 的 Redis stream、consumer group 和数据库处理语义不同。相同版本的
 代码升级可以使用 Kubernetes RollingUpdate；`v1↔v2` 是协议切换，必须先停入站、排空旧
 版本的 PostgreSQL outbox/Redis group 和执行 lease，再在所有相关 Pod 为 0 时切换配置并

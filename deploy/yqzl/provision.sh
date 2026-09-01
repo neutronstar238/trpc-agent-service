@@ -8,9 +8,6 @@ readonly SERVICE_GROUP=trpcagent
 readonly PG_BIN=/www/server/pgsql/bin
 readonly PG_CONFIG="$PG_BIN/pg_config"
 readonly DATABASE_NAME=trpc_agent_service
-readonly MIGRATION_ROLE=trpc_migration
-readonly RUNTIME_ROLE=trpc_runtime
-readonly WORKER_ROLE=trpc_worker
 readonly METRICS_ROLE=trpc_metrics
 readonly METRICS_SECRET_NAME=trpc-metrics-secrets
 readonly METRICS_SECRET_KEY=TRPC_SERVICE_METRICS_DATABASE_DSN
@@ -21,10 +18,7 @@ declare -a secret_temp_paths=()
 
 cleanup_sensitive_values() {
   local path
-  unset runtime_password migration_password redis_password worker_password metrics_password \
-    metrics_password_uri metrics_database_dsn \
-    TRPC_PROVISION_RUNTIME_PASSWORD TRPC_PROVISION_MIGRATION_PASSWORD \
-    TRPC_PROVISION_WORKER_PASSWORD TRPC_PROVISION_METRICS_PASSWORD
+  unset redis_password metrics_password metrics_password_uri metrics_database_dsn
   for path in "${secret_temp_paths[@]}"; do
     case "$path" in
       "$SITE_ROOT"/secrets/.secret.*|"$SITE_ROOT"/secrets/.minio-env.*|\
@@ -112,10 +106,6 @@ make_secret() {
   mv "$temporary" "$path"
 }
 
-make_secret "$SITE_ROOT/secrets/migration_database_password" password
-make_secret "$SITE_ROOT/secrets/runtime_database_password" password
-make_secret "$SITE_ROOT/secrets/worker_database_password" password
-make_secret "$SITE_ROOT/secrets/metrics_database_password" password
 make_secret "$SITE_ROOT/secrets/redis_password" password
 make_secret "$SITE_ROOT/secrets/session_hmac_key" session
 make_secret "$SITE_ROOT/secrets/emergency_queue_key" exact32
@@ -124,12 +114,6 @@ make_secret "$SITE_ROOT/secrets/minio_root_user" minio_user
 make_secret "$SITE_ROOT/secrets/minio_root_password" password
 make_secret "$SITE_ROOT/config/feishu_binding_id" feishu_binding
 make_secret "$SITE_ROOT/config/wecom_binding_id" wecom_binding
-chown root:root "$SITE_ROOT/secrets/migration_database_password"
-chmod 0600 "$SITE_ROOT/secrets/migration_database_password"
-chown root:root "$SITE_ROOT/secrets/worker_database_password"
-chmod 0600 "$SITE_ROOT/secrets/worker_database_password"
-chown root:root "$SITE_ROOT/secrets/metrics_database_password"
-chmod 0600 "$SITE_ROOT/secrets/metrics_database_password"
 chown root:"$SERVICE_GROUP" "$SITE_ROOT/secrets/minio_root_user" \
   "$SITE_ROOT/secrets/minio_root_password"
 chmod 0640 "$SITE_ROOT/secrets/minio_root_user" "$SITE_ROOT/secrets/minio_root_password"
@@ -187,57 +171,11 @@ if ! install_pg_extension vector; then
   case "$vector_work" in /tmp/trpc-pgvector.*) rm -rf -- "$vector_work" ;; esac
 fi
 
-runtime_password=$(<"$SITE_ROOT/secrets/runtime_database_password")
-migration_password=$(<"$SITE_ROOT/secrets/migration_database_password")
-worker_password=$(<"$SITE_ROOT/secrets/worker_database_password")
-metrics_password=$(<"$SITE_ROOT/secrets/metrics_database_password")
-export TRPC_PROVISION_RUNTIME_PASSWORD="$runtime_password"
-export TRPC_PROVISION_MIGRATION_PASSWORD="$migration_password"
-export TRPC_PROVISION_WORKER_PASSWORD="$worker_password"
-export TRPC_PROVISION_METRICS_PASSWORD="$metrics_password"
+install -m 0640 -o root -g "$SERVICE_GROUP" "$runtime_env_source" "$SITE_ROOT/config/runtime.env"
+install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/gateway.env" "$SITE_ROOT/config/gateway.env"
+install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/admin.env" "$SITE_ROOT/config/admin.env"
 
-{
-  printf '%s\n' \
-    '\getenv runtime_password TRPC_PROVISION_RUNTIME_PASSWORD' \
-    '\getenv migration_password TRPC_PROVISION_MIGRATION_PASSWORD' \
-    '\getenv worker_password TRPC_PROVISION_WORKER_PASSWORD' \
-    '\getenv metrics_password TRPC_PROVISION_METRICS_PASSWORD'
-  cat <<'SQL'
-SELECT format('CREATE ROLE trpc_migration LOGIN NOINHERIT PASSWORD %L', :'migration_password')
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_migration') \gexec
-SELECT format('ALTER ROLE trpc_migration PASSWORD %L', :'migration_password') \gexec
-SELECT format('CREATE ROLE trpc_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD %L', :'runtime_password')
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_runtime') \gexec
-ALTER ROLE trpc_runtime NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
-SELECT format('ALTER ROLE trpc_runtime PASSWORD %L', :'runtime_password') \gexec
-SELECT format('CREATE ROLE trpc_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS PASSWORD %L', :'worker_password')
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_worker') \gexec
-ALTER ROLE trpc_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
-SELECT format('ALTER ROLE trpc_worker PASSWORD %L', :'worker_password') \gexec
-SELECT format('CREATE ROLE trpc_metrics LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD %L', :'metrics_password')
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_metrics') \gexec
-ALTER ROLE trpc_metrics LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
-SELECT format('ALTER ROLE trpc_metrics PASSWORD %L', :'metrics_password') \gexec
-SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), 'trpc_metrics') \gexec
-SQL
-} | runuser --preserve-environment -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1
-
-if ! runuser -u postgres -- "$PG_BIN/psql" -Atc \
-  "SELECT 1 FROM pg_database WHERE datname='$DATABASE_NAME'" | grep -qx 1; then
-  runuser -u postgres -- "$PG_BIN/createdb" --owner="$MIGRATION_ROLE" "$DATABASE_NAME"
-fi
-
-runuser -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1 \
-  --dbname="$DATABASE_NAME" -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto' \
-  -c 'CREATE EXTENSION IF NOT EXISTS vector'
-
-# The role bootstrap above runs against PostgreSQL's maintenance database.
-# Grant access to the application database as well; this is the database used
-# by the exporter DSN and is created after the global roles.
-runuser -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1 \
-  --dbname="$DATABASE_NAME" <<'SQL'
-SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), 'trpc_metrics') \gexec
-SQL
+bash "$APP_ROOT/deploy/yqzl/bootstrap_database_roles.sh"
 
 _url_encode_uri_component() {
   local value=$1
@@ -259,15 +197,6 @@ _url_encode_uri_component() {
   done
   printf '%s' "$encoded"
 }
-
-{
-  printf '%s\n' \
-    '\getenv runtime_password TRPC_PROVISION_RUNTIME_PASSWORD' \
-    '\getenv migration_password TRPC_PROVISION_MIGRATION_PASSWORD' \
-    '\getenv worker_password TRPC_PROVISION_WORKER_PASSWORD'
-  cat "$APP_ROOT/deploy/postgres/bootstrap.sql"
-} | runuser --preserve-environment -u postgres -- "$PG_BIN/psql" \
-  --set=ON_ERROR_STOP=1 --dbname="$DATABASE_NAME"
 
 publish_metrics_kubernetes_secret() {
   # Bare-metal installs leave the namespace unset.  ACK deployments opt in by
@@ -293,6 +222,7 @@ publish_metrics_kubernetes_secret() {
     return 1
   }
 
+  metrics_password=$(<"$SITE_ROOT/secrets/metrics_database_password")
   metrics_password_uri=$(_url_encode_uri_component "$metrics_password")
   metrics_database_dsn="postgresql://${METRICS_ROLE}:${metrics_password_uri}@${metrics_database_host}:${metrics_database_port}/${DATABASE_NAME}"
   temporary=$(mktemp "$SITE_ROOT/secrets/.metrics-dsn.XXXXXX")
@@ -320,9 +250,6 @@ printf 'user default on >%s ~* &* +@all\n' "$redis_password" >"$SITE_ROOT/secret
 chown root:"$SERVICE_GROUP" "$SITE_ROOT/secrets/redis.acl"
 chmod 0640 "$SITE_ROOT/secrets/redis.acl"
 
-install -m 0640 -o root -g "$SERVICE_GROUP" "$runtime_env_source" "$SITE_ROOT/config/runtime.env"
-install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/gateway.env" "$SITE_ROOT/config/gateway.env"
-install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/admin.env" "$SITE_ROOT/config/admin.env"
 install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/redis.conf" "$SITE_ROOT/config/redis.conf"
 install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent-redis.service" /etc/systemd/system/trpc-agent-redis.service
 install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent@.service" /etc/systemd/system/trpc-agent@.service

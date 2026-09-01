@@ -44,6 +44,7 @@ class FakeConnection:
             "session_mailbox_items": 0,
             "wecom_connection_state": 0,
             "im_acceptance_evidence_events": 0,
+            "im_acceptance_runs": 0,
             "migration_checkpoints": 0,
             "migration_scope_manifests": 0,
             "migration_leases": 0,
@@ -374,6 +375,7 @@ async def test_single_active_tenant_and_target_empty_preflight() -> None:
         "session_mailbox_items",
         "wecom_connection_state",
         "im_acceptance_evidence_events",
+        "im_acceptance_runs",
         "migration_checkpoints",
         "migration_scope_manifests",
         "migration_leases",
@@ -384,12 +386,17 @@ async def test_single_active_tenant_and_target_empty_preflight() -> None:
     assert "public.migration_protected_target_counts($1)" in target_query
     assert "FROM public.wecom_connection_state" not in target_query
     assert "FROM public.im_acceptance_evidence_events" not in target_query
+    assert "FROM public.im_acceptance_runs" not in target_query
     connection.target_counts["memories"] = 1
     with pytest.raises(MigrationTargetNotEmpty, match="memories"):
         await guard.target_empty_preflight("tenant-1")
     connection.target_counts["memories"] = 0
     connection.target_counts["im_acceptance_evidence_events"] = 1
     with pytest.raises(MigrationTargetNotEmpty, match="im_acceptance_evidence_events"):
+        await guard.target_empty_preflight("tenant-1")
+    connection.target_counts["im_acceptance_evidence_events"] = 0
+    connection.target_counts["im_acceptance_runs"] = 1
+    with pytest.raises(MigrationTargetNotEmpty, match="im_acceptance_runs"):
         await guard.target_empty_preflight("tenant-1")
 
 

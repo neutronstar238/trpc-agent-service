@@ -120,6 +120,16 @@ def _control_profiles(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     return profiles
 
 
+def _artifact_attestation() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "runner_sha256": "1" * 64,
+        "runner_contract_version": 1,
+        "driver_sha256": "2" * 64,
+        "driver_contract_version": 1,
+    }
+
+
 def _observations(channel: str, nonce: str) -> dict[str, dict[str, object]]:
     timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     common = {"status": "pass", "run_nonce": nonce, "observed_at": timestamp}
@@ -219,9 +229,19 @@ def _observations(channel: str, nonce: str) -> dict[str, dict[str, object]]:
                 "old_lock_owner_released": True,
                 "new_lock_owner_acquired": True,
                 "lock_epoch": 2,
+                "outbound_request_id": "wecom-reconnect-request",
+                "acknowledged_request_id": "wecom-reconnect-request",
+                "provider_code": 0,
             }
         )
     if channel == "wecom":
+        observations["credential_rotation"].update(
+            {
+                "outbound_request_id": "wecom-rotation-request",
+                "acknowledged_request_id": "wecom-rotation-request",
+                "provider_code": 0,
+            }
+        )
         observations["prolonged_outage"].update(
             {
                 "outage_mode": "service_failover",
@@ -322,6 +342,7 @@ def test_provider_evidence_is_sanitized_and_keeps_required_case_identity(
             "independent_paths": ["provider_callback", "provider_send_ack"],
             "run_nonce": "nonce",
             "account_fingerprint": account_hash,
+            "artifact_attestation": _artifact_attestation(),
             "observations": _observations("feishu", "nonce"),
             "message_body": "must never be copied",
         },
@@ -357,6 +378,7 @@ def test_provider_evidence_is_sanitized_and_keeps_required_case_identity(
     assert "received_after_failover_event_id_hash" in reconnect
     assert "lock_epoch" not in reconnect
     assert evidence["observations"]["rate_limit_retry_after"]["retry_attempts"] == 2
+    assert evidence["artifact_attestation"] == _artifact_attestation()
     idempotency = evidence["observations"]["idempotency"]
     assert idempotency["provider_delivery_count"] == 2
     assert idempotency["duplicate_count"] == 1
@@ -447,6 +469,7 @@ def test_wecom_idempotency_is_strictly_service_replay_and_sanitized(
             "independent_paths": ["provider_ws_event", "provider_send_ack"],
             "run_nonce": "nonce",
             "account_fingerprint": fingerprints["WECOM_BOT_ID"],
+            "artifact_attestation": _artifact_attestation(),
             "observations": observations,
         },
     }
@@ -465,6 +488,49 @@ def test_wecom_idempotency_is_strictly_service_replay_and_sanitized(
     assert idempotency["duplicate_count"] == 1
     assert idempotency["original_event_id_hash"] != idempotency["replayed_event_id_hash"]
     assert "provider_delivery_count" not in idempotency
+    for case in ("reconnect", "credential_rotation"):
+        observation = evidence["observations"][case]
+        assert (
+            observation["outbound_request_id_hash"] == observation["acknowledged_request_id_hash"]
+        )
+        assert observation["provider_code"] == "0"
+
+
+@pytest.mark.parametrize("case", ["reconnect", "credential_rotation"])
+def test_wecom_send_ack_must_correlate_and_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    observations = _observations("wecom", "nonce")
+    observations[case]["acknowledged_request_id"] = "different-request"
+    observations[case]["provider_code"] = 500
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "wecom_ws_and_send_ack",
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": fingerprints["WECOM_BOT_ID"],
+            "artifact_attestation": _artifact_attestation(),
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("acknowledged_request_id must match" in error for error in errors)
+    assert any("provider_code is not successful" in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -811,6 +877,7 @@ def test_wecom_service_failover_requires_complete_handoff_and_exactly_once_deliv
                 "offline-wecom-account",
                 label=CHANNEL_ACCOUNT_VARIABLE["wecom"],
             ),
+            "artifact_attestation": _artifact_attestation(),
             "observations": _observations("wecom", "nonce"),
         },
     }
@@ -1055,12 +1122,18 @@ def test_probe_runtime_requires_nonce_image_and_fixed_identity() -> None:
                 "image_digest": "sha256:" + "a" * 64,
                 "identity_fingerprint": "b" * 64,
                 "control_profile_sha256": "d" * 64,
+                "release_id": "release-test",
+                "release_nonce_sha256": "e" * 64,
+                "source_fingerprint": "f" * 64,
             },
             run_nonce="nonce",
             image_digest="sha256:" + "a" * 64,
             configured_identity=None,
             identity_hash="c" * 64,
             control_profile_sha256="d" * 64,
+            release_id="release-test",
+            release_nonce_sha256="e" * 64,
+            source_fingerprint_value="f" * 64,
         )[0]
         is False
     )
@@ -1075,15 +1148,62 @@ def test_probe_runtime_accepts_report_safe_identity_hash() -> None:
                 "image_digest": "sha256:" + "a" * 64,
                 "identity_fingerprint": "b" * 64,
                 "control_profile_sha256": "d" * 64,
+                "release_id": "release-test",
+                "release_nonce_sha256": "e" * 64,
+                "source_fingerprint": "f" * 64,
             },
             run_nonce="nonce",
             image_digest="sha256:" + "a" * 64,
             configured_identity=None,
             identity_hash="b" * 64,
             control_profile_sha256="d" * 64,
+            release_id="release-test",
+            release_nonce_sha256="e" * 64,
+            source_fingerprint_value="f" * 64,
         )[0]
         is True
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason_fragment"),
+    [
+        ("release_id", "different-release", "release ID"),
+        ("release_nonce_sha256", "0" * 64, "release nonce"),
+        ("source_fingerprint", "0" * 64, "source fingerprint"),
+    ],
+)
+def test_probe_runtime_rejects_cross_candidate_identity(
+    field: str,
+    value: str,
+    reason_fragment: str,
+) -> None:
+    runtime: dict[str, object] = {
+        "status": "pass",
+        "run_nonce": "nonce",
+        "image_digest": "sha256:" + "a" * 64,
+        "identity_fingerprint": "b" * 64,
+        "control_profile_sha256": "d" * 64,
+        "release_id": "release-test",
+        "release_nonce_sha256": "e" * 64,
+        "source_fingerprint": "f" * 64,
+    }
+    runtime[field] = value
+
+    valid, reason = _validate_probe_runtime(
+        runtime,
+        run_nonce="nonce",
+        image_digest="sha256:" + "a" * 64,
+        configured_identity=None,
+        identity_hash="b" * 64,
+        control_profile_sha256="d" * 64,
+        release_id="release-test",
+        release_nonce_sha256="e" * 64,
+        source_fingerprint_value="f" * 64,
+    )
+
+    assert valid is False
+    assert reason is not None and reason_fragment in reason
 
 
 @pytest.mark.parametrize("observed", [None, "e" * 64])
@@ -1093,6 +1213,9 @@ def test_probe_runtime_requires_matching_control_profile_hash(observed: object) 
         "run_nonce": "nonce",
         "image_digest": "sha256:" + "a" * 64,
         "identity_fingerprint": "b" * 64,
+        "release_id": "release-test",
+        "release_nonce_sha256": "e" * 64,
+        "source_fingerprint": "f" * 64,
     }
     if observed is not None:
         runtime["control_profile_sha256"] = observed
@@ -1104,6 +1227,9 @@ def test_probe_runtime_requires_matching_control_profile_hash(observed: object) 
         configured_identity=None,
         identity_hash="b" * 64,
         control_profile_sha256="d" * 64,
+        release_id="release-test",
+        release_nonce_sha256="e" * 64,
+        source_fingerprint_value="f" * 64,
     )
 
     assert valid is False
@@ -1212,6 +1338,9 @@ def test_online_probe_pass_without_provider_originated_evidence_stays_not_run(
             "nonce",
             "cases",
             "expected_image_digest",
+            "release_id",
+            "release_nonce_sha256",
+            "source_fingerprint",
             "credential_fingerprints",
             "probe_identity_sha256",
             "account_fingerprint",
@@ -1229,6 +1358,9 @@ def test_online_probe_pass_without_provider_originated_evidence_stays_not_run(
                         label="TRPC_IM_ONLINE_PROBE_IDENTITY",
                     ),
                     "control_profile_sha256": profiles[channel],
+                    "release_id": payload["release_id"],
+                    "release_nonce_sha256": payload["release_nonce_sha256"],
+                    "source_fingerprint": payload["source_fingerprint"],
                 },
                 "cases": {case: {"status": "pass"} for case in REQUIRED_CASES},
             },

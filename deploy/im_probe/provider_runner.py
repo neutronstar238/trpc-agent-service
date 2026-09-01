@@ -69,6 +69,9 @@ REQUEST_FIELDS = frozenset(
         "run_id",
         "run_nonce",
         "expected_image_digest",
+        "release_id",
+        "release_nonce_sha256",
+        "source_fingerprint",
         "control_profile_sha256",
         "cases",
     }
@@ -88,6 +91,12 @@ CONTROL_PROFILE_ENV_BY_CHANNEL = {
     "wecom": "TRPC_IM_PROBE_WECOM_CONTROL_PROFILE_FILE",
 }
 CONTROL_SOCKET_ENV = "TRPC_IM_PROBE_CONTROL_SOCKET"
+RUNNER_SHA256_ENV = "TRPC_IM_PROBE_RUNNER_SHA256"
+BROKER_UID_ENV = "TRPC_IM_PROBE_BROKER_UID"
+BROKER_GID_ENV = "TRPC_IM_PROBE_BROKER_GID"
+ARTIFACT_CONTRACT_VERSION = 1
+CONTROL_SOCKET_MODE = 0o660
+CONTROL_SOCKET_PARENT_MODE = 0o750
 ACCOUNT_LABEL_BY_CHANNEL = {
     "feishu": "FEISHU_APP_ID",
     "wecom": "WECOM_BOT_ID",
@@ -128,6 +137,9 @@ WECOM_RECONNECT_FIELDS = (
     "old_lock_owner_released",
     "new_lock_owner_acquired",
     "lock_epoch",
+    "outbound_request_id",
+    "acknowledged_request_id",
+    "provider_code",
 )
 FEISHU_RECONNECT_FIELDS = (
     "failed_endpoint_id",
@@ -249,6 +261,13 @@ def _parse_request(value: object) -> dict[str, Any]:
     run_id = _safe_id(value.get("run_id"), label="run_id")
     run_nonce = _safe_id(value.get("run_nonce"), label="run_nonce", pattern=NONCE_RE)
     digest = _safe_digest(value.get("expected_image_digest"))
+    release_id = _safe_id(value.get("release_id"), label="release_id")
+    release_nonce_sha256 = _safe_hash(
+        value.get("release_nonce_sha256"), label="release_nonce_sha256"
+    )
+    deployed_source_fingerprint = _safe_hash(
+        value.get("source_fingerprint"), label="source_fingerprint"
+    )
     control_profile_sha256 = _safe_hash(
         value.get("control_profile_sha256"),
         label="control_profile_sha256",
@@ -266,6 +285,9 @@ def _parse_request(value: object) -> dict[str, Any]:
         "run_id": run_id,
         "run_nonce": run_nonce,
         "expected_image_digest": digest,
+        "release_id": release_id,
+        "release_nonce_sha256": release_nonce_sha256,
+        "source_fingerprint": deployed_source_fingerprint,
         "control_profile_sha256": control_profile_sha256,
         "cases": list(REQUIRED_CASES),
     }
@@ -305,6 +327,54 @@ def _safe_file_path(raw: str, *, label: str) -> Path:
     if os.name != "nt" and mode & 0o022:
         raise RunnerError(f"{label} must not be group/other writable")
     return path
+
+
+def _trusted_artifact_sha256(path: Path, *, label: str) -> str:
+    if os.name != "nt":
+        current = path.parent
+        while True:
+            try:
+                metadata = current.lstat()
+            except OSError as error:
+                raise RunnerError(f"{label} parent is unavailable") from error
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise RunnerError(f"{label} parent is not a trusted directory")
+            if metadata.st_mode & 0o022 or (metadata.st_uid != 0 and metadata.st_mode & 0o200):
+                raise RunnerError(f"{label} parent is writable by an untrusted user")
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RunnerError(f"{label} is unavailable") from error
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RunnerError(f"{label} must be a regular file")
+        if os.name != "nt" and (
+            metadata.st_uid != 0 or metadata.st_mode & 0o022 or not metadata.st_mode & 0o111
+        ):
+            raise RunnerError(f"{label} must be a root-owned immutable executable")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(64 * 1024):
+                digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _numeric_environment(variable: str) -> int:
+    try:
+        value = int(os.environ.get(variable, ""))
+    except ValueError as error:
+        raise RunnerError(f"{variable} is invalid") from error
+    if value < 0:
+        raise RunnerError(f"{variable} is invalid")
+    return value
 
 
 def _validated_control_profile_path(
@@ -357,13 +427,35 @@ def _control_socket_path() -> Path:
         raise RunnerError(f"{CONTROL_SOCKET_ENV} must be an absolute non-symlink path")
     try:
         resolved = path.resolve(strict=True)
-        mode = resolved.stat().st_mode
+        metadata = resolved.stat()
+        mode = metadata.st_mode
     except (OSError, RuntimeError) as error:
         raise RunnerError(f"{CONTROL_SOCKET_ENV} is unavailable") from error
     if os.name != "nt" and not stat.S_ISSOCK(mode):
         raise RunnerError(f"{CONTROL_SOCKET_ENV} must be a socket")
     if os.name == "nt" and stat.S_ISDIR(mode):
         raise RunnerError(f"{CONTROL_SOCKET_ENV} must not be a directory")
+    if os.name != "nt":
+        expected_uid = _numeric_environment(BROKER_UID_ENV)
+        expected_gid = _numeric_environment(BROKER_GID_ENV)
+        current_euid = getattr(os, "geteuid", None)
+        if current_euid is None or expected_uid == current_euid():
+            raise RunnerError("control broker must use a dedicated uid")
+        try:
+            parent = resolved.parent.lstat()
+        except OSError as error:
+            raise RunnerError(f"{CONTROL_SOCKET_ENV} parent is unavailable") from error
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != CONTROL_SOCKET_PARENT_MODE
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or stat.S_IMODE(mode) != CONTROL_SOCKET_MODE
+        ):
+            raise RunnerError(f"{CONTROL_SOCKET_ENV} owner or mode is invalid")
     return resolved
 
 
@@ -403,14 +495,10 @@ def _driver_path(channel: str) -> Path:
     root = _application_root()
     if root is not None and _is_within(driver, root):
         raise RunnerError("provider driver must be outside the application checkout")
-    try:
-        metadata = driver.stat()
-    except OSError as error:
-        raise RunnerError(f"{variable} is unavailable") from error
-    if os.name != "nt" and metadata.st_mode & 0o022:
-        raise RunnerError(f"{variable} must not be group/other writable")
-    if os.name != "nt" and not metadata.st_mode & 0o111:
-        raise RunnerError(f"{variable} must be executable")
+    hash_variable = f"{variable}_SHA256"
+    expected_hash = _safe_hash(os.environ.get(hash_variable), label=hash_variable)
+    if _trusted_artifact_sha256(driver, label=variable) != expected_hash:
+        raise RunnerError(f"{variable} hash does not match")
     try:
         executable = os.access(driver, os.X_OK)
     except OSError as error:
@@ -486,6 +574,8 @@ def _driver_environment(
         environment[variable] = str(path)
     environment[CONTROL_PROFILE_ENV_BY_CHANNEL[channel]] = str(control_profile)
     environment[CONTROL_SOCKET_ENV] = str(control_socket)
+    environment[BROKER_UID_ENV] = str(_numeric_environment(BROKER_UID_ENV))
+    environment[BROKER_GID_ENV] = str(_numeric_environment(BROKER_GID_ENV))
     return environment
 
 
@@ -511,6 +601,9 @@ def _driver_input(request: Mapping[str, Any]) -> bytes:
             "run_id": request["run_id"],
             "run_nonce": request["run_nonce"],
             "expected_image_digest": request["expected_image_digest"],
+            "release_id": request["release_id"],
+            "release_nonce_sha256": request["release_nonce_sha256"],
+            "source_fingerprint": request["source_fingerprint"],
             "control_profile_sha256": request["control_profile_sha256"],
             "cases": list(REQUIRED_CASES),
         }
@@ -522,6 +615,12 @@ def _invoke_driver(
     request: Mapping[str, Any],
     environment: Mapping[str, str],
 ) -> dict[str, Any]:
+    channel = cast(str, request["channel"])
+    variable = DRIVER_ENV_BY_CHANNEL[channel]
+    hash_variable = f"{variable}_SHA256"
+    expected_hash = _safe_hash(os.environ.get(hash_variable), label=hash_variable)
+    if _trusted_artifact_sha256(driver, label=variable) != expected_hash:
+        raise RunnerError("provider evidence driver hash changed before execution")
     try:
         with tempfile.TemporaryFile(mode="w+b") as driver_output:
             process = subprocess.Popen(  # noqa: S603 - absolute, validated executable; no shell
@@ -631,6 +730,8 @@ def _required_observation_fields(
         )
     if case == "reconnect":
         fields += FEISHU_RECONNECT_FIELDS if channel == "feishu" else WECOM_RECONNECT_FIELDS
+    if case == "credential_rotation" and channel == "wecom":
+        fields += ("outbound_request_id", "acknowledged_request_id", "provider_code")
     if case != "prolonged_outage" or channel != "wecom":
         return fields
     fields += ("outage_mode",)
@@ -791,6 +892,12 @@ def _validate_observation(case: str, observation: object, *, channel: str, run_n
             raise RunnerError("observation rate_limit_retry_after did not honor Retry-After")
     if case == "credential_rotation" and observation["old_credential_rejected"] is not True:
         raise RunnerError("observation credential_rotation is invalid")
+    if channel == "wecom" and case in {"reconnect", "credential_rotation"}:
+        code = _provider_code_number(observation["provider_code"])
+        if observation["acknowledged_request_id"] != observation[
+            "outbound_request_id"
+        ] or code not in {0, 200}:
+            raise RunnerError("observation acknowledgement is invalid")
     if case == "prolonged_outage" and not _finite_number(
         observation["outage_seconds"],
         minimum=MIN_PROLONGED_OUTAGE_SECONDS,
@@ -893,6 +1000,10 @@ def _account_fingerprint(channel: str, account_id: str) -> str:
 
 def _run(request: Mapping[str, Any]) -> dict[str, Any]:
     channel = cast(str, request["channel"])
+    expected_runner_hash = _safe_hash(os.environ.get(RUNNER_SHA256_ENV), label=RUNNER_SHA256_ENV)
+    runner_path = Path(__file__).resolve(strict=True)
+    if _trusted_artifact_sha256(runner_path, label="provider runner") != expected_runner_hash:
+        raise RunnerError("provider runner hash does not match")
     driver, account_id, paths, control_profile, control_socket = _validate_channel_configuration(
         channel,
         cast(str, request["control_profile_sha256"]),
@@ -922,7 +1033,20 @@ def _run(request: Mapping[str, Any]) -> dict[str, Any]:
         "account_fingerprint": _account_fingerprint(channel, account_id),
         "observations": observations,
     }
-    return {"provider_evidence": evidence}
+    driver_hash = _safe_hash(
+        os.environ.get(f"{DRIVER_ENV_BY_CHANNEL[channel]}_SHA256"),
+        label=f"{DRIVER_ENV_BY_CHANNEL[channel]}_SHA256",
+    )
+    return {
+        "provider_evidence": evidence,
+        "artifact_attestation": {
+            "schema_version": ARTIFACT_CONTRACT_VERSION,
+            "runner_sha256": expected_runner_hash,
+            "runner_contract_version": ARTIFACT_CONTRACT_VERSION,
+            "driver_sha256": driver_hash,
+            "driver_contract_version": ARTIFACT_CONTRACT_VERSION,
+        },
+    }
 
 
 def _input_stream() -> BinaryIO:

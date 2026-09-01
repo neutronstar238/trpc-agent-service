@@ -19,7 +19,11 @@ from trpc_service.storage.models import (
     TurnCommit,
     WeComBindingLeaseGrant,
 )
-from trpc_service.storage.postgres import PostgresBindingLease, PostgresRuntimeRepository
+from trpc_service.storage.postgres import (
+    PostgresBindingLease,
+    PostgresRuntimeRepository,
+    _im_provider_event_hash,
+)
 from trpc_service.storage.protocols import FencingConflict
 from trpc_service.tenant.models import Channel, ChannelBinding
 
@@ -236,6 +240,14 @@ async def test_accept_inbound_new_and_duplicate() -> None:
     )
     assert value.context == accepted.context
     assert len([call for call in connection.calls if call[0] == "execute"]) == 4
+    insert = next(call for call in connection.calls if call[0] == "fetchrow")
+    assert "provider_event_hash" in insert[1][0]
+    assert insert[1][-1] == _im_provider_event_hash(
+        accepted.context.tenant_id,
+        accepted.context.channel_binding_id,
+        accepted.envelope.channel,
+        accepted.envelope.external_message_id,
+    )
 
     duplicate_connection = Connection(fetchrows=[None, row])
     duplicate = await PostgresRuntimeRepository(Pool(duplicate_connection)).accept_inbound(
@@ -244,6 +256,46 @@ async def test_accept_inbound_new_and_duplicate() -> None:
         trace_headers={},
     )
     assert duplicate.duplicate
+    duplicate_update = duplicate_connection.calls[2]
+    assert duplicate_update[0] == "fetchrow"
+    assert "SET delivery_count=delivery_count+1" in duplicate_update[1][0]
+    assert "provider_event_hash=COALESCE(provider_event_hash,$5)" in duplicate_update[1][0]
+    assert duplicate_update[1][-2] == _im_provider_event_hash(
+        accepted.context.tenant_id,
+        accepted.context.channel_binding_id,
+        accepted.envelope.channel,
+        accepted.envelope.external_message_id,
+    )
+    assert duplicate_update[1][-1] == accepted.context.channel_binding_id
+
+
+@pytest.mark.asyncio
+async def test_accept_inbound_v2_duplicate_backfills_legacy_provider_hash() -> None:
+    accepted = await acceptance()
+    row = inbound_row(accepted)
+    connection = Connection(fetchrows=[None, row])
+
+    duplicate = await PostgresRuntimeRepository(Pool(connection)).accept_inbound_v2(
+        context=accepted.context,
+        envelope=accepted.envelope,
+        trace_headers={},
+    )
+
+    assert duplicate.duplicate
+    duplicate_update = connection.calls[2]
+    assert duplicate_update[0] == "fetchrow"
+    assert "provider_event_hash=COALESCE(provider_event_hash,$5)" in duplicate_update[1][0]
+    assert "provider_event_hash IS NULL OR provider_event_hash=$5" in duplicate_update[1][0]
+    assert duplicate_update[1][-1] == accepted.context.channel_binding_id
+
+
+def test_im_provider_event_hash_matches_independent_provider_domains() -> None:
+    assert _im_provider_event_hash("tenant", "binding", Channel.FEISHU, "event") == (
+        "14987a7e30c7a7a80301413f4cfa45d1a1e5280a8a696abf31d06c65da4b7758"
+    )
+    assert _im_provider_event_hash("tenant", "binding", Channel.WECOM_AI_BOT, "event") == (
+        "39a415957b53e983f84fae1c8f3f92d10eea72e2a1e49fb50ed3c477f7582625"
+    )
 
 
 @pytest.mark.asyncio

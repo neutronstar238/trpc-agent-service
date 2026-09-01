@@ -27,6 +27,9 @@ _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAX_REPORT_BYTES = 64 * 1024 * 1024
 _OPTIONAL_SDK_REPORT_NAMES = ("postgres-worker-gate.json", "postgres_worker_gate.json")
+_FUNCTIONAL_DR_LOGICAL_NAME = "functional_disaster_recovery"
+_DESTRUCTIVE_DR_LOGICAL_NAME = "disaster_recovery"
+_FUNCTIONAL_DR_POLICY_MODE = "explicit_functional_dr"
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -92,6 +95,7 @@ def report_image_digest(report_name: str, report: Mapping[str, Any]) -> str | No
         "migration-live.json",
         "kubernetes-runtime.json",
         "disaster-recovery.json",
+        "disaster-recovery-functional.json",
     }:
         value = _mapping(candidate.get("lineage")).get("image_digest")
     elif report_name == "im-online.json":
@@ -144,6 +148,83 @@ def _optional_sdk_attachment(directory: Path) -> dict[str, Any] | None:
     }
 
 
+def _expected_functional_dr_policy(
+    reports: Mapping[str, object],
+    *,
+    allow_functional_dr: bool,
+    authorized_not_run_gates: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if not allow_functional_dr:
+        if authorized_not_run_gates:
+            raise ValueError("functional DR authorization requires --allow-functional-dr")
+        if _FUNCTIONAL_DR_LOGICAL_NAME in reports:
+            raise ValueError("functional DR evidence requires --allow-functional-dr")
+        return None
+    if _FUNCTIONAL_DR_LOGICAL_NAME not in reports:
+        raise ValueError("functional DR policy requires functional disaster recovery evidence")
+    if authorized_not_run_gates not in {(), (_DESTRUCTIVE_DR_LOGICAL_NAME,)}:
+        raise ValueError("functional DR policy can authorize only disaster_recovery=not_run")
+    destructive_included = _DESTRUCTIVE_DR_LOGICAL_NAME in reports
+    destructive_authorized = bool(authorized_not_run_gates)
+    if destructive_included == destructive_authorized:
+        raise ValueError(
+            "functional DR policy must exclude only an authorized not_run destructive report"
+        )
+    return {
+        "mode": _FUNCTIONAL_DR_POLICY_MODE,
+        "functional_report": _FUNCTIONAL_DR_LOGICAL_NAME,
+        "destructive_report": _DESTRUCTIVE_DR_LOGICAL_NAME,
+        "authorized_not_run_gates": list(authorized_not_run_gates),
+    }
+
+
+def _functional_dr_rejection_reason(report: dict[str, Any], *, report_path: Path) -> str | None:
+    if report.get("gate") != "pass" or report.get("production_gate") != "not_run":
+        return "functional disaster recovery must be gate=pass and production_gate=not_run"
+    from scripts.release_gate import _production_evidence_result
+
+    _, reason = _production_evidence_result(
+        report,
+        report_name=report_path.name,
+        report_path=report_path,
+    )
+    return reason
+
+
+def _production_report_rejection_reason(report: Mapping[str, Any]) -> str | None:
+    if report.get("gate") != "pass":
+        return "production report gate must be pass"
+    if report.get("production_gate") != "pass":
+        return "production report production_gate must be pass"
+    return None
+
+
+def _candidate_lock_identity(directory: Path) -> tuple[tuple[str, str], str, str]:
+    lock = _read_report(directory / "candidate-lock.json")
+    binding = _read_report(directory / "registry-image-binding.json")
+    from scripts.candidate_lock import verify_candidate_lock
+
+    lock_reasons = verify_candidate_lock(lock, binding, root=ROOT)
+    if lock_reasons:
+        raise ValueError("candidate lock does not match registry binding: " + lock_reasons[0])
+    if lock.get("schema_version") != 1 or lock.get("kind") != "release_candidate_lock":
+        raise ValueError("candidate lock schema or kind is invalid")
+    release = _mapping(lock.get("release_binding"))
+    release_id = release.get("release_id")
+    nonce_sha256 = release.get("nonce_sha256")
+    image_digest = lock.get("image_digest")
+    source_value = _mapping(lock.get("source_fingerprint")).get("value")
+    if not isinstance(release_id, str) or _ID_RE.fullmatch(release_id) is None:
+        raise ValueError("candidate lock release_id is invalid")
+    if not isinstance(nonce_sha256, str) or _SHA_RE.fullmatch(nonce_sha256) is None:
+        raise ValueError("candidate lock nonce binding is invalid")
+    if not isinstance(image_digest, str) or _IMAGE_RE.fullmatch(image_digest) is None:
+        raise ValueError("candidate lock image digest is invalid")
+    if not isinstance(source_value, str) or _SHA_RE.fullmatch(source_value) is None:
+        raise ValueError("candidate lock source fingerprint is invalid")
+    return (release_id, nonce_sha256), image_digest, source_value
+
+
 def build_manifest(
     directory: Path,
     *,
@@ -151,6 +232,8 @@ def build_manifest(
     release_id: str,
     release_nonce: str,
     image_digest: str,
+    allow_functional_dr: bool = False,
+    authorized_not_run_gates: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if _ID_RE.fullmatch(release_id) is None:
         raise ValueError("release_id is invalid")
@@ -163,10 +246,36 @@ def build_manifest(
     source = source_fingerprint(ROOT)
     if source.get("status") != "available":
         raise ValueError("current source fingerprint is unavailable")
+    lock_release, lock_image, lock_source = _candidate_lock_identity(directory)
+    if lock_release != (release_id, nonce_sha256):
+        raise ValueError("release binding does not match candidate lock")
+    if lock_image != normalized_image:
+        raise ValueError("release image digest does not match candidate lock")
+    if lock_source != source.get("value"):
+        raise ValueError("release source fingerprint does not match candidate lock")
+    policy = _expected_functional_dr_policy(
+        reports,
+        allow_functional_dr=allow_functional_dr,
+        authorized_not_run_gates=authorized_not_run_gates,
+    )
     entries: dict[str, Any] = {}
     observed_run_nonces: set[str] = set()
     for logical_name, filename in sorted(reports.items()):
-        report = _read_report(directory / filename)
+        report_path = directory / filename
+        report = _read_report(report_path)
+        if logical_name == _FUNCTIONAL_DR_LOGICAL_NAME:
+            functional_reason = _functional_dr_rejection_reason(
+                report,
+                report_path=report_path,
+            )
+            if functional_reason is not None:
+                raise ValueError(
+                    f"functional disaster recovery evidence is invalid: {functional_reason}"
+                )
+        else:
+            production_reason = _production_report_rejection_reason(report)
+            if production_reason is not None:
+                raise ValueError(f"{filename} is not production-valid: {production_reason}")
         if filename == "real-runtime.json":
             role_status, role_reason = _role_evidence_check(
                 _mapping(report.get("candidate")).get("database_role_evidence")
@@ -209,6 +318,8 @@ def build_manifest(
         "image_digest": normalized_image,
         "reports": entries,
     }
+    if policy is not None:
+        manifest["policy"] = policy
     sdk_attachment = _optional_sdk_attachment(directory)
     if sdk_attachment is not None:
         manifest["auxiliary_reports"] = {"sdk_postgres_worker": sdk_attachment}
@@ -222,6 +333,8 @@ def validate_manifest(
     current_source: Mapping[str, Any],
     now: datetime | None = None,
     ttl_seconds: int = 24 * 60 * 60,
+    allow_functional_dr: bool = False,
+    authorized_not_run_gates: tuple[str, ...] = (),
 ) -> tuple[str, list[str]]:
     path = directory / MANIFEST_NAME
     if _has_symlink_component(path):
@@ -233,6 +346,26 @@ def validate_manifest(
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         return "fail", [f"release evidence manifest is invalid: {type(error).__name__}"]
     reasons: list[str] = []
+    try:
+        lock_release, lock_image, lock_source = _candidate_lock_identity(directory)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        lock_release = None
+        lock_image = None
+        lock_source = None
+        reasons.append(f"candidate lock is invalid: {type(error).__name__}")
+    try:
+        expected_policy = _expected_functional_dr_policy(
+            reports,
+            allow_functional_dr=allow_functional_dr,
+            authorized_not_run_gates=authorized_not_run_gates,
+        )
+    except ValueError as error:
+        return "fail", [str(error)]
+    if expected_policy is None:
+        if "policy" in manifest:
+            reasons.append("release evidence manifest has an unauthorized functional DR policy")
+    elif manifest.get("policy") != expected_policy:
+        reasons.append("release evidence manifest functional DR policy is invalid")
     schema_version = manifest.get("schema_version")
     if (
         not isinstance(schema_version, int)
@@ -248,9 +381,13 @@ def validate_manifest(
         reasons.append("release evidence manifest release_id is invalid")
     if not isinstance(nonce_sha256, str) or _SHA_RE.fullmatch(nonce_sha256) is None:
         reasons.append("release evidence manifest nonce binding is invalid")
+    if lock_release is not None and lock_release != (release_id, nonce_sha256):
+        reasons.append("release evidence manifest binding does not match candidate lock")
     image_digest = manifest.get("image_digest")
     if not isinstance(image_digest, str) or _IMAGE_RE.fullmatch(image_digest) is None:
         reasons.append("release evidence manifest image digest is invalid")
+    if lock_image is not None and image_digest != lock_image:
+        reasons.append("release evidence manifest image digest does not match candidate lock")
     source = _mapping(manifest.get("source_fingerprint"))
     if (
         source.get("algorithm") != "sha256"
@@ -262,6 +399,8 @@ def validate_manifest(
         or source.get("value") != current_source.get("value")
     ):
         reasons.append("release evidence manifest belongs to a different source candidate")
+    if lock_source is not None and source.get("value") != lock_source:
+        reasons.append("release evidence manifest source does not match candidate lock")
     generated_at = manifest.get("generated_at")
     try:
         parsed_raw = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
@@ -301,6 +440,20 @@ def validate_manifest(
                     f"production-valid: {role_reason or role_status}"
                 )
         evidence = _mapping(report.get("evidence"))
+        if logical_name == _FUNCTIONAL_DR_LOGICAL_NAME:
+            functional_reason = _functional_dr_rejection_reason(
+                report,
+                report_path=directory / filename,
+            )
+            if functional_reason is not None:
+                reasons.append(
+                    "release report disaster-recovery-functional.json is invalid: "
+                    f"{functional_reason}"
+                )
+        else:
+            production_reason = _production_report_rejection_reason(report)
+            if production_reason is not None:
+                reasons.append(f"release report {filename} is invalid: {production_reason}")
         if _release_binding(evidence) != (release_id, nonce_sha256):
             reasons.append(f"release report {filename} has a different release binding")
         report_source = _mapping(evidence.get("source_fingerprint"))
@@ -359,7 +512,7 @@ def validate_manifest(
 
 
 def main() -> int:
-    from scripts.release_gate import PRODUCTION_EVIDENCE_PRODUCERS, REPORTS
+    from scripts.release_gate import FUNCTIONAL_DR_REPORT, PRODUCTION_EVIDENCE_PRODUCERS, REPORTS
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=Path("runs/multitenant"))
@@ -367,18 +520,42 @@ def main() -> int:
     parser.add_argument("--release-id", default=os.getenv("TRPC_RELEASE_ID", ""))
     parser.add_argument("--release-nonce", default=os.getenv("TRPC_RELEASE_NONCE", ""))
     parser.add_argument("--image-digest", required=True)
+    parser.add_argument(
+        "--allow-functional-dr",
+        action="store_true",
+        help="bind functional DR and explicitly authorize destructive DR=not_run",
+    )
     args = parser.parse_args()
     report_names = {
         name: filename
         for name, (filename, production) in REPORTS.items()
         if production and filename in PRODUCTION_EVIDENCE_PRODUCERS
     }
+    authorized_not_run_gates: tuple[str, ...] = ()
+    if args.allow_functional_dr:
+        report_names[_FUNCTIONAL_DR_LOGICAL_NAME] = FUNCTIONAL_DR_REPORT[0]
+        destructive_path = args.directory / REPORTS[_DESTRUCTIVE_DR_LOGICAL_NAME][0]
+        if destructive_path.exists():
+            destructive_report = _read_report(destructive_path)
+            destructive_gate = destructive_report.get("gate")
+            destructive_status = destructive_report.get("production_gate", "not_run")
+            if destructive_gate == "fail" or destructive_status == "fail":
+                raise ValueError("failed destructive disaster recovery cannot be waived")
+            if destructive_status not in {"pass", "not_run"}:
+                raise ValueError("destructive disaster recovery status is invalid")
+        else:
+            destructive_status = "not_run"
+        if destructive_status == "not_run":
+            report_names.pop(_DESTRUCTIVE_DR_LOGICAL_NAME)
+            authorized_not_run_gates = (_DESTRUCTIVE_DR_LOGICAL_NAME,)
     manifest = build_manifest(
         args.directory,
         reports=report_names,
         release_id=args.release_id,
         release_nonce=args.release_nonce,
         image_digest=args.image_digest,
+        allow_functional_dr=args.allow_functional_dr,
+        authorized_not_run_gates=authorized_not_run_gates,
     )
     output = args.output or args.directory / MANIFEST_NAME
     rendered = atomic_write_json(output, manifest)

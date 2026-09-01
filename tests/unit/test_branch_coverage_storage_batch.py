@@ -1468,6 +1468,7 @@ async def test_postgres_begin_and_finish_delivery_all_terminal_paths() -> None:
         status=DeliveryStatus.FAILED,
         retryable=True,
         provider_code="busy",
+        retry_after_seconds=2.5,
     )
     retry_conn = AsyncConnection(
         rows=finish_rows, executes=["SET", "UPDATE 1", "UPDATE 1", "UPDATE 1"]
@@ -1475,6 +1476,12 @@ async def test_postgres_begin_and_finish_delivery_all_terminal_paths() -> None:
     await PostgresRuntimeRepository(AsyncPool(retry_conn)).finish_delivery(
         record, owner_id=owner, attempt_number=1, receipt=failed_retry
     )
+    attempt_update = next(
+        call
+        for call in retry_conn.calls
+        if call[0] == "execute" and "UPDATE delivery_attempts" in str(call[1][0])
+    )
+    assert attempt_update[1][-1] == 2.5
     failed_final = DeliveryReceipt(
         outbound_id=record.aggregate_id, status=DeliveryStatus.AMBIGUOUS, provider_code="unknown"
     )

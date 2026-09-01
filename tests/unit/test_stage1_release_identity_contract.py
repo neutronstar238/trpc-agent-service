@@ -1,70 +1,57 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGE1 = ROOT / "runs/multitenant/run-final-ack-performance.ps1"
 FORMAL_ENTRY = ROOT / "runs/multitenant/run-current-final-acceptance.ps1"
 
-_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
-
-
-def _assignment(script: str, name: str) -> str:
-    match = re.search(rf'^\${re.escape(name)}\s*=\s*"([^"]+)"$', script, re.MULTILINE)
-    assert match is not None
-    return match.group(1)
-
-
-def _release_context_name(script: str) -> str:
-    match = re.search(
-        r'^\$privateReleaseContext\s*=.*"[^"]*/(release-context-[^"]+)"$',
-        script,
-        re.MULTILINE,
-    )
-    assert match is not None
-    return match.group(1)
-
 
 def test_stage1_reuses_verified_context_and_binds_canonical_index_digests() -> None:
     stage1 = STAGE1.read_text(encoding="utf-8")
     formal_entry = FORMAL_ENTRY.read_text(encoding="utf-8")
 
-    initial_digest = _assignment(stage1, "imageDigest")
-    upgrade_digest = _assignment(stage1, "upgradeDigest")
-    context_initial = _assignment(stage1, "releaseContextInitialDigest")
-    context_upgrade = _assignment(stage1, "releaseContextUpgradeDigest")
-    context_name = _release_context_name(stage1)
+    for script in (stage1, formal_entry):
+        assert 'scripts/candidate_lock.py", "verify' in script or (
+            "scripts/candidate_lock.py verify" in script
+        )
+        assert "ConvertFrom-Json" in script
+        assert ".source_fingerprint.value" in script
+        assert ".images.initial.digest" in script
+        assert ".images.upgrade.digest" in script
+        assert ".images.initial.reference" in script
+        assert ".release_binding.release_id" in script
+        assert ".binding_sha256" in script
+        assert "release-context-$candidateName-amd64.json" in script
+        assert "candidate lock changed while its release context was being verified" in script
 
-    assert context_name.startswith("release-context-")
-    assert context_name.endswith("-amd64.json")
-    assert context_name in formal_entry
     assert "scripts/release_context.py verify" in stage1
     assert "scripts/release_context.py ensure" not in stage1
-
-    assert _DIGEST_PATTERN.fullmatch(initial_digest)
-    assert _DIGEST_PATTERN.fullmatch(upgrade_digest)
-    assert initial_digest != upgrade_digest
-    assert context_initial == initial_digest
-    assert context_upgrade == upgrade_digest
+    assert "bind_published_candidate.py" not in stage1
+    assert '$expectedSource = "' not in stage1
+    assert '$candidateDigest = "sha256:' not in formal_entry
+    assert stage1.count("scripts/candidate_lock.py verify") == 1
+    assert formal_entry.count('"scripts/candidate_lock.py", "verify"') == 1
+    assert stage1.index("$env:TRPC_RELEASE_NONCE") < stage1.index(
+        "scripts/candidate_lock.py verify"
+    )
+    assert formal_entry.index("$env:TRPC_RELEASE_NONCE") < formal_entry.index(
+        '"scripts/candidate_lock.py", "verify"'
+    )
+    assert stage1.index("scripts/candidate_lock.py verify") < stage1.index(
+        "--public-output $publicReleaseContext"
+    )
 
     verify_block = stage1.split("scripts/release_context.py verify", 1)[1].split(
         "$releaseContext =", 1
     )[0]
     assert "--private-context $privateReleaseContext" in verify_block
-    assert "--initial-digest $releaseContextInitialDigest" in verify_block
-    assert "--upgrade-digest $releaseContextUpgradeDigest" in verify_block
-
-    binding_block = stage1.split("bind_published_candidate.py", 1)[1].split("if ($LASTEXITCODE", 1)[
-        0
-    ]
-    assert "--initial-digest $imageDigest" in binding_block
-    assert "--upgrade-digest $upgradeDigest" in binding_block
-    assert "--initial-digest $releaseContextInitialDigest" not in binding_block
-    assert "--upgrade-digest $releaseContextUpgradeDigest" not in binding_block
+    assert "--initial-digest $imageDigest" in verify_block
+    assert "--upgrade-digest $upgradeDigest" in verify_block
 
     render_check = stage1.split("$renderedText", 1)[1].split("Invoke-Kubectl", 1)[0]
-    assert "$imageDigest" in render_check
+    assert "$lockedInitialReference" in render_check
+    assert "$dockerHubRepository@$imageDigest" not in render_check
 
 
 def test_stage1_failure_summary_tolerates_missing_optional_metrics() -> None:
@@ -75,3 +62,17 @@ def test_stage1_failure_summary_tolerates_missing_optional_metrics() -> None:
     assert "$performanceReport.candidate.sustained." not in stage1
     assert "if ($gateExit -ne 0)" in stage1
     assert 'throw "formal ACK Performance gate failed; no automatic rerun was attempted"' in stage1
+
+
+def test_stage1_applies_schema_before_starting_runtime_pods() -> None:
+    stage1 = STAGE1.read_text(encoding="utf-8")
+
+    assert "scripts.split_kubernetes_runtime_manifest" in stage1
+    assert 'Invoke-Kubectl -Arguments @("apply", "-k", $renderedPerformance)' not in stage1
+    migration_apply = stage1.index('Invoke-Kubectl -Arguments @("apply", "-f", $migrationManifest)')
+    migration_wait = stage1.index('"job/trpc-schema-migration", "--timeout=600s"')
+    head_apply = stage1.index('Invoke-Kubectl -Arguments @("apply", "-f", $headCheckManifest)')
+    head_wait = stage1.index('"job/trpc-schema-head-check", "--timeout=600s"')
+    runtime_apply = stage1.index('Invoke-Kubectl -Arguments @("apply", "-f", $runtimeManifest)')
+
+    assert migration_apply < migration_wait < head_apply < head_wait < runtime_apply

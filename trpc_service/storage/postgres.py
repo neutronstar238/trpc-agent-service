@@ -52,6 +52,29 @@ def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _im_provider_event_hash(
+    tenant_id: str,
+    binding_id: str,
+    channel: Channel,
+    external_message_id: str,
+) -> str:
+    if channel == Channel.FEISHU:
+        material = b"trpc.feishu.callback.message-id.v1\0" + external_message_id.encode("utf-8")
+    elif channel == Channel.WECOM_AI_BOT:
+        material = "\0".join(
+            (
+                "trpc-wecom-evidence-v1",
+                "provider-event",
+                tenant_id,
+                binding_id,
+                external_message_id,
+            )
+        ).encode("utf-8")
+    else:  # pragma: no cover - Channel currently has only the two production values.
+        raise ValueError("unsupported IM channel")
+    return hashlib.sha256(material).hexdigest()
+
+
 class PostgresRuntimeRepository:
     def __init__(
         self,
@@ -695,15 +718,22 @@ class PostgresRuntimeRepository:
         trace_headers: dict[str, str],
     ) -> Acceptance:
         inbound_id = uuid4()
+        provider_event_hash = _im_provider_event_hash(
+            context.tenant_id,
+            context.channel_binding_id,
+            envelope.channel,
+            envelope.external_message_id,
+        )
         async with self._tenant_transaction(context.tenant_id) as connection:
             row = await connection.fetchrow(
                 """
                 INSERT INTO inbound_messages (
                     tenant_id, inbound_id, binding_id, app_id, config_version,
                     channel, account_id, external_message_id, principal_id,
-                    session_id, request_id, trace_id, envelope_json
+                    session_id, request_id, trace_id, envelope_json,
+                    provider_event_hash
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14
                 )
                 ON CONFLICT (tenant_id, channel, account_id, external_message_id)
                     DO NOTHING
@@ -722,18 +752,26 @@ class PostgresRuntimeRepository:
                 context.request_id,
                 context.trace_id,
                 _dump(envelope.model_dump(mode="json")),
+                provider_event_hash,
             )
             if row is None:
                 existing = await connection.fetchrow(
                     """
-                    SELECT * FROM inbound_messages
+                    UPDATE inbound_messages
+                       SET delivery_count=delivery_count+1,
+                           provider_event_hash=COALESCE(provider_event_hash,$5)
                      WHERE tenant_id=$1 AND channel=$2 AND account_id=$3
                        AND external_message_id=$4
+                       AND binding_id=$6
+                       AND (provider_event_hash IS NULL OR provider_event_hash=$5)
+                    RETURNING *
                     """,
                     context.tenant_id,
                     envelope.channel.value,
                     envelope.account_id,
                     envelope.external_message_id,
+                    provider_event_hash,
+                    context.channel_binding_id,
                 )
                 assert existing is not None
                 return self._acceptance(existing).model_copy(update={"duplicate": True})
@@ -798,15 +836,22 @@ class PostgresRuntimeRepository:
         if priority < 0 or isinstance(priority, bool):
             raise ValueError("mailbox priority must be non-negative")
         inbound_id = uuid4()
+        provider_event_hash = _im_provider_event_hash(
+            context.tenant_id,
+            context.channel_binding_id,
+            envelope.channel,
+            envelope.external_message_id,
+        )
         async with self._tenant_transaction(context.tenant_id) as connection:
             row = await connection.fetchrow(
                 """
                 INSERT INTO inbound_messages (
                     tenant_id, inbound_id, binding_id, app_id, config_version,
                     channel, account_id, external_message_id, principal_id,
-                    session_id, request_id, trace_id, envelope_json
+                    session_id, request_id, trace_id, envelope_json,
+                    provider_event_hash
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14
                 )
                 ON CONFLICT (tenant_id, channel, account_id, external_message_id)
                     DO NOTHING
@@ -825,18 +870,26 @@ class PostgresRuntimeRepository:
                 context.request_id,
                 context.trace_id,
                 _dump(envelope.model_dump(mode="json")),
+                provider_event_hash,
             )
             if row is None:
                 existing = await connection.fetchrow(
                     """
-                    SELECT * FROM inbound_messages
+                    UPDATE inbound_messages
+                       SET delivery_count=delivery_count+1,
+                           provider_event_hash=COALESCE(provider_event_hash,$5)
                      WHERE tenant_id=$1 AND channel=$2 AND account_id=$3
                        AND external_message_id=$4
+                       AND binding_id=$6
+                       AND (provider_event_hash IS NULL OR provider_event_hash=$5)
+                    RETURNING *
                     """,
                     context.tenant_id,
                     envelope.channel.value,
                     envelope.account_id,
                     envelope.external_message_id,
+                    provider_event_hash,
+                    context.channel_binding_id,
                 )
                 assert existing is not None
                 return self._acceptance(existing).model_copy(update={"duplicate": True})
@@ -2503,7 +2556,8 @@ class PostgresRuntimeRepository:
             attempt_update = await connection.execute(
                 """
                 UPDATE delivery_attempts
-                   SET status=$4,provider_code=$5,completed_at=now()
+                   SET status=$4,provider_code=$5,retry_after_seconds=$6,
+                       completed_at=now()
                  WHERE tenant_id=$1 AND outbound_id=$2 AND attempt_number=$3
                    AND status='sending'
                 """,
@@ -2512,6 +2566,7 @@ class PostgresRuntimeRepository:
                 attempt_number,
                 outbound_status,
                 receipt.provider_code,
+                receipt.retry_after_seconds,
             )
             if attempt_update != "UPDATE 1":
                 raise FencingConflict("delivery attempt changed before finish")

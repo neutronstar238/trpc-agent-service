@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ from deploy.im_probe import feishu_provider_driver as driver
 APP_ID = "cli_driver_app"
 RUN_NONCE = "driver-nonce-0123456789"
 IMAGE_DIGEST = "sha256:" + "a" * 64
+RELEASE_ID = "release-offline-feishu"
+RELEASE_NONCE_SHA256 = "d" * 64
+SOURCE_FINGERPRINT = "e" * 64
 
 
 def _hash(value: str) -> str:
@@ -48,6 +52,9 @@ def _request(profile_path: Path) -> dict[str, object]:
         "run_id": "feishu-live-run",
         "run_nonce": RUN_NONCE,
         "expected_image_digest": IMAGE_DIGEST,
+        "release_id": RELEASE_ID,
+        "release_nonce_sha256": RELEASE_NONCE_SHA256,
+        "source_fingerprint": SOURCE_FINGERPRINT,
         "control_profile_sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
         "cases": list(driver.REQUIRED_CASES),
     }
@@ -58,6 +65,8 @@ def _environment(tmp_path: Path, profile_path: Path) -> dict[str, str]:
         "TRPC_IM_PROBE_FEISHU_APP_ID": APP_ID,
         "TRPC_IM_PROBE_FEISHU_CONTROL_PROFILE_FILE": str(profile_path),
         "TRPC_IM_PROBE_CONTROL_SOCKET": str(tmp_path / "broker.sock"),
+        driver.BROKER_UID_ENV: "12345",
+        driver.BROKER_GID_ENV: "23456",
         # A real runner may pass secret paths too.  This driver intentionally
         # never reads them.
         "TRPC_IM_PROBE_FEISHU_APP_SECRET_FILE": str(tmp_path / "unused-secret"),
@@ -140,6 +149,7 @@ class _FakeEvidenceSockets:
         self.forge_expected = False
         self.extra_broker_field = False
         self.witness_failure: str | None = None
+        self.witness_failure_case: str | None = None
 
     def validate(self, raw: str, _label: str) -> Path:
         path = Path(raw)
@@ -234,6 +244,7 @@ class _FakeEvidenceSockets:
         body_hash: str,
     ) -> list[dict[str, object]]:
         now = datetime.now(UTC)
+        failure = self.witness_failure if self.witness_failure_case in {None, case} else None
 
         def receipt(
             sequence: int,
@@ -248,34 +259,30 @@ class _FakeEvidenceSockets:
             return {
                 "sequence": sequence,
                 "path_sha256": path_hash,
-                "body_sha256": (
-                    _hash("wrong-body") if self.witness_failure == "hash_mismatch" else body_hash
-                ),
+                "body_sha256": (_hash("wrong-body") if failure == "hash_mismatch" else body_hash),
                 "provider_status": status,
                 "provider_code": code,
                 "provider_request_id_sha256": (
                     None
-                    if self.witness_failure == "no_request_id"
+                    if failure == "no_request_id"
                     else _hash(f"provider-request-{case}-{sequence}")
                 ),
                 "retry_after_seconds": retry_after,
                 "provider_acknowledged": acknowledged,
-                "downstream_response_dropped": (
-                    False if self.witness_failure == "bad_drop" else dropped
-                ),
+                "downstream_response_dropped": (False if failure == "bad_drop" else dropped),
                 "observed_at": observed_at.isoformat(),
             }
 
-        if self.witness_failure == "missing":
+        if failure == "missing":
             return []
         success = receipt(
             after_sequence + 2,
             status=200,
-            code=1 if self.witness_failure == "bad_provider_code" else 0,
-            acknowledged=self.witness_failure != "bad_ack",
+            code=1 if failure == "bad_provider_code" else 0,
+            acknowledged=failure != "bad_ack",
             dropped=case == "ambiguous",
         )
-        if case != "rate_limit_retry_after" or self.witness_failure == "rate_missing_limited":
+        if case != "rate_limit_retry_after" or failure == "rate_missing_limited":
             return [success]
         limited = receipt(
             after_sequence + 1,
@@ -486,6 +493,55 @@ def test_openapi_witness_must_independently_prove_ack_retry_and_drop(
         )
 
 
+def test_credential_rotation_requires_independent_openapi_ack(tmp_path: Path) -> None:
+    profile = _write_profile(tmp_path)
+    sockets = _FakeEvidenceSockets(tmp_path)
+    sockets.witness_failure = "bad_ack"
+    sockets.witness_failure_case = "credential_rotation"
+
+    with pytest.raises(driver.DriverError, match="acknowledgement"):
+        driver.run_driver(
+            _request(profile),
+            _environment(tmp_path, profile),
+            exchange=sockets.exchange,
+            socket_validator=sockets.validate,
+        )
+    assert any(
+        request["after_sequence"]
+        == next(
+            sequence
+            for sequence, receipts in sockets.witness_receipts.items()
+            if any(
+                receipt["provider_acknowledged"] is False and receipt["provider_status"] == 200
+                for receipt in receipts
+            )
+        )
+        for request in sockets.witness_queries
+    )
+
+
+def test_prolonged_outage_requires_independent_openapi_ack_even_when_admin_delivered(
+    tmp_path: Path,
+) -> None:
+    profile = _write_profile(tmp_path)
+    sockets = _FakeEvidenceSockets(tmp_path)
+    sockets.witness_failure = "missing"
+    sockets.witness_failure_case = "prolonged_outage"
+
+    with pytest.raises(driver.DriverError, match="witness receipt is missing"):
+        driver.run_driver(
+            _request(profile),
+            _environment(tmp_path, profile),
+            exchange=sockets.exchange,
+            socket_validator=sockets.validate,
+        )
+    assert any(
+        request["after_sequence"] in sockets.witness_receipts
+        and sockets.witness_receipts[request["after_sequence"]] == []
+        for request in sockets.witness_queries
+    )
+
+
 def test_check_validates_profile_and_both_sockets_without_invoking_broker(
     tmp_path: Path,
 ) -> None:
@@ -513,3 +569,42 @@ def test_main_failure_is_content_free(monkeypatch: pytest.MonkeyPatch, capsys: A
     captured = capsys.readouterr()
     assert captured.out == '{"status":"not_run"}\n'
     assert captured.err == ""
+
+
+def test_broker_peer_is_verified_on_the_same_socket_before_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = False
+
+    class FakeConnection:
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def connect(self, _path: str) -> None:
+            return None
+
+        def getsockopt(self, *_args: object) -> bytes:
+            return struct.pack("3i", 99, 1001, 1002)
+
+        def sendall(self, _payload: bytes) -> None:
+            nonlocal sent
+            sent = True
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(driver.sys, "platform", "linux")
+    monkeypatch.setattr(driver, "_AF_UNIX", 1)
+    monkeypatch.setattr(driver.socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(driver.socket, "socket", lambda *_args: FakeConnection())
+
+    with pytest.raises(driver.DriverError, match="identity does not match"):
+        driver._authenticated_broker_exchange(
+            Path("/run/trpc-im-probe/control.sock"),
+            b"{}",
+            1.0,
+            1024,
+            1001,
+            9999,
+        )
+    assert sent is False

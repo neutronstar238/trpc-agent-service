@@ -339,6 +339,33 @@ def test_load_config_projects_all_runtime_environment(tmp_path: Path) -> None:
     assert "trpc-metrics-secrets" not in config.required_secret_keys()
 
 
+def test_release_id_defaults_to_the_immutable_candidate_binding(tmp_path: Path) -> None:
+    config_path, source = _write_inputs(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("  id: acceptance-1\n", "", 1),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_gate_config(config_path)
+
+    assert config.release_id == "acceptance-1"
+    assert config.environment(source)["TRPC_RELEASE_ID"] == "acceptance-1"
+
+
+def test_explicit_release_id_must_match_the_candidate_binding(tmp_path: Path) -> None:
+    config_path, source = _write_inputs(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  id: acceptance-1\n", "  id: acceptance-other\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_gate_config(config_path)
+    with pytest.raises(DeploymentConfigError, match="release_id does not match"):
+        config.environment(source)
+
+
 def test_support_config_is_projected_to_explicit_environment_names(tmp_path: Path) -> None:
     config_path, source = _write_inputs(tmp_path)
     _add_support_config(config_path)
@@ -811,6 +838,7 @@ def test_checked_in_runtime_gate_uses_canonical_dockerhub_for_all_ack_images() -
         config.hpa_job_image,
     )
     assert all(image.startswith("docker.io/") for image in images)
+    assert config.hpa_job_image == config.resolved_image_references()["initial"]
 
 
 def test_duplicate_and_unknown_keys_are_rejected(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ Dispatcher 或 WeCom Connector 进程，因此不会把被测服务自己的状�
 | --- | --- | --- | --- |
 | `server.py` | 独立探针主机 | 候选绑定、账号指纹、driver 的脱敏结果 | 供应商 callback/WSS/ACK |
 | `provider_runner.py` | checkout 外的固定可执行文件 | 当前通道 profile、账号 ID、Secret 文件路径 | provider observation |
-| `control_broker.py` | host-only Unix socket | 固定 profile、固定 action executable/argv | action 执行结果 |
+| `control_broker.py` | host-only Unix socket | 固定 profile、固定 action executable/SHA-256/argv | action 执行结果 |
 | `feishu_callback_observer.py` | loopback mirror + Unix socket | 独立验签/解密后的域分离哈希 | OpenAPI 发送 ACK |
 | `feishu_openapi_witness.py` | loopback HTTPS 代理 + Unix socket | 状态码、平台码、Retry-After、请求 ID/请求体哈希 | callback 入站 |
 | `feishu_provider_driver.py` | checkout 外的固定可执行文件 | broker 结果及两条 witness 的哈希 receipt | operator action |
@@ -24,7 +24,8 @@ Dispatcher 或 WeCom Connector 进程，因此不会把被测服务自己的状�
 
 broker 的 action executable 是部署/租户特定的受审控制器：它负责按固定 action 对测试账号、ACK 集群
 和现有 Connector 执行真实操作，并返回严格 JSON。本仓库故意不提供一份持有 Kubernetes 管理员、
-数据库、OIDC 或供应商管理员凭据的通用脚本。缺少任一 action executable 时 broker `--check` 失败；
+数据库、OIDC 或供应商管理员凭据的通用脚本。缺少任一 action executable、配置未固定其字节 SHA-256，
+或文件被替换但未同步更新受审摘要时，broker `--check` 以及每次 action 调用都会 fail closed；
 用静态 JSON、录制结果或 driver 自报字段替代 action 会使真实在线门禁失去独立性。
 
 ## 与 yqzl 现有部署的关系
@@ -58,13 +59,25 @@ fail closed。`im-probe.env` 与 `feishu-observer.env` 只填写新路径，不�
    `/usr/local/libexec/trpc-im-provider-runner`），由独立验收代码所有者审查。
    仓库中的 `provider_runner.py`、`feishu_provider_driver.py` 和 `wecom_provider_driver.py` 是可安装的
    fail-closed 编排器；复制到上述路径后设为 `root:root 0755`，且路径任一层都不能是 symlink。
-2. 把 `feishu-control-profile.example.json`、`wecom-control-profile.example.json` 和
-   `control-broker.example.json` 渲染到 `/etc/trpc-im-probe`。先固定 tenant/binding/account、observer/
-   witness socket 和 8 个 action，再对最终文件字节计算 SHA-256；同一值必须同时写入 broker config、
+   在 yqzl 的最终安装路径对 runner 和两个 driver 分别执行 `sha256sum`，把结果写入
+   `TRPC_IM_PROBE_RUNNER_SHA256`、`TRPC_IM_PROBE_FEISHU_DRIVER_SHA256` 和
+   `TRPC_IM_PROBE_WECOM_DRIVER_SHA256`。探针和 runner 会在每次执行前重新 open/fstat/hash；文件被替换
+   或 owner/mode/父目录链不再受 root 控制时必须保持 `not_ready`/`not_run`。IM probe 只部署在拥有真实
+   回调域名的 yqzl 独立主机，ACK 集群不部署或运行这些外部 provider action。
+2. 把 `feishu-control-profile.example.json`、`wecom-control-profile.example.json`、
+   `feishu-control-action.example.json`、`wecom-control-action.example.json` 和
+   `control-broker.example.json` 渲染到 `/etc/trpc-im-probe`。两个 action 模板中的 `<...>` 都是必须替换的
+   占位符；token 只填写由 Secret 管理器安装的绝对文件路径，不能把 token 值写入 JSON。先固定
+   tenant/binding/account、URL、observer/witness socket 和 8 个 action，再对最终文件字节计算 SHA-256；
+   同一值必须同时写入 broker config、
    `TRPC_IM_ONLINE_FEISHU_CONTROL_PROFILE_SHA256` 或
    `TRPC_IM_ONLINE_WECOM_CONTROL_PROFILE_SHA256`。不要对模板或格式化前的文件计算摘要。
-   三份渲染文件及两个 env 文件使用 `root:trpcagent 0640`，目录使用 `root:trpcagent 0750`；
-   broker action executable 使用 `root:root 0755`，不得 group/other-writable。
+   五份渲染 JSON、两个 env 文件和 token 文件使用 `root:trpcagent 0640`，目录和 `secrets/` 使用
+   `root:trpcagent 0750`。
+   对每个最终安装的 broker action executable 字节计算 SHA-256，并把摘要写入相应 action 的必填
+   `sha256` 字段；不要对本地模板、软链接目标名或安装前的其他副本计算摘要。action executable 使用
+   `root:root 0755`，不得 group/other-writable。每次受审控制器更新都必须先更新摘要再执行 `--check`；
+   未同步的替换必须保持 `not_ready`/`not_run`。
 3. 生成一份独立的 32 字节 Ed25519 seed，以 Base64 单行形式保存到
    `TRPC_IM_PROBE_SIGNING_KEY_FILE`，权限设为 root:trpcagent `0640`；把对应公钥
    和 key ID 写入 `deploy/im-probe-trust.json`。私钥绝不能进入 Git、报告、日志或
@@ -74,6 +87,17 @@ fail closed。`im-probe.env` 与 `feishu-observer.env` 只填写新路径，不�
    `feishu-observer.env`，不能加载含另一通道路径的 probe env。执行 `systemctl daemon-reload`、
    `systemctl enable --now`，确认四个单元 active，再确认探针的 `/health/ready` 为 200。探针进程
    只监听 loopback；公网 HTTPS 必须由单独的 nginx vhost 终止并做出口 allowlist。
+   安装 unit 前先创建固定系统账号 `trpcimbroker`；probe/runner 使用既有 `trpcagent`，broker、callback
+   observer 和 OpenAPI witness 使用 `trpcimbroker`，两者的主组统一为共享组 `trpcagent`。必须确认
+   `id -u trpcimbroker` 与 `id -u trpcagent` 不同；不要使用 `DynamicUser`，也不要复用应用 UID。
+   `trpc-im-control-broker.service` 创建并以 `trpcimbroker:trpcagent 0750` 持有
+   `/run/trpc-im-probe`，两个 witness unit 使用同一 owner/group，probe unit 不声明或接管该
+   `RuntimeDirectory`。broker 以 `trpcimbroker:trpcagent 0660` 创建 `control.sock`；把 broker 的数字 UID
+   和其有效共享组 GID 写入
+   `TRPC_IM_PROBE_BROKER_UID/GID`。runner 只能通过共享组连接，不能拥有或替换 runtime 目录/socket。
+   两个 driver 都在实际 broker 请求所用的同一个已连接 socket 上、发送前用 Linux
+   `SO_PEERCRED` 核对 broker UID/GID；独立的预检连接不能替代此检查。不要让 broker 与 runner 复用
+   账号，也不要使用不稳定的动态 UID/GID。
 5. 按 `nginx-server.conf.example` 配置独立 HTTPS 主机、证书和 release-gate
    出口 IP/CIDR allowlist。探针 URL 的 base 必须与 trust 文件和
    `TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST` 完全一致；门禁会自行追加 `/probe`。
@@ -84,11 +108,54 @@ fail closed。`im-probe.env` 与 `feishu-observer.env` 只填写新路径，不�
    `TRPC_SERVICE_FEISHU_SEND_API_ROOT=https://<probe-host>/feishu-openapi` 后滚动更新。其他角色和正常运行
    始终保留 `https://open.feishu.cn`；验收结束立即恢复默认值并再次等待 rollout。
 
+### action 配置的原子安装、权限与检查顺序
+
+更新 action executable、profile 或 action 配置时，必须先停止 broker，避免它在多文件替换中看到混合
+版本。所有 `.new` 文件必须直接暂存在目标文件的同一文件系统中；不要先覆盖最终路径，也不要通过
+symlink 交换版本。推荐顺序如下：
+
+1. 执行 `systemctl stop trpc-im-control-broker.service`，再用
+   `install -d -o root -g trpcagent -m 0750` 创建 `/etc/trpc-im-probe` 和 `secrets/`。
+2. 将两个 action executable 安装到 `/usr/local/libexec/.trpc-im-*-control-action.new`，设为
+   `root:root 0755`；将 token、profile、action JSON 和 broker JSON 渲染到
+   `/etc/trpc-im-probe/.<name>.new`，设为 `root:trpcagent 0640`。真实 token 由 Secret 管理器直接写入
+   暂存文件，不能出现在 shell 参数、环境变量、模板或日志中。
+3. 对**暂存后的**两个 executable 和两个 profile 执行 `sha256sum`。把 executable 摘要写入暂存的
+   broker `sha256` 字段，把 profile 摘要写入对应 `control_profile_sha256`；此后不得再格式化或改写这些
+   已取摘要的文件。
+4. 用 `lstat`/`stat` 确认目标父目录和每个暂存文件都不是 symlink，owner/mode 与上文一致，且
+   broker config、profile、action executable 和 token 都由 root（uid 0）所有，executable 不可
+   group/other-writable。逐级检查每条受信路径的父目录直到 `/`：任何一级都不可 group/other-writable；
+   非 root 所有的目录还不可 owner-writable。保持 broker 停止，先用同文件系统的 `mv -T` 原子替换
+   token、executable、profile 和 action JSON，最后原子替换 `control-broker.json`。
+5. 在**最终路径**重新执行 `sha256sum`，确认结果逐字匹配最终 broker 配置；再以服务账号运行配置检查：
+
+   ```bash
+   sudo -u trpcimbroker /usr/local/libexec/trpc-im-feishu-control-action \
+     --config /etc/trpc-im-probe/feishu-control-action.json --check
+   sudo -u trpcimbroker env \
+     TRPC_IM_CONTROL_BROKER_CONFIG_FILE=/etc/trpc-im-probe/control-broker.json \
+     /opt/trpc-im-probe/current/.venv/bin/python \
+     /opt/trpc-im-probe/current/deploy/im_probe/control_broker.py --check
+   ```
+
+   任一 hash、权限或 `--check` 不通过都必须保持 broker 停止。全部通过后才执行
+   `systemctl start trpc-im-control-broker.service` 和 `systemctl is-active trpc-im-control-broker.service`；
+   不要用重启成功代替上述最终路径检查。
+
 runner 必须执行真实的外部动作并在 stdout 输出一个严格 JSON 对象：
 
 ```json
-{"provider_evidence":{"source":"...","independent_paths":["...","..."],"run_nonce":"...","account_fingerprint":"...","observations":{}}}
+{"artifact_attestation":{"schema_version":1,"runner_sha256":"...","runner_contract_version":1,"driver_sha256":"...","driver_contract_version":1},"provider_evidence":{"source":"...","independent_paths":["...","..."],"run_nonce":"...","account_fingerprint":"...","observations":{}}}
 ```
+
+每个 case 的 action 必须按固定顺序调用 Admin：先以 `channel + run_id + run_nonce` 请求
+`POST /v1/tenants/{tenant}/bindings/{binding}/im-acceptance/runs`，确认服务端返回的
+`run_id_sha256` 和 `run_binding_sha256` 与本轮请求一致；随后才允许触发真实供应商动作。平台事件进入
+业务数据库后，再把同一个 `run_id + run_nonce` 和 `provider_event_hash` 交给
+`im-acceptance/event-evidence`。注册记录由数据库时间限定为 30–900 秒且只能绑定一个事件；旧事件、
+错误 nonce、重复绑定、跨 run 复用或先于注册到达的事件都必须 fail-closed。迁移 `0021` 和 `0022`
+必须在包含这些 action 的新 Pod 启动前完成，不能先滚动应用再补表。
 
 它必须证明飞书 callback + OpenAPI send ack、企微 WebSocket event + send ack，
 以及 round trip、idempotency、media、reconnect、rate-limit/Retry-After、credential
@@ -127,11 +194,16 @@ driver。driver 的 stdout 必须恰好是
 ```powershell
 $env:TRPC_IM_PROBE_SIGNING_KEY_FILE = "<test-key-file>"
 $env:TRPC_IM_PROBE_KEY_ID = "test-key"
-$env:TRPC_IM_PROBE_IMAGE_DIGEST = "sha256:<candidate>"
+$env:TRPC_IM_PROBE_RELEASE_CONTEXT_FILE = "<root-owned-release-context.json>"
 $env:TRPC_IM_PROBE_IDENTITY_SHA256 = "<fixed-64-hex>"
 ... # 其余账号、secret 文件和 runner 变量见 im-probe.env.example
 .\.venv\Scripts\python.exe deploy\im_probe\server.py --check
 ```
+
+release context 必须是 root-owned、不可 group/other-writable 的非 symlink 普通文件，且只包含
+`schema_version=1`、`release_id`、`nonce_sha256`、`source_fingerprint` 和不可变 `image_digest`。
+probe 启动时会对当前部署目录执行与候选锁相同的 source fingerprint；仅复制新 context 到旧代码目录
+会 fail closed，不能把旧 yqzl 服务伪装成新候选。
 
 先用同一个 host-only 配置文件运行完整预检；它不会访问网络、执行 driver 或生成
 生产 IM 通过证据：
@@ -153,11 +225,15 @@ release binding、URL allowlist、Ed25519 公私钥和两条 driver 全部一致
 项目“功能完成”可以用当前候选在真实 Feishu/WeCom 上的基础双向收发闭环：每个通道都必须有唯一
 入站、唯一出站和供应商回执。该基础证据不属于 `im-online.json` 的生产 8-case，不能将
 `online_im` 或 `production_gate` 写成 `pass`；生产发布和 release manifest 仍要求两个通道的完整
-8-case 与破坏性生产灾备全部通过，缺失任一项必须保持 `not_run`。
+8-case。破坏性生产灾备默认必须真实通过；唯一例外是发布者显式使用 `--allow-functional-dr`，并由当前
+候选的功能灾备 `pass` 授权其诚实保持 `not_run`。该选项不能豁免 `online_im=not_run` 或任何失败门禁。
 
-新集群只承载 Gateway、Worker、Channel Dispatcher、WeCom Connector 和数据后端；
-独立探针、签名私钥、runner、driver 继续放在 yqzl/独立主机。这样重建集群不会丢失
-探针信任边界，但真实在线验收仍必须等新集群恢复后才能运行。
+yqzl 承载真实 IM 回调域名对应的被测 Gateway、Channel Dispatcher、Feishu/WeCom Connector，以及
+与应用进程隔离的 probe/control broker/runner/driver；yqzl 只做 IM 功能与在线门禁，禁止在该主机做
+性能压测。ACK 不承载真实 IM 回调，而承载同一候选的 Kubernetes、迁移、故障、HPA 和性能验收。
+两侧证据只有在 yqzl 部署的 release context、实际测得 source fingerprint 和不可变 image digest 与
+candidate lock 完全一致时才能合并。可以在候选冻结前先做 yqzl 双向收发 smoke，但最终签名 8-case
+必须在候选锁和镜像 digest 冻结后重跑，再与 ACK 的非 IM 报告共同生成 release manifest。
 
 真正生产验收仍必须由下面这一条（同一候选、同一 release binding）命令发起：
 

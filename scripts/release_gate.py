@@ -71,6 +71,11 @@ REPORTS = {
     "disaster_recovery": ("disaster-recovery.json", True),
 }
 
+FUNCTIONAL_DR_REPORT = (
+    "disaster-recovery-functional.json",
+    "scripts.functional_disaster_recovery_gate",
+)
+
 # A current-candidate envelope is useful only when it was emitted by the
 # gate which owns the report.  This allowlist is intentionally explicit: a
 # valid performance envelope copied into a Kubernetes, IM, or fault report
@@ -329,19 +334,30 @@ IM_PROBE_TRUST_MAX_BYTES = 8 * 1024
 IM_PROBE_TRUST_KEY_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 IM_PROBE_URL_MAX_LENGTH = 2048
 IM_RESPONSE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+IM_RUNTIME_ATTESTATION_FIELDS = frozenset(
+    {
+        "status",
+        "run_nonce",
+        "image_digest",
+        "release_id",
+        "release_nonce_sha256",
+        "source_fingerprint",
+    }
+)
+IM_ARTIFACT_ATTESTATION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "runner_sha256",
+        "runner_contract_version",
+        "driver_sha256",
+        "driver_contract_version",
+    }
+)
 IM_CASE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "round_trip": ("callback_event_id_hash", "outbound_request_id_hash", "provider_code"),
     "idempotency": ("duplicate_event_id_hash", "unique_inbound_id_hash", "duplicate_count"),
     "media": ("bytes",),
-    "reconnect": (
-        "disconnect_event_id_hash",
-        "reconnect_event_id_hash",
-        "received_after_reconnect_event_id_hash",
-        "lock_takeover_event_id_hash",
-        "old_lock_owner_released",
-        "new_lock_owner_acquired",
-        "lock_epoch",
-    ),
+    "reconnect": (),
     "rate_limit_retry_after": (
         "provider_error_code",
         "retry_after_seconds",
@@ -363,6 +379,34 @@ IM_CASE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
         "auto_replay_count",
     ),
 }
+IM_FEISHU_RECONNECT_FIELDS = (
+    "failed_endpoint_id_hash",
+    "replacement_endpoint_id_hash",
+    "endpoint_set_observed",
+    "received_after_failover_event_id_hash",
+    "outbound_request_id_hash",
+    "acknowledged_request_id_hash",
+    "ready_endpoint_count",
+    "unready_endpoint_count",
+    "terminating_endpoint_count",
+)
+IM_WECOM_RECONNECT_FIELDS = (
+    "disconnect_event_id_hash",
+    "reconnect_event_id_hash",
+    "received_after_reconnect_event_id_hash",
+    "lock_takeover_event_id_hash",
+    "old_lock_owner_released",
+    "new_lock_owner_acquired",
+    "lock_epoch",
+    "outbound_request_id_hash",
+    "acknowledged_request_id_hash",
+    "provider_code",
+)
+IM_WECOM_ROTATION_ACK_FIELDS = (
+    "outbound_request_id_hash",
+    "acknowledged_request_id_hash",
+    "provider_code",
+)
 IM_WECOM_SERVICE_FAILOVER_FIELDS = (
     "outage_mode",
     "failed_instance_id_hash",
@@ -563,6 +607,7 @@ MIGRATION_TARGET_EMPTY_TABLES = (
     "session_mailbox_items",
     "wecom_connection_state",
     "im_acceptance_evidence_events",
+    "im_acceptance_runs",
     "migration_checkpoints",
     "migration_scope_manifests",
     "migration_leases",
@@ -5193,6 +5238,21 @@ def _validate_online_im_semantics(
     if generated_at.tzinfo is None:
         return _im_missing("evidence.generated_at")
     run_nonce: str | None = None
+    release_binding = evidence.get("release_binding")
+    if not isinstance(release_binding, Mapping):
+        return _im_missing("evidence.release_binding")
+    release_id = release_binding.get("release_id")
+    release_nonce_sha256 = release_binding.get("nonce_sha256")
+    source_value = recorded_source.get("value") if isinstance(recorded_source, Mapping) else None
+    if (
+        not isinstance(release_id, str)
+        or not isinstance(release_nonce_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", release_nonce_sha256) is None
+        or not isinstance(source_value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_value) is None
+    ):
+        return _im_missing("evidence release or source binding")
+    runner_sha256: str | None = None
     for channel_name in IM_REQUIRED_CHANNELS:
         channel = channels.get(channel_name)
         if not isinstance(channel, Mapping) or channel.get("status") != "pass":
@@ -5247,6 +5307,46 @@ def _validate_online_im_semantics(
             run_nonce = channel_nonce
         elif run_nonce != channel_nonce:
             return _im_missing("provider run_nonce shared across channels")
+        runtime_attestation = channel.get("runtime_attestation")
+        if (
+            not isinstance(runtime_attestation, Mapping)
+            or set(runtime_attestation) != IM_RUNTIME_ATTESTATION_FIELDS
+            or runtime_attestation.get("status") != "pass"
+            or runtime_attestation.get("run_nonce") != channel_nonce
+            or runtime_attestation.get("image_digest") != f"sha256:{runtime_digest.lower()}"
+            or runtime_attestation.get("release_id") != release_id
+            or runtime_attestation.get("release_nonce_sha256") != release_nonce_sha256
+            or runtime_attestation.get("source_fingerprint") != source_value
+        ):
+            return _im_missing(f"candidate.channels.{channel_name}.runtime_attestation")
+        artifact_attestation = channel.get("artifact_attestation")
+        if (
+            not isinstance(artifact_attestation, Mapping)
+            or set(artifact_attestation) != IM_ARTIFACT_ATTESTATION_FIELDS
+            or not _schema_version_is(artifact_attestation.get("schema_version"), 1)
+            or not _schema_version_is(artifact_attestation.get("runner_contract_version"), 1)
+            or not _schema_version_is(artifact_attestation.get("driver_contract_version"), 1)
+        ):
+            return _im_missing(f"candidate.channels.{channel_name}.artifact_attestation")
+        if provider.get("artifact_attestation") != artifact_attestation:
+            return _im_missing(
+                f"candidate.channels.{channel_name}.provider artifact_attestation binding"
+            )
+        channel_runner_sha256 = artifact_attestation.get("runner_sha256")
+        driver_sha256 = artifact_attestation.get("driver_sha256")
+        if (
+            not isinstance(channel_runner_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", channel_runner_sha256) is None
+            or channel_runner_sha256 in {"0" * 64, "f" * 64}
+            or not isinstance(driver_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", driver_sha256) is None
+            or driver_sha256 in {"0" * 64, "f" * 64}
+        ):
+            return _im_missing(f"candidate.channels.{channel_name}.artifact hashes")
+        if runner_sha256 is None:
+            runner_sha256 = channel_runner_sha256
+        elif runner_sha256 != channel_runner_sha256:
+            return _im_missing("candidate.channels shared runner artifact")
         started_raw = provider.get("run_started_at")
         try:
             started_at = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
@@ -5278,6 +5378,14 @@ def _validate_online_im_semantics(
         if not isinstance(observations, Mapping) or set(observations) != set(IM_REQUIRED_CASES):
             return _im_missing(f"candidate.channels.{channel_name}.observations exact inventory")
         for case_name, required_fields in IM_CASE_REQUIRED_FIELDS.items():
+            if case_name == "reconnect":
+                required_fields += (
+                    IM_FEISHU_RECONNECT_FIELDS
+                    if channel_name == "feishu"
+                    else IM_WECOM_RECONNECT_FIELDS
+                )
+            if channel_name == "wecom" and case_name == "credential_rotation":
+                required_fields += IM_WECOM_ROTATION_ACK_FIELDS
             if channel_name == "wecom" and case_name == "prolonged_outage":
                 required_fields += IM_WECOM_SERVICE_FAILOVER_FIELDS
             observation = observations.get(case_name)
@@ -5330,24 +5438,81 @@ def _validate_online_im_semantics(
                 return _im_missing(
                     f"candidate.channels.{channel_name}.observations.{case_name}.bytes bounds"
                 )
-            if case_name == "reconnect":
+            if case_name == "reconnect" and channel_name == "wecom":
                 released = observation.get("old_lock_owner_released")
                 acquired = observation.get("new_lock_owner_acquired")
-                released_is_valid = (
-                    type(released) is bool if channel_name == "wecom" else released is True
-                )
-                if acquired is not True or not released_is_valid:
+                if acquired is not True or type(released) is not bool:
                     return _im_missing(
                         f"candidate.channels.{channel_name}.observations.{case_name} lock takeover"
                     )
-                minimum_epoch = 2 if channel_name == "wecom" else 1
                 if not _bounded_int(
                     observation.get("lock_epoch"),
-                    minimum=minimum_epoch,
+                    minimum=2,
                     maximum=2**63 - 1,
                 ):
                     return _im_missing(
                         f"candidate.channels.{channel_name}.observations.{case_name}.lock_epoch"
+                    )
+            if case_name == "reconnect" and channel_name == "feishu":
+                failed_endpoint = observation.get("failed_endpoint_id_hash")
+                replacement_endpoint = observation.get("replacement_endpoint_id_hash")
+                received_after_failover = observation.get("received_after_failover_event_id_hash")
+                outbound_request = observation.get("outbound_request_id_hash")
+                acknowledged_request = observation.get("acknowledged_request_id_hash")
+                if any(
+                    not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                    for value in (
+                        failed_endpoint,
+                        replacement_endpoint,
+                        received_after_failover,
+                        outbound_request,
+                        acknowledged_request,
+                    )
+                ):
+                    return _im_missing(
+                        "candidate.channels.feishu.observations.reconnect endpoint or ACK hash"
+                    )
+                if failed_endpoint == replacement_endpoint:
+                    return _im_missing(
+                        "candidate.channels.feishu.observations.reconnect distinct endpoints"
+                    )
+                if outbound_request != acknowledged_request:
+                    return _im_missing(
+                        "candidate.channels.feishu.observations.reconnect ACK binding"
+                    )
+                if observation.get("endpoint_set_observed") is not True:
+                    return _im_missing(
+                        "candidate.channels.feishu.observations.reconnect EndpointSlice observation"
+                    )
+                if not _bounded_int(
+                    observation.get("ready_endpoint_count"), minimum=1, maximum=1_000_000
+                ):
+                    return _im_missing(
+                        "candidate.channels.feishu.observations.reconnect ready endpoints"
+                    )
+                if any(
+                    not _bounded_int(observation.get(field), minimum=0, maximum=0)
+                    for field in ("unready_endpoint_count", "terminating_endpoint_count")
+                ):
+                    return _im_missing(
+                        "candidate.channels.feishu.observations.reconnect unstable endpoints"
+                    )
+            if channel_name == "wecom" and case_name in {"reconnect", "credential_rotation"}:
+                outbound_request = observation.get("outbound_request_id_hash")
+                acknowledged_request = observation.get("acknowledged_request_id_hash")
+                if (
+                    not isinstance(outbound_request, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", outbound_request) is None
+                    or not isinstance(acknowledged_request, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", acknowledged_request) is None
+                    or acknowledged_request != outbound_request
+                ):
+                    return _im_missing(
+                        f"candidate.channels.wecom.observations.{case_name} ACK binding"
+                    )
+                if str(observation.get("provider_code")) not in {"0", "200"}:
+                    return _im_missing(
+                        f"candidate.channels.wecom.observations.{case_name} provider ACK code"
                     )
             if case_name == "rate_limit_retry_after":
                 provider_code = observation.get("provider_error_code")
@@ -5552,6 +5717,107 @@ def _validate_disaster_recovery_semantics(
     return None, None
 
 
+def _validate_functional_disaster_recovery_semantics(
+    report: Mapping[str, Any], *, report_path: Path | None
+) -> tuple[str | None, str | None]:
+    def bounded(value: object, *, minimum: float, maximum: float) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and minimum <= float(value) <= maximum
+        )
+
+    baseline = report.get("baseline")
+    candidate = report.get("candidate")
+    deltas = report.get("case_deltas")
+    required = ("postgres_pitr", "artifact_restore", "key_restore")
+    if report.get("production_gate") != "not_run":
+        return "not_run", "functional disaster recovery must not claim production DR pass"
+    if not isinstance(baseline, Mapping) or baseline.get("required_components") != list(required):
+        return "not_run", "functional disaster recovery component contract is incomplete"
+    max_rto = baseline.get("max_rto_seconds")
+    if not bounded(max_rto, minimum=0.001, maximum=7 * 86_400):
+        return "not_run", "functional disaster recovery RTO objective is invalid"
+    assert isinstance(max_rto, (int, float))
+    if (
+        not isinstance(candidate, Mapping)
+        or candidate.get("mode") != "same_cluster_zero_cost_functional"
+        or candidate.get("platform") != "kubernetes"
+    ):
+        return "not_run", "functional disaster recovery mode is invalid"
+    components = candidate.get("components")
+    if not isinstance(components, Mapping) or set(components) != set(required):
+        return "not_run", "functional disaster recovery component evidence is incomplete"
+    for name in required:
+        component = components.get(name)
+        if (
+            not isinstance(component, Mapping)
+            or component.get("status") != "pass"
+            or not isinstance(component.get("run_id"), str)
+            or not component.get("run_id")
+            or not bounded(component.get("rpo_seconds"), minimum=0, maximum=86_400)
+            or not bounded(component.get("rto_seconds"), minimum=0, maximum=float(max_rto))
+            or not isinstance(component.get("backend"), str)
+            or not component.get("backend")
+            or not isinstance(component.get("restore_mode"), str)
+            or not component.get("restore_mode")
+        ):
+            return "not_run", f"functional disaster recovery component {name} is invalid"
+    if not isinstance(deltas, Mapping) or deltas.get("failed_components") != []:
+        return "not_run", "functional disaster recovery failed_components is not empty"
+    orchestration = candidate.get("orchestration")
+    if (
+        not isinstance(orchestration, Mapping)
+        or orchestration.get("failure_stage") is not None
+        or orchestration.get("failure_code") is not None
+        or orchestration.get("namespace_created") is not True
+        or orchestration.get("jobs_submitted_together") is not True
+        or orchestration.get("cleanup_completed") is not True
+        or not isinstance(orchestration.get("namespace_sha256"), str)
+        or MIGRATION_SHA256_RE.fullmatch(str(orchestration.get("namespace_sha256"))) is None
+        or not isinstance(orchestration.get("namespace_uid_sha256"), str)
+        or MIGRATION_SHA256_RE.fullmatch(str(orchestration.get("namespace_uid_sha256"))) is None
+    ):
+        return "not_run", "functional disaster recovery orchestration or cleanup is invalid"
+    lineage = candidate.get("lineage")
+    image_digest = lineage.get("image_digest") if isinstance(lineage, Mapping) else None
+    if (
+        not isinstance(image_digest, str)
+        or PRODUCTION_IMAGE_DIGEST_RE.fullmatch(image_digest) is None
+    ):
+        return "not_run", "functional disaster recovery image digest is invalid"
+    if report_path is None:
+        return "not_run", "functional disaster recovery report path is unavailable"
+    lock_path = report_path.parent / "candidate-lock.json"
+    binding_path = report_path.parent / "registry-image-binding.json"
+    if (
+        lock_path.is_symlink()
+        or binding_path.is_symlink()
+        or not lock_path.is_file()
+        or not binding_path.is_file()
+    ):
+        return "not_run", "functional disaster recovery candidate lock or image binding is missing"
+    try:
+        lock = _strict_json_loads(lock_path.read_text(encoding="utf-8"))
+        binding = _strict_json_loads(binding_path.read_text(encoding="utf-8"))
+        from scripts.candidate_lock import verify_candidate_lock
+
+        lock_reasons = verify_candidate_lock(lock, binding)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, TypeError) as error:
+        return (
+            "not_run",
+            f"functional disaster recovery candidate lock is invalid: {type(error).__name__}",
+        )
+    if lock_reasons:
+        return "not_run", lock_reasons[0]
+    if candidate.get("candidate_lock_sha256") != hashlib.sha256(lock_path.read_bytes()).hexdigest():
+        return "not_run", "functional disaster recovery candidate lock content changed"
+    if lock.get("image_digest") != image_digest:
+        return "not_run", "functional disaster recovery candidate lock image digest changed"
+    return None, None
+
+
 def _production_evidence_result(
     report: dict[str, Any], *, report_name: str, report_path: Path | None = None
 ) -> tuple[str | None, str | None]:
@@ -5565,7 +5831,11 @@ def _production_evidence_result(
     )
     if not reasons:
         evidence = report.get("evidence")
-        expected_producer = PRODUCTION_EVIDENCE_PRODUCERS.get(report_name)
+        expected_producer = (
+            FUNCTIONAL_DR_REPORT[1]
+            if report_name == FUNCTIONAL_DR_REPORT[0]
+            else PRODUCTION_EVIDENCE_PRODUCERS.get(report_name)
+        )
         actual_producer = evidence.get("producer") if isinstance(evidence, Mapping) else None
         if expected_producer is not None and actual_producer != expected_producer:
             return (
@@ -5620,6 +5890,16 @@ def _production_evidence_result(
             if not isinstance(evidence, Mapping):
                 return "not_run", "disaster recovery evidence is missing current-candidate lineage"
             return _validate_disaster_recovery_semantics(report, report_path=report_path)
+        if report_name == FUNCTIONAL_DR_REPORT[0]:
+            if not isinstance(evidence, Mapping):
+                return (
+                    "not_run",
+                    "functional disaster recovery evidence is missing current-candidate lineage",
+                )
+            return _validate_functional_disaster_recovery_semantics(
+                report,
+                report_path=report_path,
+            )
         return None, None
     # Keep the historical performance wording stable for existing operators;
     # all production reports use the same validator underneath.
@@ -5665,6 +5945,9 @@ def _status(path: Path, *, production_field: bool) -> tuple[str, list[str]]:
     value = report.get(field, "not_run")
     if value not in {"pass", "fail", "not_run"}:
         return "fail", [f"invalid {field} in {path.name}"]
+    gate_value = report.get("gate", "not_run")
+    if production_field and gate_value not in {"pass", "fail", "not_run"}:
+        return "fail", [f"invalid gate in {path.name}"]
     reason_field = "production_rejection_reasons" if production_field else "rejection_reasons"
     reasons = [str(reason) for reason in report.get(reason_field, [])]
     if value == "pass":
@@ -5674,10 +5957,40 @@ def _status(path: Path, *, production_field: bool) -> tuple[str, list[str]]:
             )
             if evidence_reason is not None:
                 return evidence_status or "not_run", [evidence_reason]
+            if gate_value != "pass":
+                gate_reasons = [str(reason) for reason in report.get("rejection_reasons", [])]
+                if not gate_reasons:
+                    gate_reasons = [f"{path.name} reported gate={gate_value}"]
+                return str(gate_value), gate_reasons
         return value, []
+    if production_field and gate_value == "fail":
+        gate_reasons = [str(reason) for reason in report.get("rejection_reasons", [])]
+        if not gate_reasons:
+            gate_reasons = [f"{path.name} reported gate=fail"]
+        return "fail", gate_reasons
     if not reasons:
         reasons = [f"{path.name} reported {field}={value}"]
     return value, reasons
+
+
+def _functional_dr_status(path: Path) -> tuple[str, list[str]]:
+    status, reasons = _status(path, production_field=False)
+    if status != "pass":
+        return status, reasons
+    try:
+        report_value: Any = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        return "fail", [f"invalid report {path.name}: {type(error).__name__}"]
+    if not isinstance(report_value, dict):
+        return "fail", [f"invalid report {path.name}: root must be a JSON object"]
+    evidence_status, evidence_reason = _production_evidence_result(
+        report_value,
+        report_name=path.name,
+        report_path=path,
+    )
+    if evidence_reason is not None:
+        return evidence_status or "not_run", [evidence_reason]
+    return "pass", []
 
 
 def main() -> int:
@@ -5685,6 +5998,11 @@ def main() -> int:
     parser.add_argument("--directory", type=Path, default=Path("runs/multitenant"))
     parser.add_argument("--output", type=Path, default=Path("runs/multitenant/release-gate.json"))
     parser.add_argument("--require-production", action="store_true")
+    parser.add_argument(
+        "--allow-functional-dr",
+        action="store_true",
+        help="explicitly authorize a validated functional DR pass for destructive DR=not_run",
+    )
     args = parser.parse_args()
 
     candidate: dict[str, str] = {}
@@ -5697,15 +6015,59 @@ def main() -> int:
         candidate[name] = status
         reasons.extend(f"{name}: {reason}" for reason in report_reasons)
 
+    destructive_dr_authorizable_not_run = False
+    if args.allow_functional_dr and candidate["disaster_recovery"] == "not_run":
+        destructive_path = args.directory / REPORTS["disaster_recovery"][0]
+        if not destructive_path.is_file():
+            destructive_dr_authorizable_not_run = True
+        else:
+            try:
+                destructive_report = _strict_json_loads(
+                    destructive_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                destructive_report = None
+            if isinstance(destructive_report, Mapping) and destructive_report.get("gate") == "fail":
+                candidate["disaster_recovery"] = "fail"
+                reasons.append(
+                    "disaster_recovery: failed destructive disaster recovery cannot be waived"
+                )
+            elif isinstance(destructive_report, Mapping):
+                destructive_dr_authorizable_not_run = (
+                    destructive_report.get("production_gate", "not_run") == "not_run"
+                )
+
+    if args.allow_functional_dr:
+        functional_status, functional_reasons = _functional_dr_status(
+            args.directory / FUNCTIONAL_DR_REPORT[0]
+        )
+        candidate["functional_disaster_recovery"] = functional_status
+        reasons.extend(f"functional_disaster_recovery: {reason}" for reason in functional_reasons)
+
+    authorized_not_run_gates: list[str] = []
+    if (
+        args.allow_functional_dr
+        and candidate["disaster_recovery"] == "not_run"
+        and candidate.get("functional_disaster_recovery") == "pass"
+        and destructive_dr_authorizable_not_run
+    ):
+        authorized_not_run_gates.append("disaster_recovery")
+
     production_report_contract = {
         name: (filename, PRODUCTION_EVIDENCE_PRODUCERS[filename])
         for name, (filename, production_field) in REPORTS.items()
         if production_field and filename in PRODUCTION_EVIDENCE_PRODUCERS
     }
+    if args.allow_functional_dr:
+        production_report_contract["functional_disaster_recovery"] = FUNCTIONAL_DR_REPORT
+        if "disaster_recovery" in authorized_not_run_gates:
+            production_report_contract.pop("disaster_recovery")
     release_bundle_status, release_bundle_reasons = validate_manifest(
         args.directory,
         reports=production_report_contract,
         current_source=_current_candidate_source_fingerprint(),
+        allow_functional_dr=args.allow_functional_dr,
+        authorized_not_run_gates=tuple(authorized_not_run_gates),
     )
     candidate["release_bundle"] = release_bundle_status
     reasons.extend(f"release_bundle: {reason}" for reason in release_bundle_reasons)
@@ -5722,8 +6084,13 @@ def main() -> int:
         "im_resilience_contract",
         "privacy_leak",
     )
-    development_failed = [name for name in development_names if candidate[name] == "fail"]
-    development_missing = [name for name in development_names if candidate[name] == "not_run"]
+    development_contract_names = development_names + (
+        ("functional_disaster_recovery",) if args.allow_functional_dr else ()
+    )
+    development_failed = [name for name in development_contract_names if candidate[name] == "fail"]
+    development_missing = [
+        name for name in development_contract_names if candidate[name] == "not_run"
+    ]
     development_gate = (
         "fail" if development_failed else "not_run" if development_missing else "pass"
     )
@@ -5731,7 +6098,11 @@ def main() -> int:
         name for name, (_, production_field) in REPORTS.items() if production_field
     )
     production_failed = [name for name in production_names if candidate[name] == "fail"]
-    production_missing = [name for name in production_names if candidate[name] == "not_run"]
+    production_missing = [
+        name
+        for name in production_names
+        if candidate[name] == "not_run" and name not in authorized_not_run_gates
+    ]
     if release_bundle_status == "fail":
         production_failed.append("release_bundle")
     elif release_bundle_status == "not_run":
@@ -5746,8 +6117,11 @@ def main() -> int:
         if runtime_production_gate == "not_run" or development_gate == "not_run"
         else "pass"
     )
+    baseline = {**{name: "pass" for name in REPORTS}, "release_bundle": "pass"}
+    if args.allow_functional_dr:
+        baseline["functional_disaster_recovery"] = "pass"
     result = {
-        "baseline": {**{name: "pass" for name in REPORTS}, "release_bundle": "pass"},
+        "baseline": baseline,
         "candidate": candidate,
         "case_deltas": {
             "failed_gates": len(production_failed),
@@ -5759,6 +6133,7 @@ def main() -> int:
         "gate": gate,
         "runtime_production_gate": runtime_production_gate,
         "development_gate": development_gate,
+        "authorized_not_run_gates": authorized_not_run_gates,
         "rejection_reasons": reasons,
     }
     rendered = json.dumps(result, indent=2)

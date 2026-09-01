@@ -45,7 +45,7 @@ ACTION_ENV = "TRPC_IM_CONTROL_ACTION"
 
 CONFIG_FIELDS = frozenset({"schema_version", "socket_path", "socket_mode", "channels"})
 CHANNEL_FIELDS = frozenset({"control_profile_file", "control_profile_sha256", "allowed_actions"})
-ACTION_FIELDS = frozenset({"executable", "argv", "timeout_seconds"})
+ACTION_FIELDS = frozenset({"executable", "sha256", "argv", "timeout_seconds"})
 REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -84,6 +84,7 @@ class DispatchError(RuntimeError):
 @dataclass(frozen=True)
 class ActionConfig:
     executable: Path
+    sha256: str
     argv: tuple[str, ...]
     timeout_seconds: float
 
@@ -148,6 +149,38 @@ def _secure_posix_mode(mode: int) -> bool:
     return mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
 
 
+def _effective_ids() -> tuple[int, int]:
+    get_uid = getattr(os, "geteuid", None)
+    get_gid = getattr(os, "getegid", None)
+    if not callable(get_uid) or not callable(get_gid):
+        raise ConfigError("POSIX process identity is unavailable")
+    return int(get_uid()), int(get_gid())
+
+
+def _validate_posix_file_owner(metadata: os.stat_result) -> None:
+    if metadata.st_uid != 0:
+        raise ConfigError("configured file must be root-owned")
+
+
+def _validate_trusted_parent_chain(path: Path) -> None:
+    current = path.parent
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise ConfigError("configured file parent is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ConfigError("configured file parent must be a non-symlink directory")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ConfigError("configured file parent is group or other writable")
+        if metadata.st_uid != 0 and metadata.st_mode & stat.S_IWUSR:
+            raise ConfigError("configured file parent is writable by a non-root owner")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
 def _validate_secure_regular_file(
     path: Path,
     *,
@@ -155,14 +188,18 @@ def _validate_secure_regular_file(
 ) -> os.stat_result:
     if not path.is_absolute():
         raise ConfigError("path must be absolute")
+    if os.name == "posix":
+        _validate_trusted_parent_chain(path)
     try:
         metadata = path.lstat()
     except OSError as error:
         raise ConfigError("configured file is unavailable") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise ConfigError("configured file must be a non-symlink regular file")
-    if os.name == "posix" and not _secure_posix_mode(metadata.st_mode):
-        raise ConfigError("configured file is group or other writable")
+    if os.name == "posix":
+        _validate_posix_file_owner(metadata)
+        if not _secure_posix_mode(metadata.st_mode):
+            raise ConfigError("configured file is group or other writable")
     if executable and not os.access(path, os.X_OK):
         raise ConfigError("configured executable is not executable")
     return metadata
@@ -182,8 +219,10 @@ def _read_secure_file(path: Path, *, limit: int) -> bytes:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise ConfigError("configured file changed type")
-        if os.name == "posix" and not _secure_posix_mode(metadata.st_mode):
-            raise ConfigError("configured file is group or other writable")
+        if os.name == "posix":
+            _validate_posix_file_owner(metadata)
+            if not _secure_posix_mode(metadata.st_mode):
+                raise ConfigError("configured file is group or other writable")
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             contents = stream.read(limit + 1)
     finally:
@@ -191,6 +230,33 @@ def _read_secure_file(path: Path, *, limit: int) -> bytes:
     if len(contents) > limit:
         raise ConfigError("configured file is too large")
     return contents
+
+
+def _secure_file_sha256(path: Path, *, executable: bool = False) -> str:
+    _validate_secure_regular_file(path, executable=executable)
+    flags = os.O_RDONLY
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ConfigError("configured file cannot be opened") from error
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConfigError("configured file changed type")
+        if os.name == "posix":
+            _validate_posix_file_owner(metadata)
+            if not _secure_posix_mode(metadata.st_mode):
+                raise ConfigError("configured file is group or other writable")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(64 * 1024):
+                digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
 
 
 def _application_root() -> Path | None:
@@ -238,6 +304,12 @@ def _parse_action(value: object, *, application_root: Path | None) -> ActionConf
     _validate_secure_regular_file(executable, executable=True)
     if application_root is not None and _is_within(executable, application_root):
         raise ConfigError("allowed action executable is inside the application checkout")
+    action_hash = value.get("sha256")
+    if not isinstance(action_hash, str) or HEX64_RE.fullmatch(action_hash) is None:
+        raise ConfigError("allowed action hash is invalid")
+    actual_hash = _secure_file_sha256(executable, executable=True)
+    if actual_hash != action_hash.lower():
+        raise ConfigError("allowed action hash does not match")
 
     argv_value = value.get("argv")
     if (
@@ -259,6 +331,7 @@ def _parse_action(value: object, *, application_root: Path | None) -> ActionConf
         raise ConfigError("allowed action timeout is invalid")
     return ActionConfig(
         executable=executable.resolve(strict=True),
+        sha256=action_hash.lower(),
         argv=tuple(argv_value),
         timeout_seconds=float(timeout),
     )
@@ -296,7 +369,12 @@ def _parse_channel(value: object, *, application_root: Path | None) -> ChannelCo
     )
 
 
-def _validate_socket_parent(socket_path: Path, *, starting: bool) -> None:
+def _validate_socket_parent(
+    socket_path: Path,
+    *,
+    starting: bool,
+    socket_mode: int = 0o600,
+) -> None:
     if not socket_path.is_absolute():
         raise ConfigError("socket path must be absolute")
     parent = socket_path.parent
@@ -306,6 +384,12 @@ def _validate_socket_parent(socket_path: Path, *, starting: bool) -> None:
         raise ConfigError("socket parent is unavailable") from error
     if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
         raise ConfigError("socket parent must be a non-symlink directory")
+    if os.name == "posix" and (
+        parent_metadata.st_uid != _effective_ids()[0]
+        or parent_metadata.st_gid != _effective_ids()[1]
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o750
+    ):
+        raise ConfigError("socket parent owner or mode is invalid")
     try:
         socket_metadata = socket_path.lstat()
     except FileNotFoundError:
@@ -314,6 +398,12 @@ def _validate_socket_parent(socket_path: Path, *, starting: bool) -> None:
         raise ConfigError("socket path cannot be inspected") from error
     if stat.S_ISLNK(socket_metadata.st_mode) or not stat.S_ISSOCK(socket_metadata.st_mode):
         raise ConfigError("socket path must be a non-symlink socket")
+    if os.name == "posix" and (
+        socket_metadata.st_uid != _effective_ids()[0]
+        or socket_metadata.st_gid != _effective_ids()[1]
+        or stat.S_IMODE(socket_metadata.st_mode) != socket_mode
+    ):
+        raise ConfigError("socket owner or mode is invalid")
     if starting:
         raise ConfigError("socket path already exists")
 
@@ -464,9 +554,11 @@ def _invoke_action(
     if len(canonical_request) > MAX_INPUT_BYTES + 1:
         raise DispatchError("request_too_large")
     try:
-        _validate_secure_regular_file(action.executable, executable=True)
+        actual_hash = _secure_file_sha256(action.executable, executable=True)
     except ConfigError as error:
         raise DispatchError("handler_failed") from error
+    if actual_hash != action.sha256:
+        raise DispatchError("handler_hash_mismatch")
     with tempfile.TemporaryFile(mode="w+b") as output:
         try:
             process = subprocess.Popen(  # noqa: S603 - executable and argv are host allowlisted
@@ -607,7 +699,11 @@ def _check() -> bool:
         return False
     try:
         config = _load_config()
-        _validate_socket_parent(config.socket_path, starting=False)
+        _validate_socket_parent(
+            config.socket_path,
+            starting=False,
+            socket_mode=config.socket_mode,
+        )
     except ConfigError:
         return False
     return True
@@ -618,7 +714,11 @@ def _serve() -> int:
         return 1
     try:
         config = _load_config()
-        _validate_socket_parent(config.socket_path, starting=True)
+        _validate_socket_parent(
+            config.socket_path,
+            starting=True,
+            socket_mode=config.socket_mode,
+        )
     except ConfigError:
         return 1
 
@@ -639,6 +739,8 @@ def _serve() -> int:
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISSOCK(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != config.socket_mode
+            or metadata.st_uid != _effective_ids()[0]
+            or metadata.st_gid != _effective_ids()[1]
         ):
             return 1
         socket_identity = (metadata.st_dev, metadata.st_ino)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import socket
 import stat
@@ -18,6 +19,9 @@ from scripts.im_online_gate import REQUIRED_CASES, _verify_probe_signature
 
 IMAGE_DIGEST = "sha256:" + "1" * 64
 IDENTITY_SHA256 = "2" * 64
+RELEASE_ID = "release-offline-probe"
+RELEASE_NONCE_SHA256 = "3" * 64
+SOURCE_FINGERPRINT = "4" * 64
 NONCE = "probe_nonce_123456"
 CONTROL_PROFILE_CONTENTS = {
     "feishu": b'{"channel":"feishu","profile":"offline"}\n',
@@ -61,28 +65,53 @@ def probe_fixture(
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         control_profile_paths[channel] = path
     control_socket = tmp_path / "control.sock"
+    if im_probe.os.name != "nt":
+        tmp_path.chmod(0o750)
     if hasattr(socket, "AF_UNIX"):
         listener = socket.socket(socket.AF_UNIX)
         listener.bind(str(control_socket))
+        control_socket.chmod(0o660)
         request.addfinalizer(listener.close)
     else:
         control_socket.write_text("windows-unix-socket-placeholder", encoding="utf-8")
+    release_context_path = tmp_path / "release-context.json"
+    release_context_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "release_id": RELEASE_ID,
+                "nonce_sha256": RELEASE_NONCE_SHA256,
+                "source_fingerprint": SOURCE_FINGERPRINT,
+                "image_digest": IMAGE_DIGEST,
+            }
+        ),
+        encoding="utf-8",
+    )
+    release_context_path.chmod(0o600)
     config = im_probe.ProbeConfig(
         bind_host="127.0.0.1",
         port=8750,
         runner=None,
+        runner_sha256=None,
         runner_timeout_seconds=1,
         driver_timeout_seconds=1,
         signing_key_path=signing_key_path,
         key_id="offline-probe-key",
+        release_context_path=release_context_path,
+        release_id=RELEASE_ID,
+        release_nonce_sha256=RELEASE_NONCE_SHA256,
+        source_fingerprint=SOURCE_FINGERPRINT,
         image_digest=IMAGE_DIGEST,
         identity_sha256=IDENTITY_SHA256,
         account_ids={"feishu": "cli_offlinefeishu", "wecom": "offline_wecom_bot"},
         credential_paths=credential_paths,
         runner_secret_paths={"feishu": {}, "wecom": {}},
         driver_paths={},
+        driver_sha256={},
         control_profile_paths=control_profile_paths,
         control_socket=control_socket,
+        broker_uid=None,
+        broker_gid=None,
     )
     service = im_probe.ProbeService(config)
     monkeypatch.setenv("FEISHU_APP_ID", config.account_ids["feishu"])
@@ -98,6 +127,9 @@ def _request(config: im_probe.ProbeConfig, channel: str, nonce: str = NONCE) -> 
         "nonce": nonce,
         "cases": list(REQUIRED_CASES),
         "expected_image_digest": config.image_digest,
+        "release_id": config.release_id,
+        "release_nonce_sha256": config.release_nonce_sha256,
+        "source_fingerprint": config.source_fingerprint,
         "credential_fingerprints": credential_fingerprints,
         "probe_identity_sha256": config.identity_sha256,
         "account_fingerprint": im_probe._fingerprint(
@@ -147,6 +179,20 @@ def test_missing_runner_is_signed_not_run_and_has_no_secret_leak(probe_fixture) 
 
     assert response["error_code"] == "provider_runner_unconfigured"
     assert response["runtime"]["status"] == "pass"
+    assert response["runtime"]["release_id"] == config.release_id
+    assert response["runtime"]["release_nonce_sha256"] == config.release_nonce_sha256
+    assert response["runtime"]["source_fingerprint"] == config.source_fingerprint
+    assert set(response["runtime"]) == {
+        "status",
+        "run_nonce",
+        "image_digest",
+        "release_id",
+        "release_nonce_sha256",
+        "source_fingerprint",
+        "identity_fingerprint",
+        "control_profile_sha256",
+        "artifact_attestation",
+    }
     assert (
         response["runtime"]["control_profile_sha256"]
         == _request(config, "feishu")["control_profile_sha256"]
@@ -171,6 +217,12 @@ def test_request_is_bound_to_candidate_credentials_identity_and_nonce(probe_fixt
     invalid["expected_image_digest"] = "sha256:" + "3" * 64
     with pytest.raises(im_probe.ProbeRequestError):
         service.handle(invalid)
+
+    for field in ("release_id", "release_nonce_sha256", "source_fingerprint"):
+        invalid_binding = _request(config, "wecom")
+        invalid_binding[field] = "wrong" if field == "release_id" else "e" * 64
+        with pytest.raises(im_probe.ProbeRequestError, match="does not match"):
+            service.handle(invalid_binding)
 
     invalid_profile = _request(config, "wecom")
     invalid_profile["control_profile_sha256"] = "e" * 64
@@ -198,14 +250,101 @@ def test_invalid_provider_runner_evidence_stays_not_run(probe_fixture, monkeypat
     assert all(case["status"] == "not_run" for case in response["cases"].values())
 
 
+def test_artifact_attestation_is_validated_inside_provider_evidence(
+    probe_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, service, _private_key, _secrets = probe_fixture
+    artifact = {
+        "schema_version": 1,
+        "runner_sha256": "a" * 64,
+        "runner_contract_version": 1,
+        "driver_sha256": "b" * 64,
+        "driver_contract_version": 1,
+    }
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        im_probe,
+        "_run_provider_runner",
+        lambda _config, _request: {
+            "provider_evidence": {"source": "offline"},
+            "artifact_attestation": artifact,
+        },
+    )
+    monkeypatch.setattr(
+        im_probe,
+        "_runner_artifact_attestation",
+        lambda _config, _request, _value: artifact,
+    )
+
+    def validate(_channel, candidate, **_kwargs):
+        observed.update(candidate)
+        return candidate["provider_evidence"], []
+
+    monkeypatch.setattr(im_probe, "_validate_provider_evidence", validate)
+    response = service.handle(_request(config, "feishu"))
+
+    assert observed["provider_evidence"]["artifact_attestation"] == artifact
+    assert response["provider_evidence"]["artifact_attestation"] == artifact
+
+
+def test_release_context_measures_the_deployed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = tmp_path / "release-context.json"
+    context.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "release_id": RELEASE_ID,
+                "nonce_sha256": RELEASE_NONCE_SHA256,
+                "source_fingerprint": SOURCE_FINGERPRINT,
+                "image_digest": IMAGE_DIGEST,
+            }
+        ),
+        encoding="utf-8",
+    )
+    context.chmod(0o600)
+    monkeypatch.setattr(
+        im_probe,
+        "source_fingerprint",
+        lambda _root: {"status": "available", "value": SOURCE_FINGERPRINT},
+    )
+    assert im_probe._release_context(str(context))[1:] == (
+        RELEASE_ID,
+        RELEASE_NONCE_SHA256,
+        SOURCE_FINGERPRINT,
+        IMAGE_DIGEST,
+    )
+
+    monkeypatch.setattr(
+        im_probe,
+        "source_fingerprint",
+        lambda _root: {"status": "available", "value": "e" * 64},
+    )
+    with pytest.raises(im_probe.ProbeConfigurationError, match="deployed source"):
+        im_probe._release_context(str(context))
+
+
 def test_runner_gets_secret_paths_but_not_secret_values(probe_fixture, monkeypatch) -> None:
     config, _service, _private_key, secrets = probe_fixture
     runner = Path(config.signing_key_path.parent / "provider-runner")
     runner.write_text("placeholder", encoding="utf-8")
+    runner.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     driver = Path(config.signing_key_path.parent / "feishu-driver")
     driver.write_text("placeholder", encoding="utf-8")
+    driver.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    runner_hash = hashlib.sha256(runner.read_bytes()).hexdigest()
+    driver_hash = hashlib.sha256(driver.read_bytes()).hexdigest()
     config = im_probe.ProbeConfig(
-        **{**config.__dict__, "runner": runner, "driver_paths": {"feishu": driver}},
+        **{
+            **config.__dict__,
+            "runner": runner,
+            "runner_sha256": runner_hash,
+            "driver_paths": {"feishu": driver},
+            "driver_sha256": {"feishu": driver_hash},
+            "broker_uid": 0,
+            "broker_gid": 0,
+        },
     )
     request = _request(config, "feishu")
     observed: dict[str, object] = {}
@@ -227,6 +366,11 @@ def test_runner_gets_secret_paths_but_not_secret_values(probe_fixture, monkeypat
         return FakeProcess(*args, **kwargs)
 
     monkeypatch.setattr(im_probe.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        im_probe,
+        "_trusted_artifact_sha256",
+        lambda path, *, label: runner_hash if path == runner else driver_hash,
+    )
     assert im_probe._run_provider_runner(config, request) == {}
     environment = observed["kwargs"]["env"]
     runner_input = observed["input"].decode("utf-8")
@@ -284,15 +428,20 @@ def test_environment_requires_both_profiles_and_runner_control_socket(
         "TRPC_IM_PROBE_WECOM_BOT_SECRET_FILE": config.credential_paths["wecom"]["WECOM_BOT_SECRET"],
         "TRPC_IM_PROBE_FEISHU_CONTROL_PROFILE_FILE": config.control_profile_paths["feishu"],
         "TRPC_IM_PROBE_WECOM_CONTROL_PROFILE_FILE": config.control_profile_paths["wecom"],
+        "TRPC_IM_PROBE_RELEASE_CONTEXT_FILE": config.release_context_path,
     }
     for variable, path in required.items():
         monkeypatch.setenv(variable, str(path))
     monkeypatch.setenv("TRPC_IM_PROBE_KEY_ID", config.key_id)
-    monkeypatch.setenv("TRPC_IM_PROBE_IMAGE_DIGEST", config.image_digest)
     monkeypatch.setenv("TRPC_IM_PROBE_IDENTITY_SHA256", config.identity_sha256)
     monkeypatch.setenv("TRPC_IM_PROBE_FEISHU_APP_ID", config.account_ids["feishu"])
     monkeypatch.setenv("TRPC_IM_PROBE_WECOM_BOT_ID", config.account_ids["wecom"])
     monkeypatch.delenv("TRPC_IM_PROBE_RUNNER", raising=False)
+    monkeypatch.setattr(
+        im_probe,
+        "source_fingerprint",
+        lambda _root: {"status": "available", "value": config.source_fingerprint},
+    )
 
     assert im_probe.ProbeConfig.from_environment().control_socket is None
 
@@ -308,17 +457,59 @@ def test_environment_requires_both_profiles_and_runner_control_socket(
     runner.write_text("executable", encoding="utf-8")
     runner.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     monkeypatch.setenv("TRPC_IM_PROBE_RUNNER", str(runner))
+    artifact_hash = hashlib.sha256(runner.read_bytes()).hexdigest()
+    monkeypatch.setenv("TRPC_IM_PROBE_RUNNER_SHA256", artifact_hash)
     for channel in ("feishu", "wecom"):
         driver = config.signing_key_path.parent / f"external-{channel}-driver"
         driver.write_text("executable", encoding="utf-8")
         driver.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         monkeypatch.setenv(f"TRPC_IM_PROBE_{channel.upper()}_DRIVER", str(driver))
+        monkeypatch.setenv(f"TRPC_IM_PROBE_{channel.upper()}_DRIVER_SHA256", artifact_hash)
+    socket_metadata = config.control_socket.stat()
+    monkeypatch.setenv("TRPC_IM_PROBE_BROKER_UID", str(socket_metadata.st_uid))
+    monkeypatch.setenv("TRPC_IM_PROBE_BROKER_GID", str(socket_metadata.st_gid))
+    if im_probe.os.name != "nt":
+        monkeypatch.setattr(im_probe.os, "geteuid", lambda: socket_metadata.st_uid + 1)
+    monkeypatch.setattr(im_probe, "_trusted_artifact_sha256", lambda _path, *, label: artifact_hash)
     monkeypatch.delenv("TRPC_IM_PROBE_CONTROL_SOCKET", raising=False)
     with pytest.raises(im_probe.ProbeConfigurationError, match="CONTROL_SOCKET"):
         im_probe.ProbeConfig.from_environment()
 
     monkeypatch.setenv("TRPC_IM_PROBE_CONTROL_SOCKET", str(config.control_socket))
     assert im_probe.ProbeConfig.from_environment().control_socket == config.control_socket.resolve()
+
+    monkeypatch.setenv("TRPC_IM_PROBE_RUNNER_SHA256", "3" * 64)
+    with pytest.raises(im_probe.ProbeConfigurationError, match="hash does not match"):
+        im_probe.ProbeConfig.from_environment()
+
+
+def test_control_socket_owner_and_mode_are_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("AF_UNIX is unavailable")
+    path = tmp_path / "broker.sock"
+    if im_probe.os.name != "nt":
+        tmp_path.chmod(0o750)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(path))
+    path.chmod(0o660)
+    request.addfinalizer(listener.close)
+    metadata = path.stat()
+    monkeypatch.setattr(im_probe.os, "name", "posix")
+
+    assert (
+        im_probe._safe_control_socket_path(
+            str(path), expected_uid=metadata.st_uid, expected_gid=metadata.st_gid
+        )
+        == path.resolve()
+    )
+    with pytest.raises(im_probe.ProbeConfigurationError, match="owner or mode"):
+        im_probe._safe_control_socket_path(
+            str(path), expected_uid=metadata.st_uid + 1, expected_gid=metadata.st_gid
+        )
 
 
 def test_runner_output_is_bounded_before_json_is_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -379,11 +570,17 @@ def test_ready_checks_both_external_drivers(probe_fixture, monkeypatch: pytest.M
     wecom_driver = config.signing_key_path.parent / "wecom-driver"
     for path in (runner, feishu_driver, wecom_driver):
         path.write_text("executable", encoding="utf-8")
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    artifact_hash = hashlib.sha256(runner.read_bytes()).hexdigest()
     config = im_probe.ProbeConfig(
         **{
             **config.__dict__,
             "runner": runner,
+            "runner_sha256": artifact_hash,
             "driver_paths": {"feishu": feishu_driver, "wecom": wecom_driver},
+            "driver_sha256": {"feishu": artifact_hash, "wecom": artifact_hash},
+            "broker_uid": 0,
+            "broker_gid": 0,
         }
     )
     observed: list[tuple[list[str], dict[str, str]]] = []
@@ -393,6 +590,7 @@ def test_ready_checks_both_external_drivers(probe_fixture, monkeypatch: pytest.M
         return {"status": "ready"}
 
     monkeypatch.setattr(im_probe, "_run_bounded_json_process", fake_process)
+    monkeypatch.setattr(im_probe, "_trusted_artifact_sha256", lambda _path, *, label: artifact_hash)
 
     assert im_probe.ProbeService(config).ready()
     assert [command[-1] for command, _environment in observed] == ["feishu", "wecom"]

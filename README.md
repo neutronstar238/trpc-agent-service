@@ -74,9 +74,12 @@ kubectl kustomize deploy/kustomize/overlays/production >/dev/null
 项目“功能完成”以本地静态/单元/契约门禁、零成本功能灾备、不可变镜像和当前候选在真实
 Feishu/WeCom 上的基础双向收发证据均闭环为准；每个通道必须证明唯一入站、唯一出站和供应商回执。
 这份基础证据不能冒充 `online_im` 生产 8-case，也不能将其升级为生产 `pass`。“生产发布完成”还要求
-完整 `online_im` 8-case、显式启用的破坏性生产灾备演练及最终 release manifest；任一项缺失必须保留
-`production_gate=not_run`。选择跳过破坏性演练时不能用功能灾备报告替代。在线 IM 的独立探针、
-control broker、driver、callback/OpenAPI witness 安装步骤见
+完整 `online_im` 8-case 和最终 release manifest；默认还要求显式启用的破坏性生产灾备演练。唯一允许的
+豁免是发布者主动传入 `--allow-functional-dr`：当前候选的功能灾备必须完整 `pass`，破坏性生产灾备必须
+诚实保留 `production_gate=not_run`，最终聚合必须记录
+`authorized_not_run_gates=[disaster_recovery]`。该选项绝不豁免破坏性灾备 `fail`、`online_im` 或任何其他
+门禁；manifest 会绑定功能灾备报告并排除未运行的破坏性报告。Stage 8 固定使用这个显式模式，仍会被
+`online_im=not_run` 阻断。在线 IM 的独立探针、control broker、driver、callback/OpenAPI witness 安装步骤见
 [探针部署说明](deploy/im_probe/README.md)。
 
 ## 文档

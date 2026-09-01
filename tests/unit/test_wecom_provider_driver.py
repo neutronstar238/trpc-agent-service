@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import struct
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,9 @@ from deploy.im_probe import wecom_provider_driver as driver
 RUN_NONCE = "offline_nonce_123456"
 IMAGE_DIGEST = "sha256:" + "1" * 64
 ACCOUNT_ID = "offline-wecom-bot"
+RELEASE_ID = "release-offline-wecom"
+RELEASE_NONCE_SHA256 = "c" * 64
+SOURCE_FINGERPRINT = "d" * 64
 
 
 def _provider_hash(tenant_id: str, binding_id: str, value: str) -> str:
@@ -51,6 +55,9 @@ def _request(profile_hash: str) -> dict[str, Any]:
         "run_id": "offline-wecom-run",
         "run_nonce": RUN_NONCE,
         "expected_image_digest": IMAGE_DIGEST,
+        "release_id": RELEASE_ID,
+        "release_nonce_sha256": RELEASE_NONCE_SHA256,
+        "source_fingerprint": SOURCE_FINGERPRINT,
         "control_profile_sha256": profile_hash,
         "cases": list(driver.REQUIRED_CASES),
     }
@@ -94,6 +101,9 @@ def _observation(case: str, provider_event_id: str) -> dict[str, Any]:
             "old_lock_owner_released": True,
             "new_lock_owner_acquired": True,
             "lock_epoch": 2,
+            "outbound_request_id": "raw-reconnect-outbound",
+            "acknowledged_request_id": "raw-reconnect-outbound",
+            "provider_code": 0,
         },
         "rate_limit_retry_after": {
             **common,
@@ -109,6 +119,9 @@ def _observation(case: str, provider_event_id: str) -> dict[str, Any]:
             "new_credential_event_id": "raw-new-credential",
             "post_rotation_event_id": "raw-post-rotation",
             "old_credential_rejected": True,
+            "outbound_request_id": "raw-rotation-outbound",
+            "acknowledged_request_id": "raw-rotation-outbound",
+            "provider_code": 0,
         },
         "prolonged_outage": {
             **common,
@@ -224,7 +237,9 @@ def test_run_calls_only_the_eight_profile_actions_and_hashes_all_ids(
     profile_path, profile_hash = _write_profile(tmp_path)
     calls: list[dict[str, Any]] = []
 
-    def fake_broker_call(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    def fake_broker_call(
+        socket_path: Path, request: dict[str, Any], _uid: int, _gid: int
+    ) -> dict[str, Any]:
         calls.append(request)
         return _broker_result(request["payload"]["case"])
 
@@ -233,6 +248,8 @@ def test_run_calls_only_the_eight_profile_actions_and_hashes_all_ids(
         driver._parse_request(_request(profile_hash)),
         driver._load_profile(profile_path, profile_hash, ACCOUNT_ID),
         Path("/run/trpc-im/control.sock"),
+        12345,
+        23456,
     )
 
     assert result["schema_version"] == 1
@@ -263,23 +280,27 @@ def test_run_calls_only_the_eight_profile_actions_and_hashes_all_ids(
     )
 
 
-def test_snapshot_provider_hash_must_match_observed_provider_event(
+def test_snapshot_provider_hashes_must_be_unique_across_cases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile_path, profile_hash = _write_profile(tmp_path)
 
-    def fake_broker_call(_socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    def fake_broker_call(
+        _socket_path: Path, request: dict[str, Any], _uid: int, _gid: int
+    ) -> dict[str, Any]:
         result = _broker_result(request["payload"]["case"])
         result["result"]["wecom_snapshot"]["provider_event_hash"] = "f" * 64
         return result
 
     monkeypatch.setattr(driver, "_broker_call", fake_broker_call)
-    with pytest.raises(driver.DriverError, match="provider event hash"):
+    with pytest.raises(driver.DriverError, match="provider event identifiers must be unique"):
         driver._run(
             driver._parse_request(_request(profile_hash)),
             driver._load_profile(profile_path, profile_hash, ACCOUNT_ID),
             Path("/run/trpc-im/control.sock"),
+            12345,
+            23456,
         )
 
 
@@ -444,7 +465,7 @@ def test_main_emits_only_strict_runner_result(
     monkeypatch.setattr(
         driver,
         "_configuration",
-        lambda _request: (profile, Path("/run/trpc-im/control.sock")),
+        lambda _request: (profile, Path("/run/trpc-im/control.sock"), 12345, 23456),
     )
     monkeypatch.setattr(driver, "_run", lambda *_args: expected)
 
@@ -466,3 +487,44 @@ def test_main_failure_is_content_free(
     assert driver.main() == 1
     captured = capsysbinary.readouterr()
     assert captured.out == captured.err == b""
+
+
+def test_broker_peer_is_verified_on_the_same_socket_before_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = False
+
+    class FakeConnection:
+        def __enter__(self) -> FakeConnection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def connect(self, _path: str) -> None:
+            return None
+
+        def getsockopt(self, *_args: object) -> bytes:
+            return struct.pack("3i", 99, 1001, 1002)
+
+        def sendall(self, _payload: bytes) -> None:
+            nonlocal sent
+            sent = True
+
+    monkeypatch.setattr(driver.sys, "platform", "linux")
+    monkeypatch.setattr(driver.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(driver.socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(driver.socket, "socket", lambda *_args: FakeConnection())
+    monkeypatch.setattr(driver, "_validate_socket_path", lambda _path: None)
+
+    with pytest.raises(driver.DriverError, match="identity does not match"):
+        driver._broker_call(
+            Path("/run/trpc-im-probe/control.sock"),
+            {"schema_version": 1},
+            1001,
+            9999,
+        )
+    assert sent is False

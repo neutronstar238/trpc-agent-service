@@ -29,8 +29,9 @@
   receipt 核对；企微不得建立第二条 WSS，只能把 broker 动作结果与当前 Connector 持久化的 connection
   epoch、lease lifecycle 和 provider event 哈希快照核对。任一旁路证据缺失时该 case 必须非 `pass`。
 - “功能完成”的真实 IM 基础证据只要求当前候选在 Feishu/WeCom 各闭环唯一入站、唯一出站和供应商
-  回执。它不能冒充上述 `online_im` 生产 8-case；生产发布和 release manifest 仍要求两个通道的完整
-  8-case 与破坏性生产灾备全部通过，缺失任一项必须保持 `not_run`。
+  回执。它不能冒充上述 `online_im` 生产 8-case；生产发布和 release manifest 始终要求两个通道的完整
+  8-case。默认还要求 destructive DR 真实通过；只有显式 `--allow-functional-dr` 可在当前候选功能灾备
+  `pass` 时授权 destructive DR 保持 `not_run`，不能豁免 destructive DR `fail`、`online_im` 或其他门禁。
 - 性能：100 callback/s、200 turn，并生成机器可读 JSON。
 
 本地门禁：
@@ -97,12 +98,19 @@ Secret 注入，命令和报告不能打印其值。
 旧的 `release-gate.json` 或 `release-gate-current.json` 都只是输入/历史记录，不能单独升级候选状态。
 过期或来自其他 checkout 的生产 evidence 必须降级为 `not_run`。
 
+默认的 `--require-production` 仍要求真实破坏性生产灾备 `pass`。本项目 Stage 8 固定同时传入
+`--allow-functional-dr`；这时必须验证 `disaster-recovery-functional.json` 的三个恢复组件、cleanup、
+lineage 和 producer，且只可把破坏性 DR 的 `not_run` 记入
+`authorized_not_run_gates=[disaster_recovery]`。破坏性 DR 为 `fail` 时不能豁免，`online_im=not_run` 仍阻断。
+
 所有真实生产报告必须使用同一个 `TRPC_RELEASE_ID`、同一个高熵
 `TRPC_RELEASE_NONCE` 和同一个不可变候选镜像 digest。报告全部完成后运行
 `scripts/release_manifest.py --image-digest sha256:<64-hex>`，生成
 `runs/multitenant/release-manifest.json`。该 manifest 按 canonical JSON SHA-256
 绑定每个生产报告的内容、producer、run ID、时间、源码指纹、release nonce 哈希和镜像。
 manifest 缺失时最终生产门禁保持 `not_run`；报告被替换、混入其他运行或镜像不一致时门禁为 `fail`。
+显式功能 DR 模式必须给 manifest 命令同样传入 `--allow-functional-dr`；manifest 的 `policy` 会绑定功能
+灾备报告和 `authorized_not_run_gates`，并排除未运行的破坏性报告，缺失或篡改该 policy 都会失败。
 
 Pytest 默认清除从当前 Shell 继承的真实负载、故障、迁移、Kubernetes 和在线 IM 环境变量。
 只有在隔离验收环境中明确添加 `--allow-real-tests` 才会保留这些变量；普通 CI 只运行

@@ -28,6 +28,8 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from scripts.evidence_lineage import source_fingerprint
+
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = "scripts.im_probe_preflight"
 DEFAULT_ENV_FILE = ROOT / "deploy" / "im_probe" / "im-probe.env"
@@ -62,7 +64,7 @@ REQUIRED_PROBE_KEYS = (
     "TRPC_IM_PROBE_PORT",
     "TRPC_IM_PROBE_SIGNING_KEY_FILE",
     "TRPC_IM_PROBE_KEY_ID",
-    "TRPC_IM_PROBE_IMAGE_DIGEST",
+    "TRPC_IM_PROBE_RELEASE_CONTEXT_FILE",
     "TRPC_IM_PROBE_IDENTITY_SHA256",
     "TRPC_IM_PROBE_FEISHU_APP_ID",
     "TRPC_IM_PROBE_WECOM_BOT_ID",
@@ -74,8 +76,13 @@ REQUIRED_PROBE_KEYS = (
     "TRPC_IM_PROBE_WECOM_CONTROL_PROFILE_FILE",
     "TRPC_IM_PROBE_CONTROL_SOCKET",
     "TRPC_IM_PROBE_RUNNER",
+    "TRPC_IM_PROBE_RUNNER_SHA256",
     "TRPC_IM_PROBE_FEISHU_DRIVER",
+    "TRPC_IM_PROBE_FEISHU_DRIVER_SHA256",
     "TRPC_IM_PROBE_WECOM_DRIVER",
+    "TRPC_IM_PROBE_WECOM_DRIVER_SHA256",
+    "TRPC_IM_PROBE_BROKER_UID",
+    "TRPC_IM_PROBE_BROKER_GID",
     "TRPC_IM_PROBE_RUNNER_TIMEOUT_SECONDS",
     "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS",
 )
@@ -122,6 +129,11 @@ CONTROL_PROFILE_HASH_KEYS = {
     "wecom": "TRPC_IM_ONLINE_WECOM_CONTROL_PROFILE_SHA256",
 }
 CONTROL_SOCKET_KEY = "TRPC_IM_PROBE_CONTROL_SOCKET"
+ARTIFACT_HASH_KEYS = {
+    "TRPC_IM_PROBE_RUNNER": "TRPC_IM_PROBE_RUNNER_SHA256",
+    "TRPC_IM_PROBE_FEISHU_DRIVER": "TRPC_IM_PROBE_FEISHU_DRIVER_SHA256",
+    "TRPC_IM_PROBE_WECOM_DRIVER": "TRPC_IM_PROBE_WECOM_DRIVER_SHA256",
+}
 
 
 def _sha256(value: str | bytes) -> str:
@@ -203,7 +215,7 @@ def _permission_reason(path: Path, *, private: bool, executable: bool) -> str | 
     # Unix service; on Windows, existence/readability is still checked and
     # deployment ACLs are left to the host's service installer.
     if os.name != "nt":
-        if private and mode & 0o027:
+        if private and mode & 0o037:
             return "private file permissions are too broad"
         if not private and mode & 0o022:
             return "executable file is writable by group or other users"
@@ -269,6 +281,8 @@ def _check_control_socket(
     *,
     mode: str,
     checkout: Path,
+    expected_uid: int | None,
+    expected_gid: int | None,
 ) -> tuple[dict[str, Any], Path | None]:
     name = CONTROL_SOCKET_KEY
     if raw_value is None or not raw_value.strip():
@@ -295,14 +309,70 @@ def _check_control_socket(
             return _check(name, "not_run", "host socket is unavailable in local mode"), None
         return _check(name, "fail", "required host socket is unavailable"), None
     try:
-        socket_mode = resolved.stat().st_mode
+        metadata = resolved.stat()
+        socket_mode = metadata.st_mode
     except OSError:
         return _check(name, "fail", "host socket metadata is unavailable"), None
     if os.name != "nt" and not stat.S_ISSOCK(socket_mode):
         return _check(name, "fail", "path must be a Unix socket"), None
     if os.name == "nt" and stat.S_ISDIR(socket_mode):
         return _check(name, "fail", "path must not be a directory"), None
+    if os.name != "nt" and (
+        expected_uid is None
+        or expected_gid is None
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(socket_mode) != 0o660
+        or resolved.parent.stat().st_uid != expected_uid
+        or resolved.parent.stat().st_gid != expected_gid
+        or stat.S_IMODE(resolved.parent.stat().st_mode) != 0o750
+    ):
+        return _check(name, "fail", "socket owner, group, parent, or mode is invalid"), None
     return _check(name, "pass", socket_type_checked=os.name != "nt"), resolved
+
+
+def _artifact_binding_check(
+    *,
+    name: str,
+    path: Path | None,
+    path_status: str,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    expected = expected_sha256.strip().lower()
+    if HEX64_RE.fullmatch(expected) is None or expected in {"0" * 64, "f" * 64}:
+        return _check(f"{name}_binding", "fail", "artifact hash is invalid")
+    if path is None:
+        status = "not_run" if path_status == "not_run" else "fail"
+        return _check(f"{name}_binding", status, "artifact is unavailable")
+    if os.name != "nt":
+        try:
+            metadata = path.stat()
+            current = path.parent
+            while True:
+                parent = current.lstat()
+                if (
+                    stat.S_ISLNK(parent.st_mode)
+                    or not stat.S_ISDIR(parent.st_mode)
+                    or parent.st_mode & 0o022
+                    or (parent.st_uid != 0 and parent.st_mode & 0o200)
+                ):
+                    return _check(
+                        f"{name}_binding", "fail", "artifact parent chain is not root-controlled"
+                    )
+                if current.parent == current:
+                    break
+                current = current.parent
+        except OSError:
+            return _check(f"{name}_binding", "fail", "artifact metadata is unavailable")
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            return _check(f"{name}_binding", "fail", "artifact is not root-owned immutable")
+    try:
+        observed = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return _check(f"{name}_binding", "fail", "artifact cannot be read")
+    if observed != expected:
+        return _check(f"{name}_binding", "fail", "artifact hash does not match")
+    return _check(f"{name}_binding", "pass", sha256=observed)
 
 
 def _control_profile_binding_check(
@@ -508,15 +578,12 @@ def _probe_value_checks(values: Mapping[str, str]) -> list[dict[str, Any]]:
     )
 
     key_id = values.get("TRPC_IM_PROBE_KEY_ID", "").strip()
-    image = values.get("TRPC_IM_PROBE_IMAGE_DIGEST", "").strip().lower()
     probe_identity = values.get("TRPC_IM_PROBE_IDENTITY_SHA256", "").strip().lower()
     feishu_id = values.get("TRPC_IM_PROBE_FEISHU_APP_ID", "").strip()
     wecom_id = values.get("TRPC_IM_PROBE_WECOM_BOT_ID", "").strip()
     account_ok = (
         KEY_ID_RE.fullmatch(key_id) is not None
         and not _contains_placeholder(key_id)
-        and IMAGE_RE.fullmatch(image) is not None
-        and image not in {"sha256:" + "0" * 64, "sha256:" + "f" * 64}
         and HEX64_RE.fullmatch(probe_identity) is not None
         and probe_identity not in {"0" * 64, "f" * 64}
         and re.fullmatch(r"cli_[A-Za-z0-9]+", feishu_id) is not None
@@ -528,9 +595,7 @@ def _probe_value_checks(values: Mapping[str, str]) -> list[dict[str, Any]]:
         _check(
             "probe_identity_and_accounts",
             "pass" if account_ok else "fail",
-            None
-            if account_ok
-            else "probe identity, key, image, or account configuration is invalid",
+            None if account_ok else "probe identity, key, or account configuration is invalid",
             values_recorded=False,
         )
     )
@@ -576,14 +641,22 @@ def _read_document(path: Path) -> tuple[Mapping[str, Any] | None, dict[str, Any]
 
 def _candidate_lock_check(
     path: Path,
-) -> tuple[dict[str, Any], str | None, str | None, str | None, bytes | None]:
+) -> tuple[
+    dict[str, Any],
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    bytes | None,
+]:
     value, document_check, raw = _read_document(path)
     document_check["name"] = "candidate_lock_file"
     if value is None:
-        return document_check, None, None, None, raw
+        return document_check, None, None, None, None, raw
     if value.get("schema_version") != 1 or value.get("kind") != "release_candidate_lock":
         return (
             _check("candidate_lock", "fail", "candidate lock schema is invalid"),
+            None,
             None,
             None,
             None,
@@ -593,6 +666,7 @@ def _candidate_lock_check(
     if not isinstance(images, Mapping) or set(images) != {"initial", "upgrade"}:
         return (
             _check("candidate_lock", "fail", "candidate lock image set is invalid"),
+            None,
             None,
             None,
             None,
@@ -638,6 +712,15 @@ def _candidate_lock_check(
         and isinstance(nonce_sha256, str)
         and HEX64_RE.fullmatch(nonce_sha256) is not None
     )
+    source = value.get("source_fingerprint")
+    source_value = source.get("value") if isinstance(source, Mapping) else None
+    source_ok = (
+        isinstance(source, Mapping)
+        and set(source) == {"status", "value"}
+        and source.get("status") == "available"
+        and isinstance(source_value, str)
+        and HEX64_RE.fullmatch(source_value) is not None
+    )
     valid = (
         valid_initial
         and valid_upgrade
@@ -646,13 +729,12 @@ def _candidate_lock_check(
         and nonzero
         and different
         and release_ok
+        and source_ok
     )
     check = _check(
         "candidate_lock",
         "pass" if valid else "fail",
-        None
-        if valid
-        else "candidate lock initial and upgrade images or release binding are invalid",
+        None if valid else "candidate lock image, source, or release binding is invalid",
         initial_digest_sha256=_sha256(str(initial_digest).lower()) if valid_initial else None,
         release_id_sha256=_sha256(str(release_id)) if isinstance(release_id, str) else None,
     )
@@ -661,8 +743,88 @@ def _candidate_lock_check(
         str(initial_digest).lower() if valid_initial else None,
         str(release_id) if release_ok and isinstance(release_id, str) else None,
         str(nonce_sha256).lower() if release_ok else None,
+        str(source_value).lower() if source_ok else None,
         raw,
     )
+
+
+def _release_context_check(
+    raw_value: str | None,
+    *,
+    mode: str,
+    checkout: Path,
+) -> tuple[dict[str, Any], Mapping[str, str] | None, bytes | None]:
+    name = "release_context"
+    path_check, path = _check_path(
+        "TRPC_IM_PROBE_RELEASE_CONTEXT_FILE",
+        raw_value,
+        mode=mode,
+        checkout=checkout,
+        private=True,
+    )
+    if path is None:
+        return path_check, None, None
+    try:
+        metadata = path.stat()
+    except OSError:
+        return _check(name, "fail", "release context metadata is unavailable"), None, None
+    if os.name != "nt":
+        expected_gid = getattr(os, "getegid", lambda: metadata.st_gid)()
+        if metadata.st_uid != 0 or metadata.st_gid != expected_gid:
+            return (
+                _check(name, "fail", "release context owner or group is invalid"),
+                None,
+                None,
+            )
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return _check(name, "fail", "release context is unreadable"), None, None
+    if not raw or len(raw) > 64 * 1024:
+        return _check(name, "fail", "release context size is invalid"), None, raw
+    try:
+        value = _strict_json(raw)
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        return _check(name, "fail", "release context is not strict JSON"), None, raw
+    fields = {
+        "schema_version",
+        "release_id",
+        "nonce_sha256",
+        "source_fingerprint",
+        "image_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields or value.get("schema_version") != 1:
+        return _check(name, "fail", "release context schema is invalid"), None, raw
+    release_id = value.get("release_id")
+    nonce_sha256 = value.get("nonce_sha256")
+    source = value.get("source_fingerprint")
+    image = value.get("image_digest")
+    valid = (
+        isinstance(release_id, str)
+        and RELEASE_ID_RE.fullmatch(release_id) is not None
+        and isinstance(nonce_sha256, str)
+        and HEX64_RE.fullmatch(nonce_sha256) is not None
+        and isinstance(source, str)
+        and HEX64_RE.fullmatch(source) is not None
+        and isinstance(image, str)
+        and IMAGE_RE.fullmatch(image) is not None
+    )
+    if not valid:
+        return _check(name, "fail", "release context identity is invalid"), None, raw
+    assert isinstance(release_id, str)
+    assert isinstance(nonce_sha256, str)
+    assert isinstance(source, str)
+    assert isinstance(image, str)
+    measured = source_fingerprint(checkout)
+    if measured.get("status") != "available" or measured.get("value") != source.lower():
+        return _check(name, "fail", "deployed source does not match release context"), None, raw
+    identity = {
+        "release_id": release_id,
+        "nonce_sha256": nonce_sha256.lower(),
+        "source_fingerprint": source.lower(),
+        "image_digest": image.lower(),
+    }
+    return _check(name, "pass", identity_values_recorded=False), identity, raw
 
 
 def _trust_check(
@@ -776,14 +938,16 @@ def _release_and_image_binding_check(
     candidate_digest: str | None,
     candidate_release_id: str | None,
     candidate_nonce_sha256: str | None,
+    candidate_source_fingerprint: str | None,
+    release_context: Mapping[str, str] | None,
 ) -> list[dict[str, Any]]:
-    probe_digest = values.get("TRPC_IM_PROBE_IMAGE_DIGEST", "").strip().lower()
     online_digest = values.get("TRPC_IM_ONLINE_IMAGE_DIGEST", "").strip().lower()
+    context_digest = release_context.get("image_digest") if release_context else None
     image_ok = (
         candidate_digest is not None
-        and IMAGE_RE.fullmatch(probe_digest) is not None
+        and context_digest is not None
         and IMAGE_RE.fullmatch(online_digest) is not None
-        and probe_digest == candidate_digest
+        and context_digest == candidate_digest
         and online_digest == candidate_digest
     )
     image_check = _check(
@@ -791,9 +955,9 @@ def _release_and_image_binding_check(
         "pass" if image_ok else "fail",
         None
         if image_ok
-        else "probe and online image digests do not match candidate initial digest",
+        else "release context and online image digests do not match candidate initial digest",
         candidate_initial_digest_sha256=_sha256(candidate_digest) if candidate_digest else None,
-        probe_digest_sha256=_sha256(probe_digest) if IMAGE_RE.fullmatch(probe_digest) else None,
+        context_digest_sha256=_sha256(context_digest) if context_digest else None,
         online_digest_sha256=_sha256(online_digest) if IMAGE_RE.fullmatch(online_digest) else None,
     )
     release_id = values.get("TRPC_RELEASE_ID", "").strip()
@@ -804,6 +968,9 @@ def _release_and_image_binding_check(
         and candidate_nonce_sha256 is not None
         and release_id == candidate_release_id
         and nonce_hash == candidate_nonce_sha256
+        and release_context is not None
+        and release_context.get("release_id") == candidate_release_id
+        and release_context.get("nonce_sha256") == candidate_nonce_sha256
     )
     release_check = _check(
         "release_binding",
@@ -812,7 +979,20 @@ def _release_and_image_binding_check(
         release_id_sha256=_sha256(release_id) if RELEASE_ID_RE.fullmatch(release_id) else None,
         release_nonce_sha256=nonce_hash,
     )
-    return [image_check, release_check]
+    source_ok = (
+        candidate_source_fingerprint is not None
+        and release_context is not None
+        and release_context.get("source_fingerprint") == candidate_source_fingerprint
+    )
+    source_check = _check(
+        "source_binding",
+        "pass" if source_ok else "fail",
+        None if source_ok else "release context source does not match candidate lock",
+        source_fingerprint_sha256=(
+            _sha256(candidate_source_fingerprint) if candidate_source_fingerprint else None
+        ),
+    )
+    return [image_check, release_check, source_check]
 
 
 def build_preflight(
@@ -839,6 +1019,7 @@ def build_preflight(
         candidate_digest,
         candidate_release_id,
         candidate_nonce_hash,
+        candidate_source,
         candidate_raw,
     ) = _candidate_lock_check(candidate_lock)
     checks.append(candidate_info)
@@ -854,6 +1035,13 @@ def build_preflight(
         )
     )
 
+    release_context_check, release_context, release_context_raw = _release_context_check(
+        values.get("TRPC_IM_PROBE_RELEASE_CONTEXT_FILE"),
+        mode=mode,
+        checkout=checkout,
+    )
+    checks.append(release_context_check)
+
     checks.extend(_probe_value_checks(values))
     checks.append(_endpoint_check(values, trust_url))
     checks.extend(
@@ -862,6 +1050,8 @@ def build_preflight(
             candidate_digest=candidate_digest,
             candidate_release_id=candidate_release_id,
             candidate_nonce_sha256=candidate_nonce_hash,
+            candidate_source_fingerprint=candidate_source,
+            release_context=release_context,
         )
     )
 
@@ -903,10 +1093,46 @@ def build_preflight(
         resolved_paths[name] = resolved
         path_statuses[name] = str(path_check["status"])
 
+    for artifact_name, hash_name in ARTIFACT_HASH_KEYS.items():
+        checks.append(
+            _artifact_binding_check(
+                name=artifact_name,
+                path=resolved_paths.get(artifact_name),
+                path_status=path_statuses.get(artifact_name, "fail"),
+                expected_sha256=values.get(hash_name, ""),
+            )
+        )
+
+    try:
+        broker_uid = int(values.get("TRPC_IM_PROBE_BROKER_UID", ""))
+        broker_gid = int(values.get("TRPC_IM_PROBE_BROKER_GID", ""))
+    except ValueError:
+        broker_uid = None
+        broker_gid = None
+    if broker_uid is not None and broker_uid < 0:
+        broker_uid = None
+    if broker_gid is not None and broker_gid < 0:
+        broker_gid = None
+    current_euid = getattr(os, "geteuid", None)
+    dedicated_uid = broker_uid is not None and (
+        os.name == "nt" or (current_euid is not None and broker_uid != current_euid())
+    )
+    checks.append(
+        _check(
+            "control_broker_identity",
+            "pass" if dedicated_uid and broker_gid is not None else "fail",
+            None
+            if dedicated_uid and broker_gid is not None
+            else "control broker must use a valid dedicated uid and shared gid",
+        )
+    )
+
     socket_check, socket_path = _check_control_socket(
         values.get(CONTROL_SOCKET_KEY),
         mode=mode,
         checkout=checkout,
+        expected_uid=broker_uid,
+        expected_gid=broker_gid,
     )
     checks.append(socket_check)
     resolved_paths[CONTROL_SOCKET_KEY] = socket_path
@@ -983,6 +1209,9 @@ def build_preflight(
             "env_file_sha256": _sha256(env_raw) if env_raw is not None else None,
             "candidate_lock_sha256": _sha256(candidate_raw) if candidate_raw is not None else None,
             "trust_file_sha256": _sha256(trust_raw) if trust_raw is not None else None,
+            "release_context_sha256": (
+                _sha256(release_context_raw) if release_context_raw is not None else None
+            ),
         },
     }
     return report

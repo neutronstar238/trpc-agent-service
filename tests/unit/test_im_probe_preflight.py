@@ -6,6 +6,7 @@ import os
 import socket
 from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -18,6 +19,17 @@ RELEASE_NONCE = "n" * 32
 PROBE_URL = "https://probe.example.test"
 FEISHU_PROFILE = b'{"channel":"feishu","schema_version":1}\n'
 WECOM_PROFILE = b'{"channel":"wecom","schema_version":1}\n'
+
+
+@pytest.fixture(autouse=True)
+def _stable_source_and_dedicated_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        preflight,
+        "source_fingerprint",
+        lambda _root: {"status": "available", "value": "c" * 64},
+    )
+    if os.name != "nt" and hasattr(os, "geteuid"):
+        monkeypatch.setattr(preflight.os, "geteuid", lambda: os.getuid() + 1)
 
 
 def _write_private_file(path: Path, content: str) -> None:
@@ -37,8 +49,10 @@ def _activate_control_socket(path: Path) -> socket.socket | None:
     if os.name == "nt":
         _write_private_file(path, "windows-test-socket-placeholder")
         return None
+    path.parent.chmod(0o750)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # type: ignore[attr-defined]
     listener.bind(str(path))
+    path.chmod(0o660)
     return listener
 
 
@@ -110,13 +124,31 @@ def _environment(
         feishu_profile.chmod(0o600)
         wecom_profile.chmod(0o600)
     control_socket = root.parent / "control" / "im-probe.sock"
+    release_context = root / "release-context.json"
+    _write_private_file(
+        release_context,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "release_id": RELEASE_ID,
+                "nonce_sha256": preflight._sha256(RELEASE_NONCE),
+                "source_fingerprint": "c" * 64,
+                "image_digest": image_digest,
+            }
+        ),
+    )
     runner_path = runner or root.parent / "provider-runner"
+    feishu_driver_path = driver or root.parent / "feishu-driver"
+    wecom_driver_path = driver or root.parent / "wecom-driver"
+    artifact_hash = lambda path: (  # noqa: E731 - compact fixture-only helper
+        preflight._sha256(path.read_bytes()) if path.exists() else "1" * 64
+    )
     values = {
         "TRPC_IM_PROBE_BIND_HOST": "127.0.0.1",
         "TRPC_IM_PROBE_PORT": "8750",
         "TRPC_IM_PROBE_SIGNING_KEY_FILE": str(signing_key),
         "TRPC_IM_PROBE_KEY_ID": "probe-key-test",
-        "TRPC_IM_PROBE_IMAGE_DIGEST": image_digest,
+        "TRPC_IM_PROBE_RELEASE_CONTEXT_FILE": str(release_context),
         "TRPC_IM_PROBE_IDENTITY_SHA256": IDENTITY_HASH,
         "TRPC_IM_PROBE_FEISHU_APP_ID": "cli_testfeishu",
         "TRPC_IM_PROBE_WECOM_BOT_ID": "wecom-test-bot",
@@ -125,6 +157,9 @@ def _environment(
         "TRPC_IM_PROBE_CONTROL_SOCKET": str(control_socket),
         **{name: str(path) for name, path in secrets.items()},
         "TRPC_IM_PROBE_RUNNER": str(runner_path),
+        "TRPC_IM_PROBE_RUNNER_SHA256": artifact_hash(runner_path),
+        "TRPC_IM_PROBE_BROKER_UID": str(os.getuid() if hasattr(os, "getuid") else 0),
+        "TRPC_IM_PROBE_BROKER_GID": str(os.getgid() if hasattr(os, "getgid") else 0),
         "TRPC_IM_PROBE_RUNNER_TIMEOUT_SECONDS": "180",
         "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS": "180",
         "TRPC_IM_ONLINE_TESTS_ENABLED": "true",
@@ -138,11 +173,13 @@ def _environment(
         "TRPC_RELEASE_NONCE": RELEASE_NONCE,
     }
     if driver is not None:
-        values["TRPC_IM_PROBE_FEISHU_DRIVER"] = str(driver)
-        values["TRPC_IM_PROBE_WECOM_DRIVER"] = str(driver)
+        values["TRPC_IM_PROBE_FEISHU_DRIVER"] = str(feishu_driver_path)
+        values["TRPC_IM_PROBE_WECOM_DRIVER"] = str(wecom_driver_path)
     else:
-        values["TRPC_IM_PROBE_FEISHU_DRIVER"] = str(root.parent / "feishu-driver")
-        values["TRPC_IM_PROBE_WECOM_DRIVER"] = str(root.parent / "wecom-driver")
+        values["TRPC_IM_PROBE_FEISHU_DRIVER"] = str(feishu_driver_path)
+        values["TRPC_IM_PROBE_WECOM_DRIVER"] = str(wecom_driver_path)
+    values["TRPC_IM_PROBE_FEISHU_DRIVER_SHA256"] = artifact_hash(feishu_driver_path)
+    values["TRPC_IM_PROBE_WECOM_DRIVER_SHA256"] = artifact_hash(wecom_driver_path)
     return values
 
 
@@ -280,7 +317,10 @@ def test_host_mode_rejects_checkout_runner_and_digest_mismatch(tmp_path: Path) -
     runner = checkout / "runner"
     _write_private_file(runner, "runner")
     values = _environment(tmp_path / "host", private_key=private_key, runner=runner)
-    values["TRPC_IM_PROBE_IMAGE_DIGEST"] = "sha256:" + "e" * 64
+    context_path = Path(values["TRPC_IM_PROBE_RELEASE_CONTEXT_FILE"])
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    context["image_digest"] = "sha256:" + "e" * 64
+    _write_private_file(context_path, json.dumps(context))
     env_file, lock_file, trust_file = _write_inputs(
         tmp_path, values=values, private_key=private_key
     )

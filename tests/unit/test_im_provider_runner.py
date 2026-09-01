@@ -19,6 +19,9 @@ IMAGE_DIGEST = "sha256:" + "1" * 64
 RUN_NONCE = "offline_nonce_123456"
 CONTROL_PROFILE = b'{"control_profile":"offline"}\n'
 CONTROL_PROFILE_SHA256 = hashlib.sha256(CONTROL_PROFILE).hexdigest()
+RELEASE_ID = "release-offline-runner"
+RELEASE_NONCE_SHA256 = "c" * 64
+SOURCE_FINGERPRINT = "d" * 64
 
 
 def _request(channel: str = "feishu") -> dict[str, Any]:
@@ -28,6 +31,9 @@ def _request(channel: str = "feishu") -> dict[str, Any]:
         "run_id": f"offline-{channel}-run",
         "run_nonce": RUN_NONCE,
         "expected_image_digest": IMAGE_DIGEST,
+        "release_id": RELEASE_ID,
+        "release_nonce_sha256": RELEASE_NONCE_SHA256,
+        "source_fingerprint": SOURCE_FINGERPRINT,
         "control_profile_sha256": CONTROL_PROFILE_SHA256,
         "cases": list(runner.REQUIRED_CASES),
     }
@@ -98,6 +104,9 @@ def _observations(channel: str = "feishu") -> dict[str, dict[str, Any]]:
                     "old_lock_owner_released": True,
                     "new_lock_owner_acquired": True,
                     "lock_epoch": 2,
+                    "outbound_request_id": "wecom-reconnect-outbound",
+                    "acknowledged_request_id": "wecom-reconnect-outbound",
+                    "provider_code": 0,
                 }
             ),
         },
@@ -117,6 +126,15 @@ def _observations(channel: str = "feishu") -> dict[str, dict[str, Any]]:
             "new_credential_event_id": f"{channel}-new",
             "post_rotation_event_id": f"{channel}-post-rotation",
             "old_credential_rejected": True,
+            **(
+                {
+                    "outbound_request_id": "wecom-rotation-outbound",
+                    "acknowledged_request_id": "wecom-rotation-outbound",
+                    "provider_code": 0,
+                }
+                if channel == "wecom"
+                else {}
+            ),
         },
         "prolonged_outage": {
             **common,
@@ -175,6 +193,8 @@ def _secret_files(tmp_path: Path, channel: str) -> dict[str, Path]:
 
 
 def _control_paths(tmp_path: Path, channel: str) -> tuple[Path, Path, socket.socket | None]:
+    if os.name != "nt":
+        tmp_path.chmod(0o750)
     profile = tmp_path / f"control-profile-{channel}.json"
     profile.write_bytes(CONTROL_PROFILE)
     profile.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -183,6 +203,7 @@ def _control_paths(tmp_path: Path, channel: str) -> tuple[Path, Path, socket.soc
     if hasattr(socket, "AF_UNIX"):
         listener = socket.socket(socket.AF_UNIX)
         listener.bind(str(control_socket))
+        control_socket.chmod(0o660)
     else:
         control_socket.write_text("windows-unix-socket-placeholder", encoding="utf-8")
     return profile, control_socket, listener
@@ -207,11 +228,24 @@ def _set_channel_env(
     driver.write_bytes(b"#!/bin/sh\nexit 0\n")
     driver.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     monkeypatch.setenv(runner.DRIVER_ENV_BY_CHANNEL[channel], str(driver))
+    monkeypatch.setenv(
+        f"{runner.DRIVER_ENV_BY_CHANNEL[channel]}_SHA256",
+        hashlib.sha256(driver.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_trusted_artifact_sha256",
+        lambda path, *, label: hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
     profile, control_socket, listener = _control_paths(tmp_path, channel)
     if listener is not None:
         request.addfinalizer(listener.close)
     monkeypatch.setenv(runner.CONTROL_PROFILE_ENV_BY_CHANNEL[channel], str(profile))
     monkeypatch.setenv(runner.CONTROL_SOCKET_ENV, str(control_socket))
+    monkeypatch.setenv(runner.BROKER_UID_ENV, str(os.getuid() if hasattr(os, "getuid") else 0))
+    monkeypatch.setenv(runner.BROKER_GID_ENV, str(os.getgid() if hasattr(os, "getgid") else 0))
+    if os.name != "nt":
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
     return driver
 
 
@@ -496,6 +530,8 @@ def test_driver_environment_is_current_channel_allowlist_only(
     profile, control_socket, listener = _control_paths(tmp_path, "feishu")
     if listener is not None:
         request.addfinalizer(listener.close)
+    monkeypatch.setenv(runner.BROKER_UID_ENV, "12345")
+    monkeypatch.setenv(runner.BROKER_GID_ENV, "23456")
     for variable in (
         "PYTHONPATH",
         "KUBECONFIG",
@@ -518,6 +554,8 @@ def test_driver_environment_is_current_channel_allowlist_only(
         *feishu_paths,
         runner.CONTROL_PROFILE_ENV_BY_CHANNEL["feishu"],
         runner.CONTROL_SOCKET_ENV,
+        runner.BROKER_UID_ENV,
+        runner.BROKER_GID_ENV,
     }
     assert all("WECOM" not in key for key in environment)
     assert "PYTHONPATH" not in environment
@@ -577,6 +615,10 @@ def test_driver_path_rejects_checkout_and_group_or_other_writable_files(
     outside.write_text("driver", encoding="utf-8")
     outside.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IWGRP)
     monkeypatch.setenv(runner.DRIVER_ENV_BY_CHANNEL["feishu"], str(outside))
+    monkeypatch.setenv(
+        f"{runner.DRIVER_ENV_BY_CHANNEL['feishu']}_SHA256",
+        hashlib.sha256(outside.read_bytes()).hexdigest(),
+    )
     if os.name != "nt" and outside.stat().st_mode & 0o022:
         with pytest.raises(runner.RunnerError, match="writable"):
             runner._driver_path("feishu")
@@ -587,6 +629,11 @@ def test_driver_invocation_timeout_and_oversized_output_fail_closed(
     tmp_path: Path,
 ) -> None:
     driver = tmp_path / "driver"
+    driver.write_text("driver", encoding="utf-8")
+    driver.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    artifact_hash = hashlib.sha256(driver.read_bytes()).hexdigest()
+    monkeypatch.setenv(f"{runner.DRIVER_ENV_BY_CHANNEL['feishu']}_SHA256", artifact_hash)
+    monkeypatch.setattr(runner, "_trusted_artifact_sha256", lambda _path, *, label: artifact_hash)
     request = _request()
     environment = {"TRPC_IM_PROBE_FEISHU_APP_ID": "cli-feishu-account"}
 
@@ -633,6 +680,12 @@ def test_run_aggregates_valid_driver_observations_and_binds_channel(
     if listener is not None:
         request.addfinalizer(listener.close)
     observed: dict[str, Any] = {}
+    artifact_hash = "a" * 64
+    monkeypatch.setenv(runner.RUNNER_SHA256_ENV, artifact_hash)
+    monkeypatch.setenv(f"{runner.DRIVER_ENV_BY_CHANNEL['feishu']}_SHA256", artifact_hash)
+    monkeypatch.setenv(runner.BROKER_UID_ENV, "12345")
+    monkeypatch.setenv(runner.BROKER_GID_ENV, "23456")
+    monkeypatch.setattr(runner, "_trusted_artifact_sha256", lambda _path, *, label: artifact_hash)
 
     class ValidProcess:
         returncode = 0
@@ -671,6 +724,13 @@ def test_run_aggregates_valid_driver_observations_and_binds_channel(
         "feishu", "cli-feishu-account"
     )
     assert set(evidence["observations"]) == set(runner.REQUIRED_CASES)
+    assert output["artifact_attestation"] == {
+        "schema_version": 1,
+        "runner_sha256": artifact_hash,
+        "runner_contract_version": 1,
+        "driver_sha256": artifact_hash,
+        "driver_contract_version": 1,
+    }
     driver_input = json.loads(observed["input"])
     assert set(driver_input) == {
         "schema_version",
@@ -678,6 +738,9 @@ def test_run_aggregates_valid_driver_observations_and_binds_channel(
         "run_id",
         "run_nonce",
         "expected_image_digest",
+        "release_id",
+        "release_nonce_sha256",
+        "source_fingerprint",
         "control_profile_sha256",
         "cases",
     }
@@ -687,6 +750,8 @@ def test_run_aggregates_valid_driver_observations_and_binds_channel(
         *paths,
         runner.CONTROL_PROFILE_ENV_BY_CHANNEL["feishu"],
         runner.CONTROL_SOCKET_ENV,
+        runner.BROKER_UID_ENV,
+        runner.BROKER_GID_ENV,
     }
     assert "PYTHONPATH" not in observed["env"]
     assert "WECOM" not in " ".join(observed["env"])

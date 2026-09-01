@@ -41,6 +41,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.evidence_lineage import source_fingerprint
 from scripts.im_online_gate import (
     CHANNEL_ACCOUNT_VARIABLE,
     REQUIRED_CASES,
@@ -58,6 +59,7 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RUNNER_OUTPUT_BYTES = 256 * 1024
 MAX_CONTROL_PROFILE_BYTES = 64 * 1024
+MAX_RELEASE_CONTEXT_BYTES = 64 * 1024
 MAX_RUNNER_TIMEOUT_SECONDS = 15 * 60
 NONCE_CACHE_CAPACITY = 4096
 NONCE_CACHE_TTL = timedelta(hours=24)
@@ -67,6 +69,9 @@ HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 IMAGE_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 PLACEHOLDER_MARKERS = ("replace-with", "change-me", "placeholder", "synthetic")
+ARTIFACT_CONTRACT_VERSION = 1
+CONTROL_SOCKET_MODE = 0o660
+CONTROL_SOCKET_PARENT_MODE = 0o750
 REQUEST_FIELDS = frozenset(
     {
         "run_id",
@@ -74,10 +79,22 @@ REQUEST_FIELDS = frozenset(
         "nonce",
         "cases",
         "expected_image_digest",
+        "release_id",
+        "release_nonce_sha256",
+        "source_fingerprint",
         "credential_fingerprints",
         "probe_identity_sha256",
         "account_fingerprint",
         "control_profile_sha256",
+    }
+)
+RELEASE_CONTEXT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "release_id",
+        "nonce_sha256",
+        "source_fingerprint",
+        "image_digest",
     }
 )
 
@@ -173,14 +190,106 @@ def _safe_path(
             raise ProbeConfigurationError(f"{label} is unavailable") from error
         if not stat.S_ISREG(mode) or (os.name != "nt" and mode & 0o022):
             raise ProbeConfigurationError(f"{label} must be a non-writable regular file")
-        if os.name != "nt" and private and mode & 0o027:
-            raise ProbeConfigurationError(f"{label} must not be readable by other users")
+        if os.name != "nt" and private and mode & 0o037:
+            raise ProbeConfigurationError(f"{label} may only be readable by its owner and group")
     return resolved
+
+
+def _trusted_artifact_sha256(path: Path, *, label: str) -> str:
+    """Hash a root-owned executable below a root-controlled parent chain."""
+
+    if os.name != "nt":
+        current = path.parent
+        while True:
+            try:
+                metadata = current.lstat()
+            except OSError as error:
+                raise ProbeConfigurationError(f"{label} parent is unavailable") from error
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ProbeConfigurationError(f"{label} parent is not a trusted directory")
+            if metadata.st_mode & 0o022 or (metadata.st_uid != 0 and metadata.st_mode & 0o200):
+                raise ProbeConfigurationError(f"{label} parent is writable by an untrusted user")
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ProbeConfigurationError(f"{label} is unavailable") from error
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ProbeConfigurationError(f"{label} must be a regular file")
+        if os.name != "nt" and (
+            metadata.st_uid != 0 or metadata.st_mode & 0o022 or not metadata.st_mode & 0o111
+        ):
+            raise ProbeConfigurationError(f"{label} must be a root-owned immutable executable")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(64 * 1024):
+                digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _release_context(value: str) -> tuple[Path, str, str, str, str]:
+    label = "TRPC_IM_PROBE_RELEASE_CONTEXT_FILE"
+    path = _safe_path(value, label=label, private=True)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ProbeConfigurationError(f"{label} is unavailable") from error
+    try:
+        metadata = os.fstat(descriptor)
+        expected_gid = getattr(os, "getegid", lambda: metadata.st_gid)()
+        if not stat.S_ISREG(metadata.st_mode) or (
+            os.name != "nt"
+            and (
+                metadata.st_uid != 0 or metadata.st_gid != expected_gid or metadata.st_mode & 0o037
+            )
+        ):
+            raise ProbeConfigurationError(f"{label} must be root-owned and immutable")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_RELEASE_CONTEXT_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if not raw or len(raw) > MAX_RELEASE_CONTEXT_BYTES:
+        raise ProbeConfigurationError(f"{label} is empty or too large")
+    try:
+        context = _strict_json(raw)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise ProbeConfigurationError(f"{label} is not strict JSON") from error
+    if (
+        not isinstance(context, dict)
+        or set(context) != RELEASE_CONTEXT_FIELDS
+        or type(context.get("schema_version")) is not int
+        or context["schema_version"] != 1
+    ):
+        raise ProbeConfigurationError(f"{label} schema is invalid")
+    release_id = _safe_config_id(str(context.get("release_id", "")), label="release_id")
+    nonce_sha256 = _safe_hash(str(context.get("nonce_sha256", "")), label="nonce_sha256")
+    expected_source = _safe_hash(
+        str(context.get("source_fingerprint", "")), label="source_fingerprint"
+    )
+    image_digest = _safe_image_digest(str(context.get("image_digest", "")))
+    measured_source = source_fingerprint(ROOT)
+    if (
+        measured_source.get("status") != "available"
+        or measured_source.get("value") != expected_source
+    ):
+        raise ProbeConfigurationError("deployed source does not match the release context")
+    return path, release_id, nonce_sha256, expected_source, image_digest
 
 
 def _safe_control_socket_path(
     value: str,
     *,
+    expected_uid: int,
+    expected_gid: int,
     label: str = "TRPC_IM_PROBE_CONTROL_SOCKET",
 ) -> Path:
     path = Path(value)
@@ -192,13 +301,31 @@ def _safe_control_socket_path(
         raise ProbeConfigurationError(f"{label} must be an absolute non-symlink path")
     try:
         resolved = path.resolve(strict=True)
-        mode = resolved.stat().st_mode
+        metadata = resolved.stat()
+        mode = metadata.st_mode
     except (OSError, RuntimeError) as error:
         raise ProbeConfigurationError(f"{label} is unavailable") from error
     if os.name != "nt" and not stat.S_ISSOCK(mode):
         raise ProbeConfigurationError(f"{label} must be a socket")
     if os.name == "nt" and stat.S_ISDIR(mode):
         raise ProbeConfigurationError(f"{label} must not be a directory")
+    if os.name != "nt" and (
+        metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(mode) != CONTROL_SOCKET_MODE
+    ):
+        raise ProbeConfigurationError(f"{label} owner or mode does not match the broker")
+    if os.name != "nt":
+        try:
+            parent = resolved.parent.lstat()
+        except OSError as error:
+            raise ProbeConfigurationError(f"{label} parent is unavailable") from error
+        if (
+            parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != CONTROL_SOCKET_PARENT_MODE
+        ):
+            raise ProbeConfigurationError(f"{label} parent owner or mode does not match")
     return resolved
 
 
@@ -257,18 +384,26 @@ class ProbeConfig:
     bind_host: str
     port: int
     runner: Path | None
+    runner_sha256: str | None
     runner_timeout_seconds: float
     driver_timeout_seconds: float
     signing_key_path: Path
     key_id: str
+    release_context_path: Path
+    release_id: str
+    release_nonce_sha256: str
+    source_fingerprint: str
     image_digest: str
     identity_sha256: str
     account_ids: Mapping[str, str]
     credential_paths: Mapping[str, Mapping[str, Path]]
     runner_secret_paths: Mapping[str, Mapping[str, Path]]
     driver_paths: Mapping[str, Path]
+    driver_sha256: Mapping[str, str]
     control_profile_paths: Mapping[str, Path]
     control_socket: Path | None
+    broker_uid: int | None
+    broker_gid: int | None
 
     @classmethod
     def from_environment(cls) -> ProbeConfig:
@@ -315,7 +450,13 @@ class ProbeConfig:
         key_id = _safe_config_id(
             os.getenv("TRPC_IM_PROBE_KEY_ID", ""), label="TRPC_IM_PROBE_KEY_ID"
         )
-        image_digest = _safe_image_digest(os.getenv("TRPC_IM_PROBE_IMAGE_DIGEST", ""))
+        (
+            release_context_path,
+            release_id,
+            release_nonce_sha256,
+            deployed_source_fingerprint,
+            image_digest,
+        ) = _release_context(os.getenv("TRPC_IM_PROBE_RELEASE_CONTEXT_FILE", ""))
         identity_sha256 = _safe_hash(
             os.getenv("TRPC_IM_PROBE_IDENTITY_SHA256", ""), label="TRPC_IM_PROBE_IDENTITY_SHA256"
         )
@@ -357,8 +498,12 @@ class ProbeConfig:
 
         runner_text = os.getenv("TRPC_IM_PROBE_RUNNER", "").strip()
         runner = None
+        runner_sha256 = None
         driver_paths: dict[str, Path] = {}
+        driver_sha256: dict[str, str] = {}
         control_socket = None
+        broker_uid = None
+        broker_gid = None
         if runner_text:
             runner = _safe_path(runner_text, label="TRPC_IM_PROBE_RUNNER")
             try:
@@ -374,6 +519,12 @@ class ProbeConfig:
                     raise ProbeConfigurationError("TRPC_IM_PROBE_RUNNER is not executable")
             except OSError as error:
                 raise ProbeConfigurationError("TRPC_IM_PROBE_RUNNER is unavailable") from error
+            runner_sha256 = _safe_hash(
+                os.getenv("TRPC_IM_PROBE_RUNNER_SHA256", ""),
+                label="TRPC_IM_PROBE_RUNNER_SHA256",
+            )
+            if _trusted_artifact_sha256(runner, label="TRPC_IM_PROBE_RUNNER") != runner_sha256:
+                raise ProbeConfigurationError("TRPC_IM_PROBE_RUNNER hash does not match")
             for channel in ("feishu", "wecom"):
                 env_name = f"TRPC_IM_PROBE_{channel.upper()}_DRIVER"
                 driver = _safe_path(os.getenv(env_name, ""), label=env_name)
@@ -382,9 +533,26 @@ class ProbeConfig:
                         raise ProbeConfigurationError(f"{env_name} is not executable")
                 except OSError as error:
                     raise ProbeConfigurationError(f"{env_name} is unavailable") from error
+                hash_name = f"{env_name}_SHA256"
+                expected_hash = _safe_hash(os.getenv(hash_name, ""), label=hash_name)
+                if _trusted_artifact_sha256(driver, label=env_name) != expected_hash:
+                    raise ProbeConfigurationError(f"{env_name} hash does not match")
                 driver_paths[channel] = driver
+                driver_sha256[channel] = expected_hash
+            try:
+                broker_uid = int(os.getenv("TRPC_IM_PROBE_BROKER_UID", ""))
+                broker_gid = int(os.getenv("TRPC_IM_PROBE_BROKER_GID", ""))
+            except ValueError as error:
+                raise ProbeConfigurationError("IM control broker identity is invalid") from error
+            if broker_uid < 0 or broker_gid < 0:
+                raise ProbeConfigurationError("IM control broker identity is invalid")
+            current_euid = getattr(os, "geteuid", None)
+            if os.name != "nt" and (current_euid is None or broker_uid == current_euid()):
+                raise ProbeConfigurationError("IM control broker must use a dedicated uid")
             control_socket = _safe_control_socket_path(
-                os.getenv("TRPC_IM_PROBE_CONTROL_SOCKET", "")
+                os.getenv("TRPC_IM_PROBE_CONTROL_SOCKET", ""),
+                expected_uid=broker_uid,
+                expected_gid=broker_gid,
             )
 
         runner_secret_paths: dict[str, dict[str, Path]] = {"feishu": {}, "wecom": {}}
@@ -410,18 +578,26 @@ class ProbeConfig:
             bind_host=host,
             port=port,
             runner=runner,
+            runner_sha256=runner_sha256,
             runner_timeout_seconds=timeout,
             driver_timeout_seconds=driver_timeout,
             signing_key_path=key_path,
             key_id=key_id,
+            release_context_path=release_context_path,
+            release_id=release_id,
+            release_nonce_sha256=release_nonce_sha256,
+            source_fingerprint=deployed_source_fingerprint,
             image_digest=image_digest,
             identity_sha256=identity_sha256,
             account_ids=account_ids,
             credential_paths=credential_paths,
             runner_secret_paths=runner_secret_paths,
             driver_paths=driver_paths,
+            driver_sha256=driver_sha256,
             control_profile_paths=control_profile_paths,
             control_socket=control_socket,
+            broker_uid=broker_uid,
+            broker_gid=broker_gid,
         )
 
 
@@ -448,6 +624,12 @@ def _validate_request(
     expected_image = payload.get("expected_image_digest")
     if expected_image != config.image_digest:
         raise ProbeRequestError("probe image digest does not match this deployment")
+    if payload.get("release_id") != config.release_id:
+        raise ProbeRequestError("probe release id does not match this deployment")
+    if payload.get("release_nonce_sha256") != config.release_nonce_sha256:
+        raise ProbeRequestError("probe release nonce does not match this deployment")
+    if payload.get("source_fingerprint") != config.source_fingerprint:
+        raise ProbeRequestError("probe source fingerprint does not match this deployment")
     identity = payload.get("probe_identity_sha256")
     if identity != config.identity_sha256:
         raise ProbeRequestError("probe identity does not match this deployment")
@@ -477,6 +659,9 @@ def _validate_request(
         "channel": channel,
         "nonce": nonce,
         "expected_image_digest": config.image_digest,
+        "release_id": config.release_id,
+        "release_nonce_sha256": config.release_nonce_sha256,
+        "source_fingerprint": config.source_fingerprint,
         "probe_identity_sha256": config.identity_sha256,
         "control_profile_sha256": control_profile_sha256,
     }, expected_fingerprints
@@ -489,6 +674,13 @@ def _runner_environment(
     channel = str(request["channel"])
     if config.control_socket is None:
         raise ProbeConfigurationError("TRPC_IM_PROBE_CONTROL_SOCKET is not configured")
+    if (
+        config.runner_sha256 is None
+        or channel not in config.driver_sha256
+        or config.broker_uid is None
+        or config.broker_gid is None
+    ):
+        raise ProbeConfigurationError("provider artifact or broker identity is not configured")
     account_variable = CHANNEL_ACCOUNT_VARIABLE[channel]
     environment = {
         "PATH": os.environ.get("PATH", ""),
@@ -499,9 +691,16 @@ def _runner_environment(
         "TRPC_IM_PROBE_RUN_ID": str(request["run_id"]),
         "TRPC_IM_PROBE_RUN_NONCE": str(request["nonce"]),
         "TRPC_IM_PROBE_EXPECTED_IMAGE_DIGEST": str(request["expected_image_digest"]),
+        "TRPC_IM_PROBE_RELEASE_ID": str(request["release_id"]),
+        "TRPC_IM_PROBE_RELEASE_NONCE_SHA256": str(request["release_nonce_sha256"]),
+        "TRPC_IM_PROBE_SOURCE_FINGERPRINT": str(request["source_fingerprint"]),
         "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS": str(config.driver_timeout_seconds),
         f"TRPC_IM_PROBE_{account_variable}": config.account_ids[channel],
         f"TRPC_IM_PROBE_{channel.upper()}_DRIVER": str(config.driver_paths[channel]),
+        "TRPC_IM_PROBE_RUNNER_SHA256": config.runner_sha256,
+        f"TRPC_IM_PROBE_{channel.upper()}_DRIVER_SHA256": config.driver_sha256[channel],
+        "TRPC_IM_PROBE_BROKER_UID": str(config.broker_uid),
+        "TRPC_IM_PROBE_BROKER_GID": str(config.broker_gid),
         f"TRPC_IM_PROBE_{channel.upper()}_CONTROL_PROFILE_FILE": str(
             config.control_profile_paths[channel]
         ),
@@ -519,7 +718,13 @@ def _run_provider_runner(
     config: ProbeConfig,
     request: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    if config.runner is None:
+    if config.runner is None or config.runner_sha256 is None:
+        return None
+    try:
+        actual_runner_hash = _trusted_artifact_sha256(config.runner, label="TRPC_IM_PROBE_RUNNER")
+    except ProbeConfigurationError:
+        return None
+    if actual_runner_hash != config.runner_sha256:
         return None
     runner_input = json.dumps(
         {
@@ -528,6 +733,9 @@ def _run_provider_runner(
             "run_id": request["run_id"],
             "run_nonce": request["nonce"],
             "expected_image_digest": request["expected_image_digest"],
+            "release_id": request["release_id"],
+            "release_nonce_sha256": request["release_nonce_sha256"],
+            "source_fingerprint": request["source_fingerprint"],
             "control_profile_sha256": request["control_profile_sha256"],
             "cases": list(REQUIRED_CASES),
         },
@@ -584,13 +792,29 @@ def _run_bounded_json_process(
 
 
 def _runner_ready(config: ProbeConfig, channel: str) -> bool:
-    if config.runner is None or channel not in config.driver_paths:
+    if (
+        config.runner is None
+        or config.runner_sha256 is None
+        or channel not in config.driver_paths
+        or channel not in config.driver_sha256
+    ):
+        return False
+    try:
+        if (
+            _trusted_artifact_sha256(config.runner, label="TRPC_IM_PROBE_RUNNER")
+            != config.runner_sha256
+        ):
+            return False
+    except ProbeConfigurationError:
         return False
     request = {
         "channel": channel,
         "run_id": "probe-readiness-check",
         "nonce": "probe_readiness_check_0001",
         "expected_image_digest": config.image_digest,
+        "release_id": config.release_id,
+        "release_nonce_sha256": config.release_nonce_sha256,
+        "source_fingerprint": config.source_fingerprint,
         "control_profile_sha256": _control_profile_sha256(
             config.control_profile_paths[channel],
             label=f"{channel} control profile",
@@ -610,9 +834,42 @@ def _runtime_attestation(config: ProbeConfig, request: Mapping[str, Any]) -> dic
         "status": "pass",
         "run_nonce": request["nonce"],
         "image_digest": request["expected_image_digest"],
+        "release_id": request["release_id"],
+        "release_nonce_sha256": request["release_nonce_sha256"],
+        "source_fingerprint": request["source_fingerprint"],
         "identity_fingerprint": config.identity_sha256,
         "control_profile_sha256": request["control_profile_sha256"],
+        "artifact_attestation": {
+            "schema_version": ARTIFACT_CONTRACT_VERSION,
+            "runner_sha256": config.runner_sha256,
+            "driver_sha256": config.driver_sha256.get(str(request["channel"])),
+        },
     }
+
+
+def _runner_artifact_attestation(
+    config: ProbeConfig,
+    request: Mapping[str, Any],
+    value: object,
+) -> dict[str, Any] | None:
+    channel = str(request["channel"])
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "runner_sha256",
+        "runner_contract_version",
+        "driver_sha256",
+        "driver_contract_version",
+    }:
+        return None
+    if (
+        value.get("schema_version") != ARTIFACT_CONTRACT_VERSION
+        or value.get("runner_sha256") != config.runner_sha256
+        or value.get("runner_contract_version") != ARTIFACT_CONTRACT_VERSION
+        or value.get("driver_sha256") != config.driver_sha256.get(channel)
+        or value.get("driver_contract_version") != ARTIFACT_CONTRACT_VERSION
+    ):
+        return None
+    return dict(value)
 
 
 def _failure_cases() -> dict[str, dict[str, str]]:
@@ -656,10 +913,19 @@ class ProbeService:
                 self._seen.popitem(last=False)
 
     def ready(self) -> bool:
-        if self.config.runner is None or self.config.control_socket is None:
+        if (
+            self.config.runner is None
+            or self.config.control_socket is None
+            or self.config.broker_uid is None
+            or self.config.broker_gid is None
+        ):
             return False
         try:
-            _safe_control_socket_path(str(self.config.control_socket))
+            _safe_control_socket_path(
+                str(self.config.control_socket),
+                expected_uid=self.config.broker_uid,
+                expected_gid=self.config.broker_gid,
+            )
             for channel, path in self.config.control_profile_paths.items():
                 _safe_path(str(path), label=f"{channel} control profile", private=True)
                 _control_profile_sha256(path, label=f"{channel} control profile")
@@ -693,10 +959,17 @@ class ProbeService:
         with self._runner_lock:
             runner_result = _run_provider_runner(self.config, request)
         provider_evidence = runner_result.get("provider_evidence") if runner_result else None
-        if isinstance(provider_evidence, dict):
+        artifact_attestation = _runner_artifact_attestation(
+            self.config,
+            request,
+            runner_result.get("artifact_attestation") if runner_result else None,
+        )
+        if isinstance(provider_evidence, dict) and artifact_attestation is not None:
+            provider_evidence_with_artifact = dict(provider_evidence)
+            provider_evidence_with_artifact["artifact_attestation"] = artifact_attestation
             candidate = {
                 "credential_attestation": response["credential_attestation"],
-                "provider_evidence": provider_evidence,
+                "provider_evidence": provider_evidence_with_artifact,
             }
             sanitized, errors = _validate_provider_evidence(
                 str(request["channel"]),
@@ -710,6 +983,8 @@ class ProbeService:
                 response["cases"] = {case: {"status": "pass"} for case in REQUIRED_CASES}
             else:
                 response["error_code"] = "provider_evidence_invalid"
+        elif runner_result is not None:
+            response["error_code"] = "provider_evidence_invalid"
         elif self.config.runner is None:
             response["error_code"] = "provider_runner_unconfigured"
         else:

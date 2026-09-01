@@ -32,26 +32,13 @@ $kubeconfig = "C:/Users/Z/.kube/trpc-ack.yaml"
 $context = "kubernetes-admin-cdecb943ac4bf48f7af5f29e4d7bf0793"
 $namespace = "trpc-service"
 $supportNamespace = "trpc-runtime-support"
-$expectedSource = "41cce1d8d17fffd9969736c9a4f050f221846b69f3676cef56926998e3d07267"
-$imageDigest = "sha256:a9765d89aa2f28aeebeb6ebf7aca4ce36a3a9b4ad89b4ad964f5da925008fee6"
-$upgradeDigest = "sha256:cde4fa4554ffe24c270858178befe47f80c8728cb6409cdc9ac45b8473f246a8"
-$releaseContextInitialDigest = "sha256:a9765d89aa2f28aeebeb6ebf7aca4ce36a3a9b4ad89b4ad964f5da925008fee6"
-$releaseContextUpgradeDigest = "sha256:cde4fa4554ffe24c270858178befe47f80c8728cb6409cdc9ac45b8473f246a8"
-$dockerHubRepository = "docker.io/zixuan760/trpc-agent-service"
-$imageTag = "release-41cce1d8d17f"
-$upgradeImageTag = "release-41cce1d8d17f-upgrade"
-$releaseId = "release-20260901-41cce1d8"
 $configPath = Join-Path $projectRoot "deploy/runtime-gate.yaml"
 $bindingPath = Join-Path $projectRoot "runs/multitenant/registry-image-binding.json"
 $lockPath = Join-Path $projectRoot "runs/multitenant/candidate-lock.json"
 $secretManifest = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/runtime-secrets-with-pull.yaml"
-$renderedSupport = Join-Path $projectRoot "runs/multitenant/rendered/support-41cce1d8d17f"
-$renderedPerformance = Join-Path $projectRoot "runs/multitenant/rendered/performance-41cce1d8d17f"
 $reportPath = Join-Path $projectRoot "runs/multitenant/real-performance.json"
 $fixturePath = Join-Path $projectRoot "runs/multitenant/performance-fixture-ack.json"
 $cleanupPath = Join-Path $projectRoot "runs/multitenant/performance-fixture-cleanup-ack.json"
-$privateReleaseContext = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-41cce1d8d17f-amd64.json"
-$publicReleaseContext = Join-Path $projectRoot "runs/multitenant/release-context-binding-41cce1d8d17f-amd64.json"
 
 function Invoke-Kubectl {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
@@ -80,13 +67,36 @@ if (-not (Test-Path -LiteralPath $secretManifest -PathType Leaf)) {
     throw "ACK runtime Secret manifest is unavailable"
 }
 
+$candidateLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$candidateBindingSha256 = [string]$candidateLock.binding_sha256
+$expectedSource = [string]$candidateLock.source_fingerprint.value
+$imageDigest = [string]$candidateLock.images.initial.digest
+$upgradeDigest = [string]$candidateLock.images.upgrade.digest
+$lockedInitialReference = [string]$candidateLock.images.initial.reference
+$releaseId = [string]$candidateLock.release_binding.release_id
+if (
+    $candidateBindingSha256 -notmatch '^[0-9a-f]{64}$' -or
+    $expectedSource -notmatch '^[0-9a-f]{64}$' -or
+    $imageDigest -notmatch '^sha256:[0-9a-f]{64}$' -or
+    $upgradeDigest -notmatch '^sha256:[0-9a-f]{64}$' -or
+    $lockedInitialReference -notmatch '@sha256:[0-9a-f]{64}$' -or
+    -not $lockedInitialReference.EndsWith("@$imageDigest") -or
+    [string]::IsNullOrWhiteSpace($releaseId)
+) {
+    throw "candidate lock identity is incomplete"
+}
+$candidateName = $expectedSource.Substring(0, 12)
+$renderedSupport = Join-Path $projectRoot "runs/multitenant/rendered/support-$candidateName"
+$renderedPerformance = Join-Path $projectRoot "runs/multitenant/rendered/performance-$candidateName"
+$privateReleaseContext = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-$candidateName-amd64.json"
+$publicReleaseContext = Join-Path $projectRoot "runs/multitenant/release-context-binding-$candidateName-amd64.json"
+
 & $python scripts/release_context.py verify `
     --private-context $privateReleaseContext `
-    --public-output $publicReleaseContext `
     --release-id $releaseId `
     --source-fingerprint $expectedSource `
-    --initial-digest $releaseContextInitialDigest `
-    --upgrade-digest $releaseContextUpgradeDigest | Out-Null
+    --initial-digest $imageDigest `
+    --upgrade-digest $upgradeDigest | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "private release context could not be verified"
 }
@@ -94,8 +104,8 @@ $releaseContext = Get-Content -LiteralPath $privateReleaseContext -Raw | Convert
 if (
     $releaseContext.release_id -ne $releaseId -or
     $releaseContext.source_fingerprint -ne $expectedSource -or
-    $releaseContext.images.initial -ne $releaseContextInitialDigest -or
-    $releaseContext.images.upgrade -ne $releaseContextUpgradeDigest -or
+    $releaseContext.images.initial -ne $imageDigest -or
+    $releaseContext.images.upgrade -ne $upgradeDigest -or
     [string]::IsNullOrWhiteSpace([string]$releaseContext.nonce)
 ) {
     throw "private release context does not match the current candidate"
@@ -103,17 +113,23 @@ if (
 
 $env:TRPC_RELEASE_ID = $releaseId
 $env:TRPC_RELEASE_NONCE = [string]$releaseContext.nonce
-& $python runs/multitenant/bind_published_candidate.py `
-    --expected-source $expectedSource `
-    --repository $dockerHubRepository `
-    --initial-tag $imageTag `
-    --initial-digest $imageDigest `
-    --upgrade-tag $upgradeImageTag `
-    --upgrade-digest $upgradeDigest `
-    --output $bindingPath `
-    --lock-output $lockPath | Out-Null
+& $python scripts/candidate_lock.py verify --binding $bindingPath --lock $lockPath | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    throw "candidate lock creation failed"
+    throw "candidate lock does not match the checkout, registry binding, or verified release context"
+}
+$verifiedCandidateLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+if ([string]$verifiedCandidateLock.binding_sha256 -ne $candidateBindingSha256) {
+    throw "candidate lock changed while its release context was being verified"
+}
+& $python scripts/release_context.py verify `
+    --private-context $privateReleaseContext `
+    --public-output $publicReleaseContext `
+    --release-id $releaseId `
+    --source-fingerprint $expectedSource `
+    --initial-digest $imageDigest `
+    --upgrade-digest $upgradeDigest | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "verified release context could not be published"
 }
 
 & $python scripts/render_runtime_support.py `
@@ -129,8 +145,19 @@ if ($LASTEXITCODE -ne 0) {
     throw "rendered performance kustomization is invalid"
 }
 $renderedText = $rendered -join "`n"
-if ($renderedText -notmatch [regex]::Escape("$dockerHubRepository@$imageDigest")) {
+if ($renderedText -notmatch [regex]::Escape($lockedInitialReference)) {
     throw "rendered performance workload is not pinned to the canonical Docker Hub image"
+}
+$migrationManifest = Join-Path $renderedPerformance "stage1-migration.yaml"
+$headCheckManifest = Join-Path $renderedPerformance "stage1-schema-head-check.yaml"
+$runtimeManifest = Join-Path $renderedPerformance "stage1-runtime.yaml"
+$renderedText | & $python -m scripts.split_kubernetes_runtime_manifest `
+    --namespace $namespace `
+    --migration-output $migrationManifest `
+    --head-check-output $headCheckManifest `
+    --runtime-output $runtimeManifest
+if ($LASTEXITCODE -ne 0) {
+    throw "rendered performance manifest split failed"
 }
 
 Invoke-Kubectl -Arguments @("apply", "-f", (Join-Path $renderedPerformance "namespace.yaml"))
@@ -174,8 +201,16 @@ foreach ($supportDeployment in @("postgres", "redis", "minio", "backlog-metric-s
     Invoke-Kubectl -Arguments @("--namespace", $supportNamespace, "rollout", "status", "deployment/$supportDeployment", "--timeout=600s")
 }
 
-Invoke-Kubectl -Arguments @("--namespace", $namespace, "delete", "job/trpc-schema-migration", "--ignore-not-found=true", "--wait=true")
-Invoke-Kubectl -Arguments @("apply", "-k", $renderedPerformance)
+Invoke-Kubectl -Arguments @(
+    "--namespace", $namespace, "delete",
+    "job/trpc-schema-migration", "job/trpc-schema-head-check",
+    "--ignore-not-found=true", "--wait=true"
+)
+Invoke-Kubectl -Arguments @("apply", "-f", $migrationManifest)
+Invoke-Kubectl -Arguments @("--namespace", $namespace, "wait", "--for=condition=complete", "job/trpc-schema-migration", "--timeout=600s")
+Invoke-Kubectl -Arguments @("apply", "-f", $headCheckManifest)
+Invoke-Kubectl -Arguments @("--namespace", $namespace, "wait", "--for=condition=complete", "job/trpc-schema-head-check", "--timeout=600s")
+Invoke-Kubectl -Arguments @("apply", "-f", $runtimeManifest)
 
 # Remove one-time literal fixture variables used by the previous bootstrap.
 # Placement is already rendered exclusively from runtime-gate.yaml.
@@ -186,7 +221,6 @@ Invoke-Kubectl -Arguments @(
     "TRPC_PERF_FIXTURE_UNUSED_ENCRYPT_KEY-"
 )
 
-Invoke-Kubectl -Arguments @("--namespace", $namespace, "wait", "--for=condition=complete", "job/trpc-schema-migration", "--timeout=600s")
 foreach ($deployment in @("trpc-gateway", "trpc-worker", "trpc-outbox-dispatcher", "trpc-session-recovery", "trpc-backlog-exporter")) {
     Invoke-Kubectl -Arguments @("--namespace", $namespace, "rollout", "status", "deployment/$deployment", "--timeout=600s")
 }

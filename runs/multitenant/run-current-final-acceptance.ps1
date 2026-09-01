@@ -24,16 +24,10 @@ $serviceNamespace = "trpc-service"
 $hpaDriverNamespace = "trpc-runtime-driver"
 $hpaDriverServiceAccount = "hpa-driver"
 $hpaDriverContext = "hpa-driver-context"
-$hpaDriverKubeconfig = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/hpa-driver-a522.kubeconfig"
+$hpaDriverKubeconfig = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/hpa-driver.kubeconfig"
 $secretManifest = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/runtime-secrets-with-pull.yaml"
-$candidateDigest = "sha256:a9765d89aa2f28aeebeb6ebf7aca4ce36a3a9b4ad89b4ad964f5da925008fee6"
-$initial = "zixuan760/trpc-agent-service:release-41cce1d8d17f"
-$initialId = $candidateDigest
-$releaseContextInitialDigest = "sha256:a9765d89aa2f28aeebeb6ebf7aca4ce36a3a9b4ad89b4ad964f5da925008fee6"
-$releaseContextUpgradeDigest = "sha256:cde4fa4554ffe24c270858178befe47f80c8728cb6409cdc9ac45b8473f246a8"
-$releaseId = "release-20260901-41cce1d8"
-$fp = "41cce1d8d17fffd9969736c9a4f050f221846b69f3676cef56926998e3d07267"
-$releaseContextPath = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-41cce1d8d17f-amd64.json"
+$bindingPath = Join-Path $projectRoot "runs/multitenant/registry-image-binding.json"
+$lockPath = Join-Path $projectRoot "runs/multitenant/candidate-lock.json"
 $portForwards = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 
 function Invoke-Python {
@@ -131,17 +125,48 @@ function Refresh-HpaDriverCredential {
     }
 }
 
+$candidateLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$candidateBindingSha256 = [string]$candidateLock.binding_sha256
+$candidateDigest = [string]$candidateLock.images.initial.digest
+$upgradeDigest = [string]$candidateLock.images.upgrade.digest
+$initial = [string]$candidateLock.images.initial.reference
+$releaseId = [string]$candidateLock.release_binding.release_id
+$fp = [string]$candidateLock.source_fingerprint.value
+if (
+    $candidateBindingSha256 -notmatch '^[0-9a-f]{64}$' -or
+    $candidateDigest -notmatch '^sha256:[0-9a-f]{64}$' -or
+    $upgradeDigest -notmatch '^sha256:[0-9a-f]{64}$' -or
+    $initial -notmatch '@sha256:[0-9a-f]{64}$' -or
+    -not $initial.EndsWith("@$candidateDigest") -or
+    [string]::IsNullOrWhiteSpace($releaseId) -or
+    $fp -notmatch '^[0-9a-f]{64}$'
+) {
+    throw "candidate lock identity is incomplete"
+}
+$candidateName = $fp.Substring(0, 12)
+$initialId = $candidateDigest
+$releaseContextPath = Join-Path $projectRoot "runs/multitenant/.ack-runtime-private/release-context-$candidateName-amd64.json"
+
 Invoke-Python -Arguments @(
     "-m", "scripts.release_context", "verify",
     "--private-context", $releaseContextPath,
     "--release-id", $releaseId,
     "--source-fingerprint", $fp,
-    "--initial-digest", $releaseContextInitialDigest,
-    "--upgrade-digest", $releaseContextUpgradeDigest
+    "--initial-digest", $candidateDigest,
+    "--upgrade-digest", $upgradeDigest
 ) -Failure "private release context verification failed"
 $releaseContext = Get-Content -LiteralPath $releaseContextPath -Raw | ConvertFrom-Json
 $env:TRPC_RELEASE_ID = [string]$releaseContext.release_id
 $env:TRPC_RELEASE_NONCE = [string]$releaseContext.nonce
+Invoke-Python -Arguments @(
+    "scripts/candidate_lock.py", "verify",
+    "--binding", $bindingPath,
+    "--lock", $lockPath
+) -Failure "candidate lock does not match the checkout, registry binding, or verified release context"
+$verifiedCandidateLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+if ([string]$verifiedCandidateLock.binding_sha256 -ne $candidateBindingSha256) {
+    throw "candidate lock changed while its release context was being verified"
+}
 
 if ($StartStage -le 1 -and $EndStage -ge 1) {
     Write-Host "[1/8] Performance + external-metric HPA"
@@ -150,9 +175,6 @@ if ($StartStage -le 1 -and $EndStage -ge 1) {
         throw "formal ACK Performance gate failed"
     }
 }
-
-Invoke-Python -Arguments @("scripts/candidate_lock.py", "verify") `
-    -Failure "candidate lock verification failed before acceptance stage $StartStage"
 
 if ($StartStage -le 2 -and $EndStage -ge 2) {
     Write-Host "[2/8] ACK Backend integration"
@@ -279,7 +301,8 @@ if ($StartStage -le 8 -and $EndStage -ge 8) {
     # external gate was omitted or whether a required gate actually failed.
     & $python scripts/release_gate.py `
         --directory runs/multitenant `
-        --output runs/multitenant/release-gate-current-final.json
+        --output runs/multitenant/release-gate-current-final.json `
+        --allow-functional-dr
     $preflightExit = $LASTEXITCODE
     if ($preflightExit -ne 0) {
         throw "aggregate release preflight failed to run"
@@ -303,7 +326,7 @@ if ($StartStage -le 8 -and $EndStage -ge 8) {
             Where-Object { [string]$_.Value -eq "fail" } |
             ForEach-Object { $_.Name }
     )
-    $allowedNotRun = @("online_im", "disaster_recovery", "release_bundle")
+    $allowedNotRun = @("disaster_recovery", "release_bundle")
     $notRunGates = @(
         $candidateProperties |
             Where-Object { [string]$_.Value -eq "not_run" } |
@@ -322,50 +345,61 @@ if ($StartStage -le 8 -and $EndStage -ge 8) {
         throw ("aggregate release preflight has unexpected not_run gates: {0}" -f ($unexpectedNotRun -join ", "))
     }
 
-    $externalNotRun = @(
-        "online_im", "disaster_recovery" |
-            Where-Object {
-                $gateName = [string]$_
-                [string]$preflight.candidate.PSObject.Properties[$gateName].Value -eq "not_run"
-            }
-    )
-    if ($externalNotRun.Count -gt 0) {
-        if ([string]$preflight.gate -ne "not_run") {
-            throw "aggregate release preflight did not remain not_run with external gates disabled"
+    if ([string]$preflight.candidate.functional_disaster_recovery -ne "pass") {
+        throw "functional disaster recovery is not a valid current-candidate pass"
+    }
+    $destructiveDrStatus = [string]$preflight.candidate.disaster_recovery
+    $authorizedNotRun = @($preflight.authorized_not_run_gates)
+    if ($destructiveDrStatus -eq "not_run") {
+        if ($authorizedNotRun.Count -ne 1 -or [string]$authorizedNotRun[0] -ne "disaster_recovery") {
+            throw "destructive disaster recovery not_run lacks explicit functional DR authorization"
         }
-        Write-Output ("RELEASE_STAGE8_RESULT gate=not_run production_manifest=not_generated external_not_run={0}" -f ($externalNotRun -join ","))
+    }
+    elseif ($authorizedNotRun.Count -ne 0) {
+        throw "aggregate release preflight contains an unexpected functional DR authorization"
+    }
+    $nonBundleNotPass = @(
+        $candidateProperties |
+            Where-Object {
+                $_.Name -ne "release_bundle" -and
+                -not ($_.Name -eq "disaster_recovery" -and
+                    [string]$_.Value -eq "not_run" -and
+                    $authorizedNotRun -contains "disaster_recovery") -and
+                [string]$_.Value -ne "pass"
+            } |
+            ForEach-Object { $_.Name }
+    )
+    if ($nonBundleNotPass.Count -gt 0) {
+        throw ("aggregate release preflight has non-bundle gates that are not pass: {0}" -f ($nonBundleNotPass -join ", "))
+    }
+
+    & $python scripts/release_manifest.py `
+        --directory runs/multitenant `
+        --image-digest $candidateDigest `
+        --output $manifestPath `
+        --allow-functional-dr
+    $manifestExit = $LASTEXITCODE
+    if ($manifestExit -ne 0) {
+        throw "release manifest generation failed after all requested gates completed"
+    }
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "release manifest generation produced no manifest"
+    }
+
+    & $python scripts/release_gate.py `
+        --directory runs/multitenant `
+        --output runs/multitenant/release-gate-current-final.json `
+        --allow-functional-dr `
+        --require-production
+    $releaseExit = $LASTEXITCODE
+    if ($releaseExit -ne 0) {
+        throw "aggregate release gate remains blocked; inspect release-gate-current-final.json"
+    }
+    if ($destructiveDrStatus -eq "not_run") {
+        Write-Output "RELEASE_STAGE8_RESULT gate=pass production_manifest=generated authorized_not_run=disaster_recovery"
     }
     else {
-        $nonBundleNotPass = @(
-            $candidateProperties |
-                Where-Object { $_.Name -ne "release_bundle" -and [string]$_.Value -ne "pass" } |
-                ForEach-Object { $_.Name }
-        )
-        if ($nonBundleNotPass.Count -gt 0) {
-            throw ("aggregate release preflight has non-bundle gates that are not pass: {0}" -f ($nonBundleNotPass -join ", "))
-        }
-
-        & $python scripts/release_manifest.py `
-            --directory runs/multitenant `
-            --image-digest $candidateDigest `
-            --output $manifestPath
-        $manifestExit = $LASTEXITCODE
-        if ($manifestExit -ne 0) {
-            throw "release manifest generation failed after all requested gates completed"
-        }
-        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-            throw "release manifest generation produced no manifest"
-        }
-
-        & $python scripts/release_gate.py `
-            --directory runs/multitenant `
-            --output runs/multitenant/release-gate-current-final.json `
-            --require-production
-        $releaseExit = $LASTEXITCODE
-        if ($releaseExit -ne 0) {
-            throw "aggregate release gate remains blocked; inspect release-gate-current-final.json"
-        }
-        Write-Output "RELEASE_STAGE8_RESULT gate=pass production_manifest=generated"
+        Write-Output "RELEASE_STAGE8_RESULT gate=pass production_manifest=generated authorized_not_run=none"
     }
 
     foreach ($name in @(
@@ -376,6 +410,7 @@ if ($StartStage -le 8 -and $EndStage -ge 8) {
         "migration-live.json",
         "fault-injection.json",
         "kubernetes-runtime.json",
+        "im-online.json",
         "disaster-recovery.json",
         "disaster-recovery-functional.json",
         "coverage-gate.json",

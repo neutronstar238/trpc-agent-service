@@ -112,6 +112,9 @@ WECOM_RECONNECT_FIELDS = (
     "old_lock_owner_released",
     "new_lock_owner_acquired",
     "lock_epoch",
+    "outbound_request_id",
+    "acknowledged_request_id",
+    "provider_code",
 )
 WECOM_OUTAGE_MODES = frozenset({"service_failover", "provider_delivery_gap"})
 WECOM_SERVICE_FAILOVER_FIELDS = (
@@ -158,6 +161,7 @@ RELEASE_ID_ENV = "TRPC_RELEASE_ID"
 RELEASE_NONCE_ENV = "TRPC_RELEASE_NONCE"
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+ARTIFACT_CONTRACT_VERSION = 1
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -443,6 +447,9 @@ def _normalized_probe_response_sha256(
             "image_digest",
             "identity_fingerprint",
             "control_profile_sha256",
+            "release_id",
+            "release_nonce_sha256",
+            "source_fingerprint",
         ):
             value = runtime.get(field)
             if isinstance(value, (str, int, float, bool)) or value is None:
@@ -498,6 +505,9 @@ def _validate_probe_runtime(
     configured_identity: str | None,
     identity_hash: str,
     control_profile_sha256: str,
+    release_id: str,
+    release_nonce_sha256: str,
+    source_fingerprint_value: str,
 ) -> tuple[bool, str | None]:
     """Validate a content-free probe attestation without retaining identity data."""
 
@@ -512,6 +522,12 @@ def _validate_probe_runtime(
         return False, "probe runtime image attestation did not match candidate"
     if runtime.get("control_profile_sha256") != control_profile_sha256:
         return False, "probe runtime control profile did not match candidate"
+    if runtime.get("release_id") != release_id:
+        return False, "probe runtime release ID did not match candidate"
+    if runtime.get("release_nonce_sha256") != release_nonce_sha256:
+        return False, "probe runtime release nonce did not match candidate"
+    if runtime.get("source_fingerprint") != source_fingerprint_value:
+        return False, "probe runtime source fingerprint did not match deployed candidate"
     observed_hash = runtime.get("identity_fingerprint")
     if observed_hash != identity_hash:
         observed_identity = runtime.get("identity")
@@ -520,6 +536,39 @@ def _validate_probe_runtime(
         if not hmac.compare_digest(observed_identity, configured_identity):
             return False, "probe runtime identity attestation did not match the fixed identity"
     return True, None
+
+
+def _validate_artifact_attestation(value: object) -> tuple[dict[str, Any] | None, str | None]:
+    required = {
+        "schema_version",
+        "runner_sha256",
+        "runner_contract_version",
+        "driver_sha256",
+        "driver_contract_version",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        return None, "provider artifact attestation is missing or invalid"
+    if (
+        value.get("schema_version") != ARTIFACT_CONTRACT_VERSION
+        or value.get("runner_contract_version") != ARTIFACT_CONTRACT_VERSION
+        or value.get("driver_contract_version") != ARTIFACT_CONTRACT_VERSION
+    ):
+        return None, "provider artifact contract version is invalid"
+    for field in ("runner_sha256", "driver_sha256"):
+        digest = value.get(field)
+        if (
+            not isinstance(digest, str)
+            or HEX64_RE.fullmatch(digest) is None
+            or digest.lower() in {"0" * 64, "f" * 64}
+        ):
+            return None, f"provider artifact {field} is invalid"
+    return {
+        "schema_version": ARTIFACT_CONTRACT_VERSION,
+        "runner_sha256": str(value["runner_sha256"]).lower(),
+        "runner_contract_version": ARTIFACT_CONTRACT_VERSION,
+        "driver_sha256": str(value["driver_sha256"]).lower(),
+        "driver_contract_version": ARTIFACT_CONTRACT_VERSION,
+    }, None
 
 
 def _enabled() -> bool:
@@ -649,7 +698,9 @@ def _required_observation_fields(
             FEISHU_IDEMPOTENCY_FIELDS if channel == "feishu" else WECOM_IDEMPOTENCY_FIELDS
         )
     if case == "reconnect":
-        return fields + (FEISHU_RECONNECT_FIELDS if channel == "feishu" else WECOM_RECONNECT_FIELDS)
+        fields += FEISHU_RECONNECT_FIELDS if channel == "feishu" else WECOM_RECONNECT_FIELDS
+    if case == "credential_rotation" and channel == "wecom":
+        fields += ("outbound_request_id", "acknowledged_request_id", "provider_code")
     if case != "prolonged_outage" or channel != "wecom":
         return fields
     fields += ("outage_mode",)
@@ -700,6 +751,12 @@ def _validate_provider_evidence(
         expected_account_hash = ""
     if evidence.get("account_fingerprint") != expected_account_hash:
         errors.append("provider_evidence.account_fingerprint does not match the configured account")
+
+    artifact_attestation, artifact_error = _validate_artifact_attestation(
+        evidence.get("artifact_attestation")
+    )
+    if artifact_error is not None:
+        errors.append(artifact_error)
 
     credential_attestation = response.get("credential_attestation")
     if not isinstance(credential_attestation, dict):
@@ -896,6 +953,22 @@ def _validate_provider_evidence(
             lock_epoch = observation.get("lock_epoch")
             if not isinstance(lock_epoch, int) or isinstance(lock_epoch, bool) or lock_epoch < 1:
                 errors.append(f"provider_evidence.observations.{case}.lock_epoch is invalid")
+        if channel == "wecom" and case in {"reconnect", "credential_rotation"}:
+            outbound_request = _safe_identifier(observation.get("outbound_request_id"))
+            acknowledged_request = _safe_identifier(observation.get("acknowledged_request_id"))
+            if (
+                outbound_request is not None
+                and acknowledged_request is not None
+                and acknowledged_request != outbound_request
+            ):
+                errors.append(
+                    f"provider_evidence.observations.{case}.acknowledged_request_id must "
+                    "match outbound_request_id"
+                )
+            if _provider_code_number(observation.get("provider_code")) not in {0, 200}:
+                errors.append(
+                    f"provider_evidence.observations.{case}.provider_code is not successful"
+                )
         if case == "reconnect" and channel == "feishu":
             failed_endpoint = _safe_identifier(observation.get("failed_endpoint_id"))
             replacement_endpoint = _safe_identifier(observation.get("replacement_endpoint_id"))
@@ -1096,6 +1169,11 @@ def _validate_provider_evidence(
                 "outbound_request_id": "outbound_request",
                 "acknowledged_request_id": "outbound_request",
             }
+        if channel == "wecom" and case in {"reconnect", "credential_rotation"}:
+            correlation_labels = {
+                "outbound_request_id": "outbound_request",
+                "acknowledged_request_id": "outbound_request",
+            }
         for field in (*event_fields, "unique_inbound_id"):
             value = _safe_identifier(observation.get(field))
             if value is not None:
@@ -1221,6 +1299,7 @@ def _validate_provider_evidence(
             "run_nonce": run_nonce,
             "credential_count": len(credential_fingerprints),
         },
+        "artifact_attestation": artifact_attestation,
     }
     if run_started_at is not None:
         normalized_run_started_at = _normalized_timestamp(run_started_at.isoformat())
@@ -1421,6 +1500,21 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
     nonce = secrets.token_urlsafe(18)
     run_started_at = datetime.now(UTC)
     expected_source_fingerprint = source_fingerprint(ROOT)
+    source_fingerprint_value = expected_source_fingerprint.get("value")
+    if (
+        expected_source_fingerprint.get("status") != "available"
+        or not isinstance(source_fingerprint_value, str)
+        or HEX64_RE.fullmatch(source_fingerprint_value) is None
+    ):
+        result = _not_run(
+            output,
+            ["current candidate source fingerprint is unavailable"],
+            run_id=run_id,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return 1 if require_production else 0
+    assert expected_release_binding is not None
+    release_nonce_sha256 = expected_release_binding["nonce_sha256"]
     image_digest = image_digest.lower()
     assert identity_hash is not None  # guarded by the prerequisite branch above
     assert canonical_probe_url is not None
@@ -1457,6 +1551,9 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
                     "nonce": nonce,
                     "cases": list(REQUIRED_CASES),
                     "expected_image_digest": image_digest,
+                    "release_id": release_id,
+                    "release_nonce_sha256": release_nonce_sha256,
+                    "source_fingerprint": source_fingerprint_value,
                     "credential_fingerprints": credential_fingerprints[channel],
                     "probe_identity_sha256": identity_hash,
                     "control_profile_sha256": control_profile_hashes[channel],
@@ -1476,6 +1573,9 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
                 configured_identity=configured_identity,
                 identity_hash=identity_hash,
                 control_profile_sha256=control_profile_hashes[channel],
+                release_id=release_id,
+                release_nonce_sha256=release_nonce_sha256,
+                source_fingerprint_value=source_fingerprint_value,
             )
             if not runtime_ok:
                 raise RuntimeError(runtime_error or "probe runtime attestation failed")
@@ -1501,11 +1601,21 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
             elif provider_evidence is not None and all(
                 item.get("status") == "pass" for item in channel_cases.values()
             ):
+                runtime_attestation = {
+                    "status": "pass",
+                    "run_nonce": nonce,
+                    "image_digest": image_digest,
+                    "release_id": release_id,
+                    "release_nonce_sha256": release_nonce_sha256,
+                    "source_fingerprint": source_fingerprint_value,
+                }
                 candidate["channels"][channel] = {
                     "status": "pass",
                     "control_profile_sha256": control_profile_hashes[channel],
                     "cases": channel_cases,
                     "provider_evidence": provider_evidence,
+                    "runtime_attestation": runtime_attestation,
+                    "artifact_attestation": provider_evidence["artifact_attestation"],
                     "signature_response": {
                         "algorithm": "sha256",
                         "response_sha256": _normalized_probe_response_sha256(

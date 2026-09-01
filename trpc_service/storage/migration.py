@@ -78,6 +78,7 @@ _TARGET_EMPTY_TABLES = (
     "session_mailbox_items",
     "wecom_connection_state",
     "im_acceptance_evidence_events",
+    "im_acceptance_runs",
     "migration_checkpoints",
     "migration_scope_manifests",
     "migration_leases",

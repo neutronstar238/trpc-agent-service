@@ -14,12 +14,26 @@ import pytest
 from deploy.im_probe import control_broker as broker
 
 RUN_NONCE = "offline_nonce_123456"
+_VALIDATE_POSIX_FILE_OWNER = broker._validate_posix_file_owner
+_VALIDATE_TRUSTED_PARENT_CHAIN = broker._validate_trusted_parent_chain
+
+
+@pytest.fixture(autouse=True)
+def _allow_non_root_test_artifacts(monkeypatch: pytest.MonkeyPatch) -> None:
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+        return
+    monkeypatch.setattr(broker, "_validate_posix_file_owner", lambda _metadata: None)
+    monkeypatch.setattr(broker, "_validate_trusted_parent_chain", lambda _path: None)
 
 
 def _write_secure(path: Path, contents: str) -> Path:
     path.write_text(contents, encoding="utf-8")
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     return path
+
+
+def _metadata(mode: int, *, uid: int) -> os.stat_result:
+    return os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
 
 
 def _config_value(
@@ -30,6 +44,8 @@ def _config_value(
 ) -> tuple[dict[str, Any], dict[str, Path]]:
     paths: dict[str, Path] = {}
     channels: dict[str, Any] = {}
+    executable = Path(getattr(sys, "_base_executable", sys.executable))
+    executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
     for channel in broker.CHANNELS:
         profile = _write_secure(
             tmp_path / f"{channel}-control.json",
@@ -41,7 +57,8 @@ def _config_value(
             "control_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
             "allowed_actions": {
                 "exercise": {
-                    "executable": getattr(sys, "_base_executable", sys.executable),
+                    "executable": str(executable),
+                    "sha256": executable_sha256,
                     "argv": ["-c", handler_code, "fixed-argv"],
                     "timeout_seconds": timeout_seconds,
                 }
@@ -50,7 +67,7 @@ def _config_value(
     value = {
         "schema_version": 1,
         "socket_path": str(tmp_path / "control.sock"),
-        "socket_mode": "0600",
+        "socket_mode": "0660",
         "channels": channels,
     }
     return value, paths
@@ -102,6 +119,56 @@ def test_config_schema_is_strict(
 
     with pytest.raises(broker.ConfigError, match="schema"):
         _load_config(tmp_path, value)
+
+
+def test_action_hash_is_required_and_verified_when_loading(tmp_path: Path) -> None:
+    value, _ = _config_value(tmp_path)
+    action = value["channels"]["feishu"]["allowed_actions"]["exercise"]
+    action.pop("sha256")
+    with pytest.raises(broker.ConfigError, match="schema"):
+        _load_config(tmp_path, value)
+
+    value, _ = _config_value(tmp_path)
+    action = value["channels"]["feishu"]["allowed_actions"]["exercise"]
+    action["sha256"] = "not-a-sha256"
+    with pytest.raises(broker.ConfigError, match="hash is invalid"):
+        _load_config(tmp_path, value)
+
+    value, _ = _config_value(tmp_path)
+    action = value["channels"]["feishu"]["allowed_actions"]["exercise"]
+    action["sha256"] = "f" * 64
+    with pytest.raises(broker.ConfigError, match="hash does not match"):
+        _load_config(tmp_path, value)
+
+
+def test_posix_trusted_file_must_be_root_owned() -> None:
+    with pytest.raises(broker.ConfigError, match="root-owned"):
+        _VALIDATE_POSIX_FILE_OWNER(_metadata(stat.S_IFREG | 0o600, uid=1000))
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid"),
+    [
+        (stat.S_IFDIR | 0o770, 0),
+        (stat.S_IFDIR | 0o700, 1000),
+    ],
+)
+def test_posix_trusted_parent_chain_rejects_writable_directory(
+    tmp_path: Path,
+    mode: int,
+    uid: int,
+) -> None:
+    target = tmp_path / "trusted" / "config.json"
+    unsafe_parent = target.parent
+
+    def metadata(path: Path) -> os.stat_result:
+        if path == unsafe_parent:
+            return _metadata(mode, uid=uid)
+        return _metadata(stat.S_IFDIR | 0o755, uid=0)
+
+    with patch.object(Path, "lstat", autospec=True, side_effect=metadata):
+        with pytest.raises(broker.ConfigError, match="parent"):
+            _VALIDATE_TRUSTED_PARENT_CHAIN(target)
 
 
 def test_config_rejects_relative_symlink_checkout_or_insecure_handler(
@@ -190,6 +257,26 @@ def test_profile_hash_is_recomputed_for_every_request(tmp_path: Path) -> None:
     }
 
 
+def test_action_hash_is_recomputed_before_every_execution(tmp_path: Path) -> None:
+    value, _ = _config_value(tmp_path)
+    handler = _write_secure(tmp_path / "reviewed-action", "#!/bin/sh\nexit 0\n")
+    handler.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    digest = hashlib.sha256(handler.read_bytes()).hexdigest()
+    for channel in broker.CHANNELS:
+        action = value["channels"][channel]["allowed_actions"]["exercise"]
+        action.update({"executable": str(handler), "sha256": digest, "argv": []})
+    config = _load_config(tmp_path, value)
+
+    handler.write_text("#!/bin/sh\nexit 78\n", encoding="utf-8")
+    handler.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    with patch("deploy.im_probe.control_broker.subprocess.Popen") as popen:
+        assert broker._process_request(config, _request(config)) == {
+            "status": "not_run",
+            "error_code": "handler_hash_mismatch",
+        }
+    popen.assert_not_called()
+
+
 def test_handler_receives_canonical_request_fixed_argv_and_empty_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -268,6 +355,27 @@ def test_check_validates_without_executing_handler(
 
     assert broker._check() is True
     assert not marker.exists()
+
+
+def test_check_rejects_action_replaced_without_hash_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value, _ = _config_value(tmp_path)
+    handler = _write_secure(tmp_path / "reviewed-action", "#!/bin/sh\nexit 0\n")
+    handler.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    digest = hashlib.sha256(handler.read_bytes()).hexdigest()
+    for channel in broker.CHANNELS:
+        action = value["channels"][channel]["allowed_actions"]["exercise"]
+        action.update({"executable": str(handler), "sha256": digest, "argv": []})
+    config_path = _write_secure(tmp_path / "broker.json", json.dumps(value))
+    monkeypatch.setenv("TRPC_IM_CONTROL_BROKER_CONFIG_FILE", str(config_path))
+    monkeypatch.setattr(broker, "_platform_supports_unix_socket", lambda: True)
+
+    assert broker._check() is True
+    handler.write_text("#!/bin/sh\nexit 78\n", encoding="utf-8")
+    handler.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    assert broker._check() is False
 
 
 def test_check_output_is_content_free(

@@ -84,6 +84,28 @@ class ReplayRequest(RequestModel):
     confirm_ambiguous: bool = False
 
 
+class IMAcceptanceEventRequest(RequestModel):
+    channel: Channel
+    run_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$",
+    )
+    run_nonce: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+    provider_event_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class IMAcceptanceRunRequest(RequestModel):
+    channel: Channel
+    run_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$",
+    )
+    run_nonce: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+    expires_in_seconds: int = Field(default=300, ge=30, le=900)
+
+
 def create_admin_router(
     repository: PostgresControlPlaneRepository, authorizer: Authorizer
 ) -> APIRouter:
@@ -301,6 +323,61 @@ def create_admin_router(
             binding_id,
             run_id=run_id,
             outbound_id=outbound_id,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="resource not found",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.post(
+        "/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/runs",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def register_im_acceptance_run(
+        tenant_id: str,
+        binding_id: str,
+        body: IMAcceptanceRunRequest,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+    ) -> dict[str, Any]:
+        require_role(actor, Role.TENANT_ADMIN, tenant_id=tenant_id)
+        result = await repository.register_im_acceptance_run(
+            tenant_id,
+            binding_id,
+            channel=body.channel,
+            run_id=body.run_id,
+            run_nonce=body.run_nonce,
+            expires_in_seconds=body.expires_in_seconds,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=409,
+                detail="acceptance run is unavailable",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.post("/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/event-evidence")
+    async def im_acceptance_event_evidence(
+        tenant_id: str,
+        binding_id: str,
+        body: IMAcceptanceEventRequest,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+    ) -> dict[str, Any]:
+        require_role(actor, Role.TENANT_ADMIN, tenant_id=tenant_id)
+        result = await repository.im_acceptance_event_evidence(
+            tenant_id,
+            binding_id,
+            channel=body.channel,
+            run_id=body.run_id,
+            run_nonce=body.run_nonce,
+            provider_event_hash=body.provider_event_hash,
         )
         if result is None:
             raise HTTPException(

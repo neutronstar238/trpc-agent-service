@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import hashlib
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 
-from tests.conftest import binding, tenant_config
+from tests.conftest import binding, envelope, tenant_config
 from tests.unit.test_postgres_repository import Connection, Pool
+from trpc_service.channels.envelopes import MediaReference
 from trpc_service.tenant.control import (
     ControlVersionConflict,
     IdempotencyConflict,
@@ -16,6 +18,9 @@ from trpc_service.tenant.control import (
     _record_json,
     _safe_provider_code,
 )
+from trpc_service.tenant.models import Channel
+
+RUN_NONCE = "acceptance-nonce-123456"
 
 
 def control(connection: Connection) -> PostgresControlPlaneRepository:
@@ -323,6 +328,7 @@ async def test_im_acceptance_outbound_evidence_is_scoped_hash_only_and_bounded()
             "attempt_number": 1,
             "status": "failed",
             "provider_code": "429",
+            "retry_after_seconds": 1.25,
             "started_at": timestamp,
             "completed_at": timestamp,
             "total_count": 2,
@@ -331,6 +337,7 @@ async def test_im_acceptance_outbound_evidence_is_scoped_hash_only_and_bounded()
             "attempt_number": 2,
             "status": "delivered",
             "provider_code": "sk-live-ABC123",
+            "retry_after_seconds": None,
             "started_at": timestamp,
             "completed_at": timestamp,
             "total_count": 2,
@@ -361,6 +368,7 @@ async def test_im_acceptance_outbound_evidence_is_scoped_hash_only_and_bounded()
     assert evidence["attempt_count"] == 2
     assert evidence["attempts_truncated"] is False
     assert evidence["attempts"][0]["provider_code"] == "429"
+    assert evidence["attempts"][0]["retry_after_seconds"] == 1.25
     assert evidence["attempts"][1]["provider_code"] is None
     assert evidence["pending_count"] == 0
     assert evidence["dlq_count"] == 0
@@ -421,6 +429,7 @@ async def test_im_acceptance_outbound_evidence_keeps_latest_attempts_in_order() 
             "attempt_number": attempt_number,
             "status": "delivered" if attempt_number == 101 else "failed",
             "provider_code": "0" if attempt_number == 101 else "429",
+            "retry_after_seconds": None,
             "started_at": timestamp,
             "completed_at": timestamp,
             "total_count": 101,
@@ -470,6 +479,260 @@ async def test_im_acceptance_outbound_evidence_handles_missing_binding_or_outbou
     assert result is not None
     assert result["outbound"] == {"availability": "not_found"}
     assert not any(call[0] == "fetch" for call in missing_outbound.calls)
+
+
+@pytest.mark.asyncio
+async def test_im_acceptance_event_evidence_correlates_delivery_and_artifact_content_free() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    inbound_id = str(uuid4())
+    outbound_id = uuid4()
+    provider_id = "raw-provider-media-id"
+    media_envelope = envelope().model_copy(
+        update={"media": (MediaReference(provider_media_id=provider_id),)}
+    )
+    artifact_id = hashlib.sha256(f"{inbound_id}:0:{provider_id}".encode()).hexdigest()
+    persisted_run_and_inbound = {
+        "run_tenant_id": "tenant-a",
+        "run_binding_id": "binding-a",
+        "run_channel": Channel.FEISHU.value,
+        "run_id_sha256": "b" * 64,
+        "run_binding_sha256": "c" * 64,
+        "run_created_at": timestamp - timedelta(seconds=1),
+        "run_expires_at": timestamp + timedelta(minutes=4),
+        "run_provider_event_hash": "a" * 64,
+        "inbound_id": inbound_id,
+        "external_message_id": "raw-external-message-id",
+        "status": "committed",
+        "accepted_at": timestamp,
+        "delivery_count": 2,
+        "envelope_json": media_envelope.model_dump_json(),
+    }
+    outbounds = [
+        {
+            "outbound_id": outbound_id,
+            "status": "delivered",
+            "provider_message_id": "raw-provider-reply-id",
+            "pending_count": 0,
+            "dlq_count": 0,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+    ]
+    attempts = [
+        {
+            "outbound_id": outbound_id,
+            "attempt_number": 1,
+            "status": "delivered",
+            "provider_code": "0",
+            "retry_after_seconds": 0.5,
+            "started_at": timestamp,
+            "completed_at": timestamp,
+        }
+    ]
+    artifacts = [
+        {
+            "artifact_id": artifact_id,
+            "checksum": "d" * 64,
+            "size_bytes": 123,
+            "status": "committed",
+            "created_at": timestamp,
+        }
+    ]
+    connection = Connection(
+        fetchvals=[Channel.FEISHU.value],
+        fetchrows=[persisted_run_and_inbound],
+        fetches=[outbounds, attempts, artifacts],
+    )
+
+    result = await control(connection).im_acceptance_event_evidence(
+        "tenant-a",
+        "binding-a",
+        channel=Channel.FEISHU,
+        run_id="im-run-456",
+        run_nonce=RUN_NONCE,
+        provider_event_hash="a" * 64,
+    )
+
+    assert result is not None
+    assert result["requested_run_id_sha256"] == "b" * 64
+    assert result["run_binding_sha256"] == "c" * 64
+    assert result["provider_event_hash"] == "a" * 64
+    assert result["correlation"]["availability"] == "available"
+    assert result["correlation"]["delivery_count"] == 2
+    assert result["outbounds"]["count"] == 1
+    assert result["outbounds"]["items"][0]["delivery_status"] == "delivered"
+    assert result["outbounds"]["items"][0]["attempts"][0]["retry_after_seconds"] == 0.5
+    assert result["artifact"] == {
+        "availability": "available",
+        "count": 1,
+        "items": [
+            {
+                "sha256": "d" * 64,
+                "bytes": 123,
+                "status": "available",
+                "created_at": timestamp.isoformat(),
+            }
+        ],
+    }
+    artifact_query = next(
+        call for call in connection.calls if call[0] == "fetch" and "FROM artifacts" in call[1][0]
+    )
+    assert "status='committed'" in artifact_query[1][0]
+    rendered = repr(result)
+    assert "im-run-456" not in rendered
+    assert inbound_id not in rendered
+    assert str(outbound_id) not in rendered
+    assert "raw-external-message-id" not in rendered
+    assert "raw-provider-media-id" not in rendered
+    assert "raw-provider-reply-id" not in rendered
+    binding_query = next(call for call in connection.calls if call[0] == "fetchval")
+    correlation_query = next(call for call in connection.calls if call[0] == "fetchrow")
+    assert "tenant_id=$1 AND binding_id=$2" in binding_query[1][0]
+    assert "expires_at > clock_timestamp()" in correlation_query[1][0]
+    assert "inbound.accepted_at >= acceptance.created_at" in correlation_query[1][0]
+    assert "provider_event_hash IS NULL" in correlation_query[1][0]
+
+
+@pytest.mark.asyncio
+async def test_im_acceptance_event_evidence_rejects_binding_expiry_rebind_and_reuse() -> None:
+    wrong_channel = Connection(fetchvals=[Channel.WECOM_AI_BOT.value])
+    assert (
+        await control(wrong_channel).im_acceptance_event_evidence(
+            "tenant-a",
+            "binding-a",
+            channel=Channel.FEISHU,
+            run_id="im-run-456",
+            run_nonce=RUN_NONCE,
+            provider_event_hash="a" * 64,
+        )
+        is None
+    )
+    assert not any(call[0] == "fetchrow" for call in wrong_channel.calls)
+
+    expired = Connection(fetchvals=[Channel.FEISHU.value], fetchrows=[None])
+    assert (
+        await control(expired).im_acceptance_event_evidence(
+            "tenant-a",
+            "binding-a",
+            channel=Channel.FEISHU,
+            run_id="im-run-expired",
+            run_nonce=RUN_NONCE,
+            provider_event_hash="b" * 64,
+        )
+        is None
+    )
+    expired_query = next(call for call in expired.calls if call[0] == "fetchrow")
+    assert "expires_at > clock_timestamp()" in expired_query[1][0]
+
+    rebound = Connection(fetchvals=[Channel.FEISHU.value], fetchrows=[None])
+    assert (
+        await control(rebound).im_acceptance_event_evidence(
+            "tenant-a",
+            "binding-a",
+            channel=Channel.FEISHU,
+            run_id="im-run-rebind",
+            run_nonce=RUN_NONCE,
+            provider_event_hash="c" * 64,
+        )
+        is None
+    )
+    rebound_query = next(call for call in rebound.calls if call[0] == "fetchrow")
+    assert "acceptance.provider_event_hash=$7" in rebound_query[1][0]
+    assert "used.provider_event_hash=$7" in rebound_query[1][0]
+
+
+@pytest.mark.asyncio
+async def test_im_acceptance_event_evidence_stale_event_is_not_bound_or_echoed() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    stale = Connection(
+        fetchvals=[Channel.FEISHU.value],
+        fetchrows=[
+            {
+                "run_tenant_id": "tenant-a",
+                "run_binding_id": "binding-a",
+                "run_channel": Channel.FEISHU.value,
+                "run_id_sha256": "d" * 64,
+                "run_binding_sha256": "e" * 64,
+                "run_created_at": timestamp,
+                "run_expires_at": timestamp + timedelta(minutes=5),
+                "run_provider_event_hash": None,
+                "inbound_id": None,
+                "external_message_id": None,
+                "status": None,
+                "accepted_at": None,
+                "delivery_count": None,
+                "envelope_json": None,
+            }
+        ],
+    )
+    result = await control(stale).im_acceptance_event_evidence(
+        "tenant-a",
+        "binding-a",
+        channel=Channel.FEISHU,
+        run_id="im-run-stale",
+        run_nonce=RUN_NONCE,
+        provider_event_hash="b" * 64,
+    )
+    assert result is not None
+    assert result["requested_run_id_sha256"] == "d" * 64
+    assert result["provider_event_hash"] is None
+    assert result["correlation"] == {"availability": "not_found"}
+    assert result["outbounds"] == {"count": 0, "truncated": False, "items": []}
+    assert result["artifact"] == {"availability": "not_found", "count": 0, "items": []}
+    assert not any(call[0] == "fetch" for call in stale.calls)
+    rendered = repr(result)
+    assert "im-run-stale" not in rendered
+    assert "b" * 64 not in rendered
+
+
+@pytest.mark.asyncio
+async def test_register_im_acceptance_run_persists_hash_and_server_lifetime() -> None:
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    expires_at = created_at + timedelta(minutes=5)
+    connection = Connection(
+        fetchrows=[
+            {
+                "tenant_id": "tenant-a",
+                "binding_id": "binding-a",
+                "channel": Channel.FEISHU.value,
+                "run_id_sha256": "e" * 64,
+                "run_binding_sha256": "f" * 64,
+                "created_at": created_at,
+                "expires_at": expires_at,
+            }
+        ]
+    )
+
+    result = await control(connection).register_im_acceptance_run(
+        "tenant-a",
+        "binding-a",
+        channel=Channel.FEISHU,
+        run_id="raw-run-id",
+        run_nonce=RUN_NONCE,
+        expires_in_seconds=300,
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "tenant_id": "tenant-a",
+        "binding_id": "binding-a",
+        "channel": Channel.FEISHU.value,
+        "run_id_sha256": "e" * 64,
+        "run_binding_sha256": "f" * 64,
+        "created_at": created_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    query = next(call for call in connection.calls if call[0] == "fetchrow")
+    cleanup = next(
+        call
+        for call in connection.calls
+        if call[0] == "execute" and "DELETE FROM im_acceptance_runs" in call[1][0]
+    )
+    assert "clock_timestamp()" in query[1][0]
+    assert "ON CONFLICT DO NOTHING" in query[1][0]
+    assert "raw-run-id" not in repr(query)
+    assert RUN_NONCE not in repr(query)
+    assert cleanup[1][1:] == ("tenant-a", "binding-a")
 
 
 @pytest.mark.asyncio
