@@ -139,8 +139,7 @@ def _configuration() -> dict[str, str | list[str]]:
     if not command_text:
         raise ValueError("HPA driver Job command is required")
     if image_pull_secret and (
-        len(image_pull_secret) > 253
-        or SECRET_NAME_RE.fullmatch(image_pull_secret) is None
+        len(image_pull_secret) > 253 or SECRET_NAME_RE.fullmatch(image_pull_secret) is None
     ):
         raise ValueError("HPA driver image pull Secret name is invalid")
     try:
@@ -345,9 +344,7 @@ def _job_manifest(config: Mapping[str, str | list[str]]) -> dict[str, Any]:
     }
     image_pull_secret = str(config.get("image_pull_secret", "")).strip()
     if image_pull_secret:
-        manifest["spec"]["template"]["spec"]["imagePullSecrets"] = [
-            {"name": image_pull_secret}
-        ]
+        manifest["spec"]["template"]["spec"]["imagePullSecrets"] = [{"name": image_pull_secret}]
     return manifest
 
 
@@ -428,9 +425,7 @@ def _load(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, An
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         payload = _retry_transient(
-            lambda: _get_job(
-                config, min(10.0, max(1.0, deadline - time.monotonic()))
-            )
+            lambda: _get_job(config, min(10.0, max(1.0, deadline - time.monotonic())))
         )
         if payload is None:
             raise RuntimeError("bounded HPA load Job disappeared before completion")
@@ -549,9 +544,7 @@ def _clear(config: Mapping[str, str | list[str]], timeout: float) -> dict[str, A
         if remaining > 0:
             time.sleep(min(0.25, remaining))
     if delete_failed:
-        raise RuntimeError(
-            "bounded HPA load Job delete failed and absence was not observed"
-        )
+        raise RuntimeError("bounded HPA load Job delete failed and absence was not observed")
     raise RuntimeError("bounded HPA load Job deletion was not observed")
 
 

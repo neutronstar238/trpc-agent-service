@@ -27,6 +27,7 @@ import secrets
 import sys
 import tempfile
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -140,7 +141,7 @@ async def run_acceptance(
         raise ValueError("timeout_seconds is outside the safe range")
 
     endpoint_hash = hashlib.sha256(base_url.encode("utf-8")).hexdigest()
-    state_url = f"{base_url}/state/{quote(outbound_id, safe='') }"
+    state_url = f"{base_url}/state/{quote(outbound_id, safe='')}"
     adapter: FeishuAdapter | None = None
     client = httpx.AsyncClient(timeout=timeout_seconds)
     try:
@@ -154,8 +155,7 @@ async def run_acceptance(
 
         first = await adapter.send(envelope, binding)
         first_ambiguous = (
-            first.status == DeliveryStatus.AMBIGUOUS
-            and first.provider_code == "transport_unknown"
+            first.status == DeliveryStatus.AMBIGUOUS and first.provider_code == "transport_unknown"
         )
         first_state_response = await client.get(state_url)
         first_state = first_state_response.json() if first_state_response.status_code == 200 else {}
@@ -264,9 +264,7 @@ def _not_run_result(reason: str) -> dict[str, Any]:
         "automatic_replay_count": 0,
         "confirmed_replay_status": "not_run",
         "provider_ledger": {"accepted_count": 0, "side_effect_count": 0},
-        "stage_markers": [
-            _marker(name, status="not_run", reason=reason) for name in STAGE_MARKERS
-        ],
+        "stage_markers": [_marker(name, status="not_run", reason=reason) for name in STAGE_MARKERS],
     }
 
 
@@ -315,7 +313,7 @@ def _execution_run_id() -> str:
 
 
 @contextmanager
-def _local_endpoint(ledger_path: Path | None):
+def _local_endpoint(ledger_path: Path | None) -> Iterator[str]:
     temporary: tempfile.TemporaryDirectory[str] | None = None
     if ledger_path is None:
         temporary = tempfile.TemporaryDirectory(prefix="trpc-ambiguous-provider-")
@@ -345,9 +343,7 @@ def _run_endpoint_acceptance(
             )
         )
     except (OSError, ValueError, httpx.HTTPError) as error:
-        return _not_run_result(
-            f"provider endpoint acceptance unavailable: {type(error).__name__}"
-        )
+        return _not_run_result(f"provider endpoint acceptance unavailable: {type(error).__name__}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -385,9 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.execute:
         missing = _execution_environment_missing()
         if missing:
-            result = _not_run_result(
-                "missing real prerequisite: " + ", ".join(missing)
-            )
+            result = _not_run_result("missing real prerequisite: " + ", ".join(missing))
             ended_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             report = _child_report(
                 result,

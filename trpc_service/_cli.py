@@ -49,6 +49,7 @@ _WORKER_DATABASE_ROLES = frozenset(
         Role.POST_TURN_PROJECTOR,
         Role.WECOM_CONNECTOR,
         Role.SESSION_RECOVERY,
+        Role.ARTIFACT_GC,
     }
 )
 _GLOBAL_WORKER_FUNCTIONS = (
@@ -84,6 +85,7 @@ _DATABASE_FUNCTIONS: dict[Role, tuple[str, ...]] = {
         "public.reconcile_session_mailboxes(integer)",
         "public.reconcile_session_mailboxes_v2(integer,integer)",
     ),
+    Role.ARTIFACT_GC: (),
 }
 _WORKER_TABLES = (
     "tenants",
@@ -115,7 +117,12 @@ _WORKER_TABLES = (
     "fault_stage_controls",
     "session_mailboxes",
     "session_mailbox_items",
+    "wecom_connection_state",
+    "im_acceptance_evidence_events",
 )
+_WORKER_TABLE_PRIVILEGES = {table: "SELECT,INSERT,UPDATE,DELETE" for table in _WORKER_TABLES}
+_WORKER_TABLE_PRIVILEGES["wecom_connection_state"] = "SELECT,INSERT,UPDATE"
+_WORKER_TABLE_PRIVILEGES["im_acceptance_evidence_events"] = "SELECT,INSERT"
 
 
 @app.callback()
@@ -302,6 +309,8 @@ async def _serve(role: Role, settings: ServiceSettings) -> None:
             await _serve_wecom(settings, secrets, repository, redis, lifecycle.stop_event)
         elif role == Role.SESSION_RECOVERY:
             await _serve_session_recovery(settings, repository, lifecycle.stop_event)
+        elif role == Role.ARTIFACT_GC:
+            await _serve_artifact_gc(settings, secrets, repository, lifecycle.stop_event)
     finally:
         await lifecycle.close()
         if redis is not None:
@@ -680,7 +689,7 @@ async def _serve_channel_dispatcher(
     from trpc_service.channels.feishu import FeishuAdapter
     from trpc_service.tenant.models import Channel
 
-    feishu = FeishuAdapter(secrets)
+    feishu = FeishuAdapter(secrets, api_root=settings.feishu_send_api_root)
     owner = f"channel-{uuid4()}"
     try:
         await ChannelDispatcher(
@@ -764,6 +773,7 @@ async def _serve_wecom(
         {Channel.WECOM_AI_BOT: connector},
         owner_id=owner,
         event_type="outbound.wecom_ai_bot.ready",
+        binding_ready=connector.ready_for_delivery,
     )
     await asyncio.gather(
         manager.run(stop_event=stop_event),
@@ -803,6 +813,30 @@ async def _serve_session_recovery(
             await asyncio.wait_for(task, timeout=settings.shutdown_grace_seconds)
 
 
+async def _serve_artifact_gc(
+    settings: ServiceSettings,
+    secrets: LocalSecretProvider,
+    repository: Any,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Run bounded PostgreSQL-authoritative staged artifact cleanup."""
+
+    from trpc_service.storage.artifact_gc import ArtifactGarbageCollector
+
+    objects = _s3_artifact_store(settings, secrets)
+    if objects is None:
+        raise ValueError("artifact-gc requires an S3 endpoint")
+    stop_event = stop_event or asyncio.Event()
+    collector = ArtifactGarbageCollector(
+        repository.pool,
+        objects,
+        ttl_seconds=settings.artifact_staging_ttl_seconds,
+        batch_size=settings.artifact_gc_batch_size,
+        poll_seconds=settings.artifact_gc_poll_seconds,
+    )
+    await collector.run(stop_event)
+
+
 async def _serve_uvicorn(server: Any, stop_event: asyncio.Event) -> None:
     """Bridge the shared drain event into Uvicorn's graceful shutdown."""
 
@@ -829,9 +863,7 @@ def _database_dsn(settings: ServiceSettings, secrets: LocalSecretProvider) -> st
 
 def _worker_database_dsn(settings: ServiceSettings, secrets: LocalSecretProvider) -> str:
     if settings.worker_database_dsn_ref is None:
-        raise ValueError(
-            "worker database DSN reference is required for cross-tenant runtime roles"
-        )
+        raise ValueError("worker database DSN reference is required for cross-tenant runtime roles")
     return _resolve_database_dsn(
         settings.worker_database_dsn_ref,
         settings.worker_database_password_ref,
@@ -880,6 +912,7 @@ async def _validate_database_identity(repository: Any, role: Role) -> None:
     # tests independent from PostgreSQL while the production path is strict.
     if not callable(getattr(pool, "acquire", None)):
         return
+    assert pool is not None
 
     expected_role = (
         WORKER_DATABASE_ROLE if role in _WORKER_DATABASE_ROLES else RUNTIME_DATABASE_ROLE
@@ -931,18 +964,17 @@ async def _validate_database_identity(repository: Any, role: Role) -> None:
                 signature,
             )
             if not granted:
-                raise RuntimeError(
-                    f"database role {expected_role} lacks EXECUTE on {signature}"
-                )
+                raise RuntimeError(f"database role {expected_role} lacks EXECUTE on {signature}")
         if role in _WORKER_DATABASE_ROLES:
-            for table in _WORKER_TABLES:
+            for table, privileges in _WORKER_TABLE_PRIVILEGES.items():
                 granted = await connection.fetchval(
                     """
                     SELECT has_table_privilege(
-                        current_user, $1, 'SELECT,INSERT,UPDATE,DELETE'
+                        current_user, $1, $2
                     )
                     """,
                     f"public.{table}",
+                    privileges,
                 )
                 if not granted:
                     raise RuntimeError(

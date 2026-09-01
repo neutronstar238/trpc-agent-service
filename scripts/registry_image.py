@@ -208,6 +208,7 @@ def publish_candidate(
     tag: str | None = None,
     upgrade_tag: str | None = None,
     output: Path | None = None,
+    lock_output: Path | None = None,
 ) -> dict[str, Any]:
     """Build/push initial and rollout images and return their safe binding report."""
 
@@ -242,10 +243,7 @@ def publish_candidate(
     if initial_digest == upgrade_digest:
         raise RegistryImageError("initial and upgrade registry digests must differ")
     source_after = source_fingerprint(context, SOURCE_FINGERPRINT_ROOTS)
-    if (
-        source_after.get("status") != "available"
-        or source_after.get("value") != source_value
-    ):
+    if source_after.get("status") != "available" or source_after.get("value") != source_value:
         raise RegistryImageError(
             "checkout changed during image build/push; discard the candidate binding and restart"
         )
@@ -274,6 +272,10 @@ def publish_candidate(
     }
     if output is not None:
         atomic_write_json(output, report)
+    if lock_output is not None:
+        from scripts.candidate_lock import create_candidate_lock
+
+        create_candidate_lock(report, root=context, output=lock_output)
     return report
 
 
@@ -288,6 +290,11 @@ def _parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         default=Path("runs/multitenant/registry-image-binding.json"),
+    )
+    parser.add_argument(
+        "--lock-output",
+        type=Path,
+        default=Path("runs/multitenant/candidate-lock.json"),
     )
     return parser
 
@@ -304,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tag=args.tag,
             upgrade_tag=args.upgrade_tag,
             output=args.output,
+            lock_output=args.lock_output,
         )
     except (RegistryImageError, ValueError) as error:
         parser.error(str(error))
@@ -316,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "initial_reference": report["images"]["initial"]["reference"],
                 "upgrade_reference": report["images"]["upgrade"]["reference"],
                 "output": str(args.output),
+                "candidate_lock": str(args.lock_output),
             },
             sort_keys=True,
         )

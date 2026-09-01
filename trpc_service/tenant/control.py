@@ -15,6 +15,30 @@ import asyncpg
 
 from trpc_service.tenant.models import ChannelBinding, TenantConfig
 
+_WECOM_STATE_FIELDS = (
+    "owner_hash",
+    "epoch",
+    "phase",
+    "acquired_at",
+    "authenticated_at",
+    "disconnected_at",
+    "released_at",
+    "last_provider_event_hash",
+    "last_provider_event_at",
+    "updated_at",
+)
+_WECOM_EVENT_FIELDS = (
+    "event_id",
+    "connection_epoch",
+    "event_type",
+    "owner_hash",
+    "provider_event_hash",
+    "occurred_at",
+)
+_SAFE_PROVIDER_CODES = frozenset(
+    {"0", "200", "429", "45009", "45011", "99991400", "99991401", "99991402", "99991672"}
+)
+
 
 class IdempotencyConflict(RuntimeError):
     pass
@@ -78,6 +102,19 @@ class ControlPlaneRepository(Protocol):
     async def audit_page(
         self, tenant_id: str, *, cursor: str | None, limit: int
     ) -> dict[str, Any]: ...
+
+    async def wecom_acceptance_snapshot(
+        self, tenant_id: str, binding_id: str, *, limit: int
+    ) -> dict[str, Any] | None: ...
+
+    async def im_acceptance_outbound_evidence(
+        self,
+        tenant_id: str,
+        binding_id: str,
+        *,
+        run_id: str,
+        outbound_id: UUID,
+    ) -> dict[str, Any] | None: ...
 
 
 class PostgresControlPlaneRepository:
@@ -415,6 +452,187 @@ class PostgresControlPlaneRepository:
             )
         return [_record_json(row) for row in rows]
 
+    async def wecom_acceptance_snapshot(
+        self, tenant_id: str, binding_id: str, *, limit: int
+    ) -> dict[str, Any] | None:
+        bounded_limit = max(1, min(limit, 200))
+        async with self._transaction(tenant_id) as connection:
+            exists = await connection.fetchval(
+                """
+                SELECT 1
+                  FROM channel_bindings
+                 WHERE tenant_id=$1 AND binding_id=$2
+                   AND channel='wecom_ai_bot'
+                """,
+                tenant_id,
+                binding_id,
+            )
+            if not exists:
+                return None
+            state = await connection.fetchrow(
+                """
+                SELECT owner_hash,epoch,phase,acquired_at,authenticated_at,
+                       disconnected_at,released_at,last_provider_event_hash,
+                       last_provider_event_at,updated_at
+                  FROM wecom_connection_state
+                 WHERE tenant_id=$1 AND binding_id=$2
+                """,
+                tenant_id,
+                binding_id,
+            )
+            events = await connection.fetch(
+                """
+                SELECT event_id,connection_epoch,event_type,owner_hash,
+                       provider_event_hash,occurred_at
+                  FROM im_acceptance_evidence_events
+                 WHERE tenant_id=$1 AND binding_id=$2
+                 ORDER BY occurred_at DESC,event_id DESC
+                 LIMIT $3
+                """,
+                tenant_id,
+                binding_id,
+                bounded_limit,
+            )
+        return {
+            "state": _project_record(state, _WECOM_STATE_FIELDS) if state else None,
+            "events": [_project_record(row, _WECOM_EVENT_FIELDS) for row in events],
+        }
+
+    async def im_acceptance_outbound_evidence(
+        self,
+        tenant_id: str,
+        binding_id: str,
+        *,
+        run_id: str,
+        outbound_id: UUID,
+    ) -> dict[str, Any] | None:
+        """Return bounded, content-free delivery evidence for one outbound.
+
+        The current schema does not persist an IM acceptance run ID on an
+        outbound or artifact row.  The response therefore hashes the caller's
+        run ID for request binding but explicitly marks run and artifact
+        correlation unavailable instead of inferring either from timestamps,
+        sessions, or payload content.
+        """
+
+        async with self._transaction(tenant_id) as connection:
+            exists = await connection.fetchval(
+                """
+                SELECT 1
+                  FROM channel_bindings
+                 WHERE tenant_id=$1 AND binding_id=$2
+                """,
+                tenant_id,
+                binding_id,
+            )
+            if not exists:
+                return None
+            outbound = await connection.fetchrow(
+                """
+                SELECT message.status,message.provider_message_id,
+                       message.created_at,message.updated_at,
+                       (
+                           SELECT count(*)
+                             FROM outbox_events AS pending
+                            WHERE pending.tenant_id=message.tenant_id
+                              AND pending.aggregate_type='outbound'
+                              AND pending.aggregate_id=message.outbound_id::text
+                              AND pending.published_at IS NULL
+                       ) AS pending_count,
+                       (
+                           SELECT count(*)
+                             FROM dead_letters AS dead
+                            WHERE dead.tenant_id=message.tenant_id
+                              AND dead.source_id=message.outbound_id::text
+                              AND dead.status='open'
+                       ) AS dlq_count
+                  FROM outbound_messages AS message
+                 WHERE message.tenant_id=$1 AND message.binding_id=$2
+                   AND message.outbound_id=$3
+                """,
+                tenant_id,
+                binding_id,
+                outbound_id,
+            )
+            attempts = (
+                await connection.fetch(
+                    """
+                    SELECT attempt_number,status,provider_code,started_at,completed_at,
+                           total_count
+                      FROM (
+                          SELECT attempt_number,status,provider_code,started_at,completed_at,
+                                 count(*) OVER () AS total_count
+                            FROM delivery_attempts
+                           WHERE tenant_id=$1 AND outbound_id=$2
+                           ORDER BY attempt_number DESC
+                           LIMIT 100
+                      ) AS recent_attempts
+                     ORDER BY attempt_number
+                    """,
+                    tenant_id,
+                    outbound_id,
+                )
+                if outbound is not None
+                else []
+            )
+
+        response: dict[str, Any] = {
+            "schema_version": 1,
+            "tenant_id": tenant_id,
+            "binding_id": binding_id,
+            "requested_run_id_sha256": _acceptance_identifier_hash(
+                "run", tenant_id, binding_id, run_id
+            ),
+            "run_correlation": {
+                "availability": "unavailable",
+                "reason": "run_id_not_persisted_on_outbound_records",
+            },
+            "artifact": {
+                "availability": "unavailable",
+                "reason": "artifact_not_correlated_to_run_or_binding",
+            },
+        }
+        if outbound is None:
+            response["outbound"] = {"availability": "not_found"}
+            return response
+
+        provider_message_id = outbound["provider_message_id"]
+        attempt_count = int(attempts[0]["total_count"]) if attempts else 0
+        response["outbound"] = {
+            "availability": "available",
+            "outbound_id_sha256": _acceptance_identifier_hash(
+                "outbound", tenant_id, binding_id, str(outbound_id)
+            ),
+            "delivery_status": str(outbound["status"]),
+            "provider_message_id_sha256": (
+                _acceptance_identifier_hash(
+                    "provider-message",
+                    tenant_id,
+                    binding_id,
+                    str(provider_message_id),
+                )
+                if provider_message_id is not None
+                else None
+            ),
+            "attempt_count": attempt_count,
+            "attempts_truncated": attempt_count > len(attempts),
+            "attempts": [
+                {
+                    "attempt_number": int(attempt["attempt_number"]),
+                    "status": str(attempt["status"]),
+                    "provider_code": _safe_provider_code(attempt["provider_code"]),
+                    "started_at": _timestamp_json(attempt["started_at"]),
+                    "completed_at": _timestamp_json(attempt["completed_at"]),
+                }
+                for attempt in attempts
+            ],
+            "pending_count": int(outbound["pending_count"]),
+            "dlq_count": int(outbound["dlq_count"]),
+            "created_at": _timestamp_json(outbound["created_at"]),
+            "updated_at": _timestamp_json(outbound["updated_at"]),
+        }
+        return response
+
     async def replay_outbound(
         self,
         *,
@@ -606,6 +824,26 @@ def _record_json(row: Mapping[str, Any]) -> dict[str, Any]:
         else value
         for key, value in row.items()
     }
+
+
+def _project_record(row: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return _record_json({field: row[field] for field in fields})
+
+
+def _acceptance_identifier_hash(domain: str, *parts: str) -> str:
+    material = "\x00".join(("trpc-im-acceptance-evidence-v1", domain, *parts))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _safe_provider_code(value: object) -> str | None:
+    if value is None:
+        return None
+    rendered = str(value)
+    return rendered if rendered in _SAFE_PROVIDER_CODES else None
+
+
+def _timestamp_json(value: object) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
 
 
 def _encode_cursor(timestamp: datetime, audit_id: UUID) -> str:

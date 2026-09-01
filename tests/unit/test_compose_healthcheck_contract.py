@@ -16,6 +16,7 @@ _NON_HTTP_ROLES = (
     "post-turn-projector",
     "wecom-connector",
     "session-recovery",
+    "artifact-gc",
 )
 _LIGHTWEIGHT_PROBE = {
     role: ["CMD", "python", "-m", "trpc_service.probe", "--role", role] for role in _NON_HTTP_ROLES

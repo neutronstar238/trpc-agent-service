@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from argparse import Namespace
 from datetime import UTC, datetime, timedelta
@@ -12,9 +13,15 @@ import scripts.migration_full_acceptance as full_acceptance
 import trpc_service.storage.migration as migration_module
 from scripts.migration_full_acceptance import (
     _bounded_positive_int,
+    _bounded_timeout,
     _FailOnceAfterBatchTarget,
+    _live_failure,
+    _LiveProgress,
     _phase_evidence,
+    _PhaseAwareTarget,
+    _postgres_connection_initializer,
     _run,
+    _run_branch,
     execute_full_acceptance,
 )
 from trpc_service.storage.migration import (
@@ -178,6 +185,118 @@ def test_resume_probe_target_delegates_lease_binding() -> None:
     wrapped = _FailOnceAfterBatchTarget(target, fail_after=1)
     wrapped.bind_migration_lease(lease)
     assert target.bound == lease
+
+
+@pytest.mark.asyncio
+async def test_phase_aware_target_defers_enumeration_until_shadow_read() -> None:
+    class EnumeratingTarget(_Target):
+        async def list_records_page(
+            self,
+            tenant_id: str,
+            kind: str,
+            *,
+            cursor: str | None,
+            limit: int,
+        ) -> tuple[tuple[MigrationRecord, ...], str | None]:
+            del tenant_id, kind, cursor, limit
+            return (), None
+
+    target = EnumeratingTarget(_Control())
+    wrapped = _PhaseAwareTarget(target)
+    with pytest.raises(ValueError, match="deferred until SHADOW_READ"):
+        await wrapped.list_records_page(
+            "migration-acceptance-test", "session", cursor=None, limit=2
+        )
+
+    wrapped.set_enumeration_enabled(True)
+    assert await wrapped.list_records_page(
+        "migration-acceptance-test", "session", cursor=None, limit=2
+    ) == ((), None)
+
+
+@pytest.mark.asyncio
+async def test_manifest_bound_branch_uses_coordinator_snapshot_validation_once_per_phase() -> None:
+    source = _Source()
+    expected = _source_snapshot(source)
+
+    class EnumeratingTarget(_Target):
+        async def list_records_page(
+            self,
+            tenant_id: str,
+            kind: str,
+            *,
+            cursor: str | None,
+            limit: int,
+        ) -> tuple[tuple[MigrationRecord, ...], str | None]:
+            records = sorted(
+                (
+                    record
+                    for (record_tenant, record_kind, _), record in self.records.items()
+                    if record_tenant == tenant_id and record_kind == kind
+                ),
+                key=lambda record: record.resource_id,
+            )
+            start = int(cursor or 0)
+            page = tuple(records[start : start + limit])
+            end = start + len(page)
+            return page, str(end) if end < len(records) else None
+
+    class SnapshotSource(_Source):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshot_calls = 0
+
+        async def snapshot(self, _tenant_id: str) -> MigrationSourceSnapshot:
+            self.snapshot_calls += 1
+            return expected
+
+    manifest = MigrationScopeManifest(
+        tenant_id="migration-acceptance-test",
+        migration_id="migration-acceptance-branch",
+        source_kind="redis",
+        kinds=("session", "memory"),
+        source_snapshot_id=expected.source_snapshot_id,
+        source_count=expected.source_count,
+        source_checksum=expected.source_checksum,
+        app_id="migration-acceptance-app-test",
+        app_revision=1,
+        config_version=1,
+        binding_id="migration-acceptance-binding-test",
+        binding_revision=1,
+    )
+    snapshot_source = SnapshotSource()
+    control = _Control()
+    target = _PhaseAwareTarget(EnumeratingTarget(control))
+    result = await _run_branch(
+        snapshot_source,
+        target,
+        InMemoryMigrationCheckpointStore(),
+        control=control,
+        tenant_id=manifest.tenant_id,
+        migration_id=manifest.migration_id,
+        batch_size=2,
+        expected_records=5,
+        terminal=MigrationPhase.ROLLBACK,
+        resume_probe=False,
+        expected_source_snapshot=expected,
+        guard=None,
+        lease=None,
+        manifest=manifest,
+    )
+
+    assert result["phase_evidence"][MigrationPhase.VERIFY.value]["gate"] == "pass"
+    phase_evidence = result["phase_evidence"]
+    assert phase_evidence[MigrationPhase.PREPARE.value]["target_enumeration"] == (
+        "deferred_until_shadow_read"
+    )
+    assert phase_evidence[MigrationPhase.SHADOW_READ.value]["target_enumeration"] == ("independent")
+    assert phase_evidence[MigrationPhase.VERIFY.value]["target_enumeration"] == "independent"
+    assert phase_evidence[MigrationPhase.ROLLBACK.value]["target_enumeration"] == (
+        "deferred_until_shadow_read"
+    )
+    # The coordinator performs the two guarded checks around each of the
+    # seven phases.  The acceptance wrapper must not add another two checks.
+    assert snapshot_source.snapshot_calls == 14
 
 
 @pytest.mark.asyncio
@@ -657,10 +776,10 @@ async def test_full_acceptance_requires_current_release_binding_before_connectin
         "TRPC_MIGRATION_ID": "migration-acceptance-valid",
         "TRPC_MIGRATION_EXPECTED_RECORDS": "5",
         "TRPC_MIGRATION_CONTROL_FACTORY": "tests.unit.test_migration_full_acceptance:factory",
-            "TRPC_MIGRATION_APP_ID": "migration-acceptance-app-valid",
+        "TRPC_MIGRATION_APP_ID": "migration-acceptance-app-valid",
         "TRPC_MIGRATION_APP_REVISION": "1",
         "TRPC_MIGRATION_CONFIG_VERSION": "1",
-            "TRPC_MIGRATION_BINDING_ID": "migration-acceptance-binding-valid",
+        "TRPC_MIGRATION_BINDING_ID": "migration-acceptance-binding-valid",
         "TRPC_MIGRATION_BINDING_REVISION": "1",
     }
     for name, value in values.items():
@@ -699,6 +818,135 @@ def test_live_acceptance_limits_reject_non_finite_or_excessive_values() -> None:
         _bounded_positive_int("11", name="batch", maximum=10)
     with pytest.raises(ValueError, match="positive integer"):
         _bounded_positive_int(1.5, name="batch", maximum=10)
+
+
+def test_live_acceptance_timeout_limits_reject_non_finite_or_excessive_values() -> None:
+    with pytest.raises(ValueError, match="finite positive"):
+        _bounded_timeout("NaN", name="timeout", maximum=10.0)
+    with pytest.raises(ValueError, match="between 0 and 10"):
+        _bounded_timeout("11", name="timeout", maximum=10.0)
+    with pytest.raises(ValueError, match="between 0 and 10"):
+        _bounded_timeout(0, name="timeout", maximum=10.0)
+
+
+def test_live_failure_report_contains_only_secret_free_progress_labels(tmp_path: Path) -> None:
+    progress = _LiveProgress()
+    progress.started("verify", "target_enumeration")
+    progress.completed_operation("verify", "target_enumeration")
+    report = _live_failure(
+        tmp_path / "migration-failure.json",
+        "live migration acceptance timed out after 300 seconds",
+        progress=progress,
+    )
+
+    assert report["case_deltas"] == {
+        "last_phase": "verify",
+        "last_operation": "target_enumeration",
+        "last_completed_phase": "not_started",
+        "last_completed_operation": "target_enumeration",
+    }
+    assert "secret" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_postgres_initializer_sets_statement_and_lock_timeouts() -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+        async def execute(self, query: str, *args: Any) -> None:
+            self.calls.append((query, args))
+
+    connection = Connection()
+    await _postgres_connection_initializer(30.0)(connection)
+    assert len(connection.calls) == 1
+    query, args = connection.calls[0]
+    assert "statement_timeout" in query and "lock_timeout" in query
+    assert args == ("30000ms", "5000ms")
+
+
+@pytest.mark.asyncio
+async def test_full_acceptance_timeout_is_fail_closed_and_terminates_pool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    values = {
+        "TRPC_RUN_REAL_MIGRATION": "1",
+        "TRPC_MIGRATION_FULL_ACCEPTANCE": "1",
+        "TRPC_MIGRATION_SOURCE_REDIS_URL": "redis://source:6379/0",
+        "TRPC_MIGRATION_TARGET_DATABASE_DSN": "postgresql://trpc_runtime@target:5432/db",
+        "TRPC_MIGRATION_TENANT_ID": "migration-acceptance-timeout",
+        "TRPC_MIGRATION_ID": "migration-acceptance-timeout",
+        "TRPC_MIGRATION_EXPECTED_RECORDS": "2",
+        "TRPC_MIGRATION_CONTROL_FACTORY": "tests.fake:factory",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("TRPC_RELEASE_ID", "release-timeout-test")
+    monkeypatch.setenv("TRPC_RELEASE_NONCE", "n" * 32)
+
+    class Redis:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class Pool:
+        closed = False
+        terminated = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    redis = Redis()
+    pool = Pool()
+
+    class Source:
+        async def snapshot(self, tenant_id: str) -> MigrationSourceSnapshot:
+            del tenant_id
+            return MigrationSourceSnapshot(
+                source_snapshot_id="snapshot-timeout",
+                source_count=2,
+                source_checksum="a" * 64,
+            )
+
+    async def fake_create_pool(*args: Any, **kwargs: Any) -> Pool:
+        del args, kwargs
+        return pool
+
+    async def fake_acceptance(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        await asyncio.sleep(10)
+        return {}
+
+    monkeypatch.setattr(full_acceptance.redis_async, "from_url", lambda *args, **kwargs: redis)
+    monkeypatch.setattr(full_acceptance.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(full_acceptance, "RedisMigrationSource", lambda *args, **kwargs: Source())
+    monkeypatch.setattr(full_acceptance, "execute_full_acceptance", fake_acceptance)
+    monkeypatch.setattr(full_acceptance, "_load_control_factory", lambda _spec: object())
+
+    report = await _run(
+        Namespace(
+            output=tmp_path / "migration-timeout.json",
+            batch_size=1,
+            db_pool_size=2,
+            timeout_seconds=0.01,
+            db_command_timeout_seconds=1.0,
+        )
+    )
+    assert report["gate"] == "fail"
+    assert "timed out after 0.01 seconds" in report["rejection_reasons"][0]
+    assert report["case_deltas"] == {
+        "last_phase": "acceptance",
+        "last_operation": "execute_full_acceptance",
+        "last_completed_phase": "not_started",
+        "last_completed_operation": "manifest_source_snapshot",
+    }
+    assert redis.closed is True
+    assert pool.terminated is True
+    assert pool.closed is False
 
 
 def test_live_acceptance_report_replaces_atomically_and_rejects_nan(tmp_path: Path) -> None:

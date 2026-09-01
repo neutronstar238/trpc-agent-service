@@ -8,6 +8,12 @@ independent sessions, while the already-running dispatcher and workers drain
 the PostgreSQL outbox/Redis stream.  It is suitable for the yqzl systemd
 deployment and does not start, stop, scale, or kill any service.
 
+``--kubernetes`` (or ``TRPC_PERF_K8S_ENABLED=true``) switches the preflight
+identity path to read-only ``kubectl`` and the ``metrics.k8s.io`` API.  The
+namespace, context, candidate bindings, and memory threshold are explicit
+configuration; this path never asks Docker for container PIDs or reads the
+local process table for the worker services.
+
 No database or Redis operation is attempted unless ``--execute``,
 ``--confirm-real-load``, ``TRPC_RUN_REAL_MULTINODE=1``, and the exact
 ``TRPC_REAL_PERFORMANCE_CONFIRM=I_UNDERSTAND_REAL_LOAD`` value are supplied.
@@ -23,6 +29,7 @@ import asyncio
 import base64
 import ctypes
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -35,6 +42,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, TypeVar, cast, overload
 from urllib.parse import urlsplit
@@ -100,11 +108,19 @@ DEFAULT_RUN_CALLBACK_RATE = 105.0
 DEFAULT_CALLBACKS = 200
 DEFAULT_BURST_TURNS = 200
 PRODUCTION_MIN_WORKERS = 4
+# The Kubernetes production acceptance topology is intentionally fixed.  The
+# ConfigMap value is checked independently from the Pod count so a scaled or
+# misconfigured deployment cannot masquerade as the locked workload.
+PRODUCTION_WORKER_CONCURRENCY = 50
 DEFAULT_MIN_WORKERS = PRODUCTION_MIN_WORKERS
 DEFAULT_DB_POOL_SIZE = 32
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_P95_MS = 200.0
-DEFAULT_MAX_INFLIGHT = 32
+DEFAULT_MAX_INFLIGHT = 64
+# Kubernetes sustained acceptance must exercise the real HTTP route before
+# timed requests.  Keep this small and fixed so warmup remains evidence rather
+# than another tunable workload dimension.
+KUBERNETES_HTTP_WARMUP_REQUESTS = 16
 # Keep the producer's bounded ramp identical to the release validator.  The
 # final 200-turn burst is measured separately and must not be folded into the
 # warmup evidence.
@@ -158,6 +174,47 @@ _WORKER_RE = re.compile(r"(?:trpc-service|trpc_service).*serve\s+--role\s+worker
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$", re.IGNORECASE)
 IMAGE_SOURCE_FINGERPRINT_LABEL = "io.trpc.agent-service.source-fingerprint"
+KUBERNETES_ENABLED_ENV = "TRPC_PERF_K8S_ENABLED"
+KUBERNETES_NAMESPACE_ENV = "TRPC_PERF_K8S_NAMESPACE"
+KUBERNETES_CONTEXT_ENV = "TRPC_PERF_K8S_CONTEXT"
+KUBERNETES_KUBECONFIG_ENV = "TRPC_PERF_K8S_KUBECONFIG"
+KUBERNETES_IMAGE_DIGEST_ENV = "TRPC_PERF_K8S_IMAGE_DIGEST"
+KUBERNETES_SOURCE_FINGERPRINT_ENV = "TRPC_PERF_K8S_SOURCE_FINGERPRINT"
+KUBERNETES_MEMORY_LIMIT_ENV = "TRPC_PERF_K8S_MEMORY_LIMIT_BYTES"
+KUBERNETES_PREFLIGHT_EVIDENCE_ENV = "TRPC_PERF_K8S_PREFLIGHT_EVIDENCE"
+KUBERNETES_LOAD_JOB_ENV = "TRPC_PERF_K8S_LOAD_JOB"
+KUBERNETES_WORKER_SELECTOR = "app.kubernetes.io/component=worker"
+KUBERNETES_OUTBOX_SELECTOR = "app.kubernetes.io/component=outbox-dispatcher"
+KUBERNETES_METRICS_API = "metrics.k8s.io/v1beta1"
+KUBERNETES_PREFLIGHT_EVIDENCE_SCHEMA_VERSION = 1
+KUBERNETES_PREFLIGHT_MAX_BYTES = 2 * 1024 * 1024
+KUBERNETES_GATEWAY_SERVICE = "trpc-gateway"
+KUBERNETES_SERVICE_CONFIGMAP = "trpc-service-config"
+KUBERNETES_WORKER_CONCURRENCY_KEY = "TRPC_SERVICE_WORKER_CONCURRENCY"
+_KUBERNETES_NAMESPACE_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+_KUBERNETES_CONTEXT_RE = re.compile(r"^[^\x00\r\n\t ]{1,128}$")
+_KUBERNETES_IMAGE_ID_RE = re.compile(r"(?:^|@|://)(sha256:[0-9a-f]{64})$", re.IGNORECASE)
+_KUBERNETES_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+_KUBERNETES_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_KUBERNETES_QUANTITY_RE = re.compile(
+    r"^(?P<number>[+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"(?P<suffix>Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$"
+)
+_KUBERNETES_QUANTITY_FACTORS = {
+    "": Decimal(1),
+    "k": Decimal(1000),
+    "M": Decimal(1000**2),
+    "G": Decimal(1000**3),
+    "T": Decimal(1000**4),
+    "P": Decimal(1000**5),
+    "E": Decimal(1000**6),
+    "Ki": Decimal(1024),
+    "Mi": Decimal(1024**2),
+    "Gi": Decimal(1024**3),
+    "Ti": Decimal(1024**4),
+    "Pi": Decimal(1024**5),
+    "Ei": Decimal(1024**6),
+}
 
 
 def _source_fingerprint() -> dict[str, Any]:
@@ -411,6 +468,76 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--load-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--kubernetes-load-worker",
+        action="store_true",
+        default=os.getenv(KUBERNETES_LOAD_JOB_ENV, "").strip().lower() in {"1", "true", "yes"},
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--kubernetes",
+        dest="kubernetes",
+        action="store_true",
+        default=(
+            os.getenv(KUBERNETES_ENABLED_ENV, "").strip().lower() in {"1", "true", "yes"}
+            or os.getenv(KUBERNETES_LOAD_JOB_ENV, "").strip().lower() in {"1", "true", "yes"}
+        ),
+        help=(
+            "inspect worker and outbox-dispatcher Pods through kubectl/metrics API; "
+            "requires an explicit namespace and context"
+        ),
+    )
+    parser.add_argument(
+        "--kubernetes-namespace",
+        default=os.getenv(KUBERNETES_NAMESPACE_ENV),
+        help=f"Kubernetes namespace (or {KUBERNETES_NAMESPACE_ENV})",
+    )
+    parser.add_argument(
+        "--kubernetes-context",
+        default=os.getenv(KUBERNETES_CONTEXT_ENV),
+        help=f"Kubernetes context (or {KUBERNETES_CONTEXT_ENV})",
+    )
+    parser.add_argument(
+        "--kubernetes-kubeconfig",
+        default=os.getenv(KUBERNETES_KUBECONFIG_ENV),
+        help=f"dedicated kubeconfig (or {KUBERNETES_KUBECONFIG_ENV})",
+    )
+    parser.add_argument(
+        "--kubernetes-image-digest",
+        default=os.getenv(KUBERNETES_IMAGE_DIGEST_ENV),
+        help=(
+            f"expected immutable worker image digest; may also use {KUBERNETES_IMAGE_DIGEST_ENV}"
+        ),
+    )
+    parser.add_argument(
+        "--kubernetes-source-fingerprint",
+        default=os.getenv(KUBERNETES_SOURCE_FINGERPRINT_ENV),
+        help=(
+            "expected candidate source fingerprint; may also use "
+            f"{KUBERNETES_SOURCE_FINGERPRINT_ENV}"
+        ),
+    )
+    parser.add_argument(
+        "--kubernetes-memory-limit-bytes",
+        type=int,
+        default=(
+            int(os.getenv(KUBERNETES_MEMORY_LIMIT_ENV, "0"))
+            if os.getenv(KUBERNETES_MEMORY_LIMIT_ENV, "").strip().isdigit()
+            else None
+        ),
+        help=(
+            "optional aggregate memory safety threshold for Kubernetes metrics; "
+            f"may also use {KUBERNETES_MEMORY_LIMIT_ENV}"
+        ),
+    )
+    parser.add_argument(
+        "--kubernetes-preflight-evidence",
+        default=os.getenv(KUBERNETES_PREFLIGHT_EVIDENCE_ENV),
+        help=(
+            "parent-attested Kubernetes preflight JSON for a supervised in-cluster load Job; "
+            f"may also use {KUBERNETES_PREFLIGHT_EVIDENCE_ENV}"
+        ),
+    )
     parser.add_argument(
         "--callbacks",
         type=int,
@@ -755,10 +882,7 @@ def _worker_image_attestation(
         label = worker.get("source_fingerprint")
         if not isinstance(container_id, str) or not container_id.strip():
             missing_fields.add("container_id")
-        if (
-            not isinstance(image_id, str)
-            or _IMAGE_DIGEST_RE.fullmatch(image_id) is None
-        ):
+        if not isinstance(image_id, str) or _IMAGE_DIGEST_RE.fullmatch(image_id) is None:
             missing_fields.add("image_id")
         else:
             image_ids.add(image_id)
@@ -850,8 +974,1008 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _kubernetes_mode(args: argparse.Namespace | None = None) -> bool:
+    """Return whether the explicitly requested Kubernetes evidence path is active."""
+
+    if args is not None and bool(getattr(args, "kubernetes", False)):
+        return True
+    return any(
+        os.getenv(name, "").strip().lower() in {"1", "true", "yes"}
+        for name in (KUBERNETES_ENABLED_ENV, KUBERNETES_LOAD_JOB_ENV)
+    )
+
+
+def _kubernetes_configuration(args: argparse.Namespace | None = None) -> dict[str, Any]:
+    """Validate the read-only Kubernetes inspection configuration.
+
+    A Kubernetes performance run must name its namespace and context.  The
+    kubeconfig may be supplied through the dedicated performance variable or
+    the standard ``KUBECONFIG`` variable used by the operator.  No implicit
+    Docker or host-process discovery is allowed on this path.
+    """
+
+    def value(name: str, fallback: str | None = None) -> str:
+        raw = getattr(args, name, None) if args is not None else None
+        if raw is None:
+            return (fallback or "").strip()
+        return str(raw).strip()
+
+    namespace = value("kubernetes_namespace", os.getenv(KUBERNETES_NAMESPACE_ENV))
+    context = value("kubernetes_context", os.getenv(KUBERNETES_CONTEXT_ENV))
+    kubeconfig = value(
+        "kubernetes_kubeconfig",
+        os.getenv(KUBERNETES_KUBECONFIG_ENV) or os.getenv("KUBECONFIG"),
+    )
+    expected_image = value(
+        "kubernetes_image_digest",
+        os.getenv(KUBERNETES_IMAGE_DIGEST_ENV) or os.getenv("TRPC_REAL_IMAGE_DIGEST"),
+    ).lower()
+    expected_source = value(
+        "kubernetes_source_fingerprint",
+        os.getenv(KUBERNETES_SOURCE_FINGERPRINT_ENV),
+    ).lower()
+    memory_limit_raw = getattr(args, "kubernetes_memory_limit_bytes", None) if args else None
+    if memory_limit_raw is None:
+        memory_limit_raw = os.getenv(KUBERNETES_MEMORY_LIMIT_ENV)
+    memory_limit: int | None = None
+    if memory_limit_raw not in (None, ""):
+        try:
+            memory_limit = int(str(memory_limit_raw))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Kubernetes memory limit must be an integer") from error
+        if memory_limit <= 0 or memory_limit >= 2**60:
+            raise ValueError("Kubernetes memory limit must be within (0, 2**60)")
+
+    if _KUBERNETES_NAMESPACE_RE.fullmatch(namespace) is None:
+        raise ValueError("Kubernetes performance namespace is invalid or missing")
+    if _KUBERNETES_CONTEXT_RE.fullmatch(context) is None:
+        raise ValueError("Kubernetes performance context is invalid or missing")
+    if kubeconfig and (len(kubeconfig) > 4096 or any(char in kubeconfig for char in "\x00\r\n")):
+        raise ValueError("Kubernetes performance kubeconfig path is invalid")
+    if expected_image and _IMAGE_DIGEST_RE.fullmatch(expected_image) is None:
+        raise ValueError("Kubernetes expected image must be a sha256 digest")
+    if expected_source and _KUBERNETES_FINGERPRINT_RE.fullmatch(expected_source) is None:
+        raise ValueError("Kubernetes expected source fingerprint is invalid")
+    return {
+        "namespace": namespace,
+        "context": context,
+        "kubeconfig": kubeconfig,
+        "expected_image_digest": expected_image or None,
+        "expected_source_fingerprint": expected_source or None,
+        "memory_limit_bytes": memory_limit,
+    }
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize evidence deterministically before hashing or signing it."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Kubernetes preflight evidence is not canonical JSON") from error
+
+
+def _strict_json_object(value: str) -> dict[str, Any]:
+    """Parse one JSON object while rejecting duplicate keys and non-finite values."""
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON value: {token}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Kubernetes preflight evidence is invalid JSON") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("Kubernetes preflight evidence must be a JSON object")
+    return parsed
+
+
+def _validate_preflight_attestation(
+    preflight: Mapping[str, Any],
+    *,
+    source_fingerprint: str,
+    image_digest: str,
+) -> None:
+    """Check the service identity claims carried by a parent preflight."""
+
+    if preflight.get("status") != "pass":
+        raise ValueError("Kubernetes preflight status is not pass")
+    if preflight.get("worker_count") != PRODUCTION_MIN_WORKERS:
+        raise ValueError(f"Kubernetes preflight worker_count must equal {PRODUCTION_MIN_WORKERS}")
+    if preflight.get("worker_concurrency") != PRODUCTION_WORKER_CONCURRENCY:
+        raise ValueError(
+            f"Kubernetes preflight worker_concurrency must equal {PRODUCTION_WORKER_CONCURRENCY}"
+        )
+    kubernetes = preflight.get("kubernetes")
+    if (
+        not isinstance(kubernetes, Mapping)
+        or not isinstance(kubernetes.get("namespace"), str)
+        or _KUBERNETES_NAMESPACE_RE.fullmatch(kubernetes["namespace"]) is None
+        or kubernetes.get("namespace_bound") is not True
+    ):
+        raise ValueError("Kubernetes preflight namespace binding is invalid")
+    source = preflight.get("source_fingerprint")
+    if not isinstance(source, Mapping) or source.get("value") != source_fingerprint:
+        raise ValueError("Kubernetes preflight source fingerprint is not bound")
+    worker_attestation = preflight.get("worker_image_attestation")
+    if (
+        not isinstance(worker_attestation, Mapping)
+        or worker_attestation.get("status") != "pass"
+        or worker_attestation.get("source_fingerprint") != source_fingerprint
+        or worker_attestation.get("image_id") != image_digest
+    ):
+        raise ValueError("Kubernetes worker image attestation is not bound")
+    service_attestation = preflight.get("service_image_attestation")
+    if not isinstance(service_attestation, Mapping):
+        raise ValueError("Kubernetes service image attestation is missing")
+    outbox_attestation = service_attestation.get("outbox-dispatcher")
+    if (
+        not isinstance(outbox_attestation, Mapping)
+        or outbox_attestation.get("status") != "pass"
+        or outbox_attestation.get("source_fingerprint") != source_fingerprint
+        or outbox_attestation.get("image_id") != image_digest
+    ):
+        raise ValueError("Kubernetes outbox image attestation is not bound")
+
+
+def build_kubernetes_preflight_evidence(
+    preflight: Mapping[str, Any],
+    *,
+    run_id: str,
+    run_token: str,
+    source_fingerprint: str,
+    image_digest: str,
+) -> dict[str, Any]:
+    """Build the signed evidence envelope consumed by an in-cluster load Job.
+
+    The parent gate is responsible for obtaining and validating ``preflight``.
+    The Job receives this envelope through a bounded file and receives the
+    unshared ``run_token`` through a Secret-backed environment variable.  The
+    token is never serialized into the envelope or the report.
+    """
+
+    if _KUBERNETES_RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError("Kubernetes performance run ID is invalid")
+    if (
+        not run_token
+        or len(run_token) > 4096
+        or any(ord(char) < 32 or ord(char) == 127 for char in run_token)
+    ):
+        raise ValueError("Kubernetes performance run token is invalid")
+    source_value = source_fingerprint.strip().lower()
+    image_value = image_digest.strip().lower()
+    if _KUBERNETES_FINGERPRINT_RE.fullmatch(source_value) is None:
+        raise ValueError("Kubernetes performance source fingerprint is invalid")
+    if _IMAGE_DIGEST_RE.fullmatch(image_value) is None:
+        raise ValueError("Kubernetes performance image digest is invalid")
+    _validate_preflight_attestation(
+        preflight,
+        source_fingerprint=source_value,
+        image_digest=image_value,
+    )
+    preflight_value = dict(preflight)
+    unsigned: dict[str, Any] = {
+        "schema_version": KUBERNETES_PREFLIGHT_EVIDENCE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "source_fingerprint": source_value,
+        "image_digest": image_value,
+        "preflight": preflight_value,
+        "preflight_sha256": hashlib.sha256(
+            _canonical_json(preflight_value).encode("utf-8")
+        ).hexdigest(),
+        "token_sha256": hashlib.sha256(run_token.encode("utf-8")).hexdigest(),
+    }
+    signature = hmac.new(
+        run_token.encode("utf-8"),
+        _canonical_json(unsigned).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {**unsigned, "signature": signature}
+
+
+def _load_kubernetes_preflight_evidence(args: argparse.Namespace) -> dict[str, Any]:
+    """Load and verify parent-attested preflight evidence without using kubectl."""
+
+    if not bool(getattr(args, "kubernetes", False)):
+        raise ValueError("Kubernetes load worker requires --kubernetes")
+    path_value = getattr(args, "kubernetes_preflight_evidence", None)
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError("Kubernetes parent preflight evidence path is missing")
+    path = Path(path_value)
+    if path.is_symlink():
+        raise ValueError("Kubernetes parent preflight evidence must not be a symlink")
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ValueError("Kubernetes parent preflight evidence could not be read") from error
+    if len(raw) > KUBERNETES_PREFLIGHT_MAX_BYTES:
+        raise ValueError("Kubernetes parent preflight evidence exceeds the size limit")
+    try:
+        envelope = _strict_json_object(raw.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError("Kubernetes parent preflight evidence is not UTF-8") from error
+    expected_keys = {
+        "schema_version",
+        "run_id",
+        "source_fingerprint",
+        "image_digest",
+        "preflight",
+        "preflight_sha256",
+        "token_sha256",
+        "signature",
+    }
+    if set(envelope) != expected_keys:
+        raise ValueError("Kubernetes parent preflight evidence fields are invalid")
+    if envelope.get("schema_version") != KUBERNETES_PREFLIGHT_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("Kubernetes parent preflight evidence schema is unsupported")
+    run_id = os.getenv("TRPC_REAL_RUN_ID", "").strip()
+    if _KUBERNETES_RUN_ID_RE.fullmatch(run_id) is None or envelope.get("run_id") != run_id:
+        raise ValueError("Kubernetes parent preflight run ID does not match the Job")
+    token = os.getenv(WORKER_TOKEN_ENV, "")
+    if not token:
+        raise ValueError("Kubernetes parent preflight worker token is missing")
+    config = _kubernetes_configuration(args)
+    expected_source = config.get("expected_source_fingerprint")
+    expected_image = config.get("expected_image_digest")
+    if not isinstance(expected_source, str) or not isinstance(expected_image, str):
+        raise ValueError("Kubernetes parent preflight requires expected source and image")
+    source_value = expected_source.lower()
+    image_value = expected_image.lower()
+    if (
+        envelope.get("source_fingerprint") != source_value
+        or envelope.get("image_digest") != image_value
+    ):
+        raise ValueError("Kubernetes parent preflight source or image binding mismatches")
+    if envelope.get("token_sha256") != hashlib.sha256(token.encode("utf-8")).hexdigest():
+        raise ValueError("Kubernetes parent preflight token binding mismatches")
+    unsigned = {key: envelope[key] for key in expected_keys if key != "signature"}
+    expected_signature = hmac.new(
+        token.encode("utf-8"),
+        _canonical_json(unsigned).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    signature = envelope.get("signature")
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected_signature):
+        raise ValueError("Kubernetes parent preflight signature is invalid")
+    preflight = envelope.get("preflight")
+    if not isinstance(preflight, Mapping):
+        raise ValueError("Kubernetes parent preflight payload is invalid")
+    preflight_hash = hashlib.sha256(_canonical_json(preflight).encode("utf-8")).hexdigest()
+    if envelope.get("preflight_sha256") != preflight_hash:
+        raise ValueError("Kubernetes parent preflight payload hash mismatches")
+    _validate_preflight_attestation(
+        preflight,
+        source_fingerprint=source_value,
+        image_digest=image_value,
+    )
+    kubernetes = preflight.get("kubernetes")
+    if (
+        not isinstance(kubernetes, Mapping)
+        or kubernetes.get("namespace") != config.get("namespace")
+        or kubernetes.get("namespace_bound") is not True
+    ):
+        raise ValueError("Kubernetes parent preflight namespace binding is invalid")
+    verified = dict(preflight)
+    verified["kubernetes"] = {
+        **dict(kubernetes),
+        "preflight_evidence": {
+            "status": "parent_attested",
+            "schema_version": KUBERNETES_PREFLIGHT_EVIDENCE_SCHEMA_VERSION,
+            "run_id": run_id,
+            "preflight_sha256": preflight_hash,
+            "source_fingerprint": source_value,
+            "image_digest": image_value,
+        },
+    }
+    return verified
+
+
+def _preflight_for_execution(args: argparse.Namespace) -> dict[str, Any]:
+    """Choose local kubectl preflight or the signed Job handoff."""
+
+    if bool(getattr(args, "kubernetes_load_worker", False)):
+        if not bool(getattr(args, "load_worker", False)):
+            raise ValueError("Kubernetes load-worker handoff requires --load-worker")
+        return _load_kubernetes_preflight_evidence(args)
+    return _preflight(args)
+
+
+def _kubernetes_kubectl(
+    arguments: Sequence[str],
+    configuration: Mapping[str, Any],
+    *,
+    timeout_seconds: float = 20.0,
+) -> tuple[str, str]:
+    """Run one bounded, read-only kubectl request and return status/stdout."""
+
+    executable = shutil.which("kubectl")
+    if executable is None:
+        return "not_run", "kubectl is not installed"
+    command = [executable]
+    kubeconfig = configuration.get("kubeconfig")
+    if isinstance(kubeconfig, str) and kubeconfig:
+        command.extend(["--kubeconfig", kubeconfig])
+    context = configuration.get("context")
+    if not isinstance(context, str) or not context:
+        return "not_run", "Kubernetes context is missing"
+    command.extend(["--context", context])
+    command.extend(str(argument) for argument in arguments)
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed kubectl executable and argv
+            command,
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return "not_run", "kubectl request timed out"
+    except OSError:
+        return "not_run", "kubectl request could not start"
+    if completed.returncode != 0:
+        return "not_run", "kubectl request failed"
+    return "pass", completed.stdout
+
+
+def _kubernetes_json(
+    arguments: Sequence[str],
+    configuration: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    status, output = _kubernetes_kubectl(arguments, configuration)
+    if status != "pass":
+        return None, output
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "kubectl returned invalid JSON"
+    if not isinstance(payload, dict):
+        return None, "kubectl returned a non-object JSON payload"
+    return payload, None
+
+
+def _kubernetes_image_digest(value: Any) -> str | None:
+    """Extract an immutable digest from the CRI ``imageID`` representation."""
+
+    if not isinstance(value, str):
+        return None
+    match = _KUBERNETES_IMAGE_ID_RE.search(value.strip())
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def _kubernetes_quantity_bytes(value: Any) -> int | None:
+    """Parse a bounded Kubernetes resource quantity into bytes."""
+
+    if not isinstance(value, str):
+        return None
+    match = _KUBERNETES_QUANTITY_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    try:
+        numeric = Decimal(match.group("number"))
+        factor = _KUBERNETES_QUANTITY_FACTORS[match.group("suffix") or ""]
+        result = int(numeric * factor)
+    except (InvalidOperation, KeyError, ValueError, OverflowError):
+        return None
+    if result <= 0 or result >= 2**60:
+        return None
+    return result
+
+
+def _kubernetes_pod_records(
+    configuration: Mapping[str, Any],
+    *,
+    role: str,
+    selector: str,
+) -> tuple[tuple[dict[str, Any], ...], str | None]:
+    """Read ready role Pods and their immutable runtime identities."""
+
+    namespace = configuration.get("namespace")
+    if not isinstance(namespace, str):
+        return (), "Kubernetes namespace is unavailable"
+    payload, error = _kubernetes_json(
+        [
+            "get",
+            "pods",
+            "--namespace",
+            namespace,
+            "--selector",
+            selector,
+            "--output",
+            "json",
+        ],
+        configuration,
+    )
+    if error is not None or payload is None:
+        return (), error or "Kubernetes Pod inventory is unavailable"
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return (), "Kubernetes Pod inventory is invalid"
+    records: list[dict[str, Any]] = []
+    seen_pods: set[str] = set()
+    container_name = role
+    for raw_pod in raw_items:
+        if not isinstance(raw_pod, Mapping):
+            return (), "Kubernetes Pod inventory contains an invalid item"
+        metadata = raw_pod.get("metadata")
+        spec = raw_pod.get("spec")
+        status = raw_pod.get("status")
+        if not isinstance(metadata, Mapping) or not isinstance(spec, Mapping):
+            return (), "Kubernetes Pod identity is incomplete"
+        pod_name = metadata.get("name")
+        pod_uid = metadata.get("uid")
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or not isinstance(pod_uid, str)
+            or not pod_uid
+            or pod_name in seen_pods
+        ):
+            return (), "Kubernetes Pod identity is missing or duplicated"
+        seen_pods.add(pod_name)
+        if not isinstance(status, Mapping) or status.get("phase") != "Running":
+            return (), f"Kubernetes {role} Pod is not running"
+        raw_statuses = status.get("containerStatuses")
+        raw_containers = spec.get("containers")
+        if not isinstance(raw_statuses, list) or not isinstance(raw_containers, list):
+            return (), f"Kubernetes {role} Pod container status is incomplete"
+        container_status = next(
+            (
+                item
+                for item in raw_statuses
+                if isinstance(item, Mapping) and item.get("name") == container_name
+            ),
+            None,
+        )
+        container_spec = next(
+            (
+                item
+                for item in raw_containers
+                if isinstance(item, Mapping) and item.get("name") == container_name
+            ),
+            None,
+        )
+        if not isinstance(container_status, Mapping) or not isinstance(container_spec, Mapping):
+            return (), f"Kubernetes {role} Pod container is missing"
+        if container_status.get("ready") is not True:
+            return (), f"Kubernetes {role} Pod container is not ready"
+        container_state = container_status.get("state")
+        if not isinstance(container_state, Mapping) or not isinstance(
+            container_state.get("running"), Mapping
+        ):
+            return (), f"Kubernetes {role} Pod container is not running"
+        image_digest = _kubernetes_image_digest(container_status.get("imageID"))
+        container_id = container_status.get("containerID")
+        if not isinstance(container_id, str) or not container_id.strip():
+            return (), f"Kubernetes {role} Pod container ID is missing"
+        if image_digest is None:
+            return (), f"Kubernetes {role} Pod imageID is not an immutable digest"
+        resources = container_spec.get("resources")
+        limits = resources.get("limits") if isinstance(resources, Mapping) else None
+        memory_limit = (
+            _kubernetes_quantity_bytes(limits.get("memory"))
+            if isinstance(limits, Mapping)
+            else None
+        )
+        labels = metadata.get("labels")
+        source_value = (
+            labels.get(IMAGE_SOURCE_FINGERPRINT_LABEL) if isinstance(labels, Mapping) else None
+        )
+        if not isinstance(source_value, str):
+            source_value = None
+        source_value = source_value.lower() if source_value else None
+        node_name = spec.get("nodeName")
+        if not isinstance(node_name, str) or not node_name:
+            return (), f"Kubernetes {role} Pod node identity is missing"
+        records.append(
+            {
+                "role": role,
+                "pod_name": pod_name,
+                "pod_uid": pod_uid,
+                "container_name": container_name,
+                "container_id": container_id,
+                "image_id": image_digest,
+                "image_digest": image_digest,
+                "source_fingerprint": source_value,
+                "node_name": node_name,
+                "process_count": 1,
+                "memory_limit_bytes": memory_limit,
+                "ready": True,
+            }
+        )
+    return tuple(records), None
+
+
+def _kubernetes_worker_concurrency(
+    configuration: Mapping[str, Any],
+) -> tuple[int | None, str | None]:
+    """Read the locked worker concurrency from the service ConfigMap."""
+
+    namespace = configuration.get("namespace")
+    if not isinstance(namespace, str):
+        return None, "Kubernetes namespace is unavailable for worker ConfigMap lookup"
+    payload, error = _kubernetes_json(
+        [
+            "get",
+            f"configmap/{KUBERNETES_SERVICE_CONFIGMAP}",
+            "--namespace",
+            namespace,
+            "--output",
+            "json",
+        ],
+        configuration,
+    )
+    if error is not None or payload is None:
+        return None, error or "Kubernetes worker concurrency ConfigMap is unavailable"
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None, "Kubernetes worker concurrency ConfigMap data is missing"
+    raw_value = data.get(KUBERNETES_WORKER_CONCURRENCY_KEY)
+    observed: int | None = None
+    if isinstance(raw_value, str):
+        try:
+            observed = int(raw_value.strip(), 10)
+        except ValueError:
+            pass
+    if raw_value != str(PRODUCTION_WORKER_CONCURRENCY):
+        return observed, (
+            "Kubernetes TRPC_SERVICE_WORKER_CONCURRENCY must equal exactly "
+            f"{PRODUCTION_WORKER_CONCURRENCY}"
+        )
+    return PRODUCTION_WORKER_CONCURRENCY, None
+
+
+def _kubernetes_image_attestation(
+    workers: Sequence[Mapping[str, Any]],
+    *,
+    expected_source: str | None,
+    expected_image: str | None,
+    role: str = "worker",
+) -> dict[str, Any]:
+    """Require one immutable role image and an explicit source binding."""
+
+    if not workers:
+        return {"status": "not_run", "reason": f"no Kubernetes {role} Pods were available"}
+    image_ids: set[str] = set()
+    source_values: set[str] = set()
+    for worker in workers:
+        image_id = _kubernetes_image_digest(worker.get("image_id"))
+        if image_id is None:
+            return {"status": "not_run", "reason": f"Kubernetes {role} imageID is invalid"}
+        image_ids.add(image_id)
+        source_value = worker.get("source_fingerprint")
+        if isinstance(source_value, str) and _KUBERNETES_FINGERPRINT_RE.fullmatch(source_value):
+            source_values.add(source_value)
+        elif source_value not in (None, ""):
+            return {
+                "status": "not_run",
+                "reason": f"Kubernetes {role} source fingerprint is invalid",
+            }
+    if len(image_ids) != 1:
+        return {
+            "status": "not_run",
+            "reason": f"Kubernetes {role} Pods use mixed immutable image digests",
+            "image_count": len(image_ids),
+        }
+    image_id = next(iter(image_ids))
+    if expected_image is not None and image_id != expected_image.lower():
+        return {
+            "status": "not_run",
+            "reason": f"Kubernetes {role} image digest does not match candidate",
+        }
+    if expected_source is None:
+        if len(source_values) != 1:
+            return {
+                "status": "not_run",
+                "reason": f"Kubernetes {role} source fingerprint binding is unavailable",
+            }
+        expected_source = next(iter(source_values))
+        binding_method = "pod_label"
+    else:
+        if source_values and source_values != {expected_source}:
+            return {
+                "status": "not_run",
+                "reason": f"Kubernetes {role} source fingerprint label is stale or mixed",
+            }
+        binding_method = "configured_candidate"
+    return {
+        "status": "pass",
+        "worker_count": len(workers),
+        "independent_process_count": len(workers),
+        "image_count": 1,
+        "image_id": image_id,
+        "source_fingerprint": expected_source,
+        "source_fingerprint_matches": True,
+        "binding_method": binding_method,
+    }
+
+
+def _kubernetes_metrics_memory_observation(
+    participating: Mapping[str, Sequence[Mapping[str, Any]]],
+    metrics_payload: Mapping[str, Any],
+    *,
+    configured_limit_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Convert PodMetrics API samples into complete role-bound evidence."""
+
+    raw_items = metrics_payload.get("items")
+    if not isinstance(raw_items, list):
+        return {
+            "status": "not_run",
+            "reason": "Kubernetes metrics API returned no Pod metrics list",
+            "required_roles": list(_SERVICE_ROLES),
+            "coverage_complete": False,
+        }
+    metrics_by_pod: dict[str, Mapping[str, Any]] = {}
+    duplicate_metrics = False
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        metadata = raw_item.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, Mapping) else None
+        if isinstance(name, str) and name:
+            if name in metrics_by_pod:
+                duplicate_metrics = True
+            else:
+                metrics_by_pod[name] = raw_item
+    if duplicate_metrics:
+        return {
+            "status": "not_run",
+            "reason": "Kubernetes metrics API returned duplicate Pod identities",
+            "required_roles": list(_SERVICE_ROLES),
+            "coverage_complete": False,
+        }
+    records: list[dict[str, Any]] = []
+    role_observations: dict[str, Any] = {}
+    all_observed = True
+    sample_windows: list[float] = []
+    sample_timestamps: set[str] = set()
+    for role in _SERVICE_ROLES:
+        identities = participating.get(role, ())
+        role_records: list[dict[str, Any]] = []
+        for identity in identities:
+            pod_name = identity.get("pod_name")
+            container_name = identity.get("container_name")
+            pod_metrics = metrics_by_pod.get(pod_name) if isinstance(pod_name, str) else None
+            raw_containers = pod_metrics.get("containers") if pod_metrics else None
+            metric_container = next(
+                (
+                    item
+                    for item in raw_containers or ()
+                    if isinstance(item, Mapping) and item.get("name") == container_name
+                ),
+                None,
+            )
+            usage = metric_container.get("usage") if isinstance(metric_container, Mapping) else None
+            memory_bytes = (
+                _kubernetes_quantity_bytes(usage.get("memory"))
+                if isinstance(usage, Mapping)
+                else None
+            )
+            if memory_bytes is None:
+                all_observed = False
+            window = pod_metrics.get("window") if isinstance(pod_metrics, Mapping) else None
+            window_seconds = (
+                _kubernetes_duration_seconds(window) if isinstance(window, str) else None
+            )
+            if window_seconds is None:
+                all_observed = False
+            else:
+                sample_windows.append(window_seconds)
+            timestamp = pod_metrics.get("timestamp") if isinstance(pod_metrics, Mapping) else None
+            if isinstance(timestamp, str) and timestamp:
+                sample_timestamps.add(timestamp)
+            else:
+                all_observed = False
+            record = {
+                "role": role,
+                "pod_name": pod_name,
+                "pod_uid": identity.get("pod_uid"),
+                "container_name": container_name,
+                "container_id": identity.get("container_id"),
+                "memory_bytes": memory_bytes,
+                "sampled_memory_bytes": memory_bytes,
+                "memory_limit_bytes": identity.get("memory_limit_bytes"),
+                "sampling_source": "kubernetes_metrics_api",
+                "metrics_timestamp": timestamp,
+                "metrics_window": window,
+            }
+            role_records.append(record)
+            records.append(record)
+        if not identities or len(role_records) != len(identities):
+            all_observed = False
+        role_observations[role] = {
+            "identity_count": len(identities),
+            "observed_count": len(role_records)
+            if all_observed
+            else sum(1 for item in role_records if isinstance(item.get("memory_bytes"), int)),
+            "observations": role_records,
+        }
+    observed_count = sum(1 for item in records if isinstance(item.get("memory_bytes"), int))
+    limits = [item.get("memory_limit_bytes") for item in records]
+    threshold: int | None
+    if configured_limit_bytes is not None:
+        threshold = configured_limit_bytes
+    elif all(isinstance(value, int) and value > 0 for value in limits):
+        threshold = sum(cast(int, value) for value in limits)
+    else:
+        threshold = None
+    sampled_bytes = sum(
+        cast(int, item["memory_bytes"])
+        for item in records
+        if isinstance(item.get("memory_bytes"), int)
+    )
+    within_limit = threshold is not None and sampled_bytes <= threshold
+    status = "pass" if all_observed and within_limit else "not_run"
+    if all_observed and threshold is not None and not within_limit:
+        status = "fail"
+    reason = None
+    if not all_observed:
+        reason = "Kubernetes metrics API lacks memory coverage for every role Pod"
+    elif threshold is None:
+        reason = "Kubernetes memory safety threshold is unavailable"
+    elif not within_limit:
+        reason = "Kubernetes sampled memory exceeds the safety threshold"
+    return {
+        "status": status,
+        "sampling_method": "kubernetes_metrics_api",
+        "metrics_api": KUBERNETES_METRICS_API,
+        "sample_count": 1,
+        "sampling_interval_seconds": max(sample_windows or [MEMORY_SAMPLE_INTERVAL_SECONDS]),
+        "sample_timestamps": sorted(sample_timestamps),
+        "required_roles": list(_SERVICE_ROLES),
+        "role_observations": role_observations,
+        "coverage_complete": all_observed,
+        "observed_identity_count": observed_count,
+        "sampled_memory_bytes": sampled_bytes if sampled_bytes > 0 else None,
+        "peak_bytes": sampled_bytes if sampled_bytes > 0 else None,
+        "safety_threshold_bytes": threshold,
+        "threshold_source": (
+            "configured" if configured_limit_bytes is not None else "pod_resource_limits"
+        ),
+        "within_safety_threshold": within_limit,
+        "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def _kubernetes_duration_seconds(value: str) -> float | None:
+    match = re.fullmatch(r"(?P<number>\d+(?:\.\d+)?)(?P<unit>s|m|h)$", value.strip())
+    if match is None:
+        return None
+    try:
+        number = float(match.group("number"))
+    except ValueError:
+        return None
+    factor = {"s": 1.0, "m": 60.0, "h": 3600.0}[match.group("unit")]
+    result = number * factor
+    return result if math.isfinite(result) and result > 0 else None
+
+
+def _kubernetes_preflight(
+    args: argparse.Namespace,
+    *,
+    min_workers: int,
+) -> dict[str, Any]:
+    """Collect all Kubernetes evidence before a live load can start."""
+
+    try:
+        configuration = _kubernetes_configuration(args)
+    except ValueError as error:
+        return {"status": "not_run", "reason": str(error)}
+    worker_concurrency, concurrency_error = _kubernetes_worker_concurrency(configuration)
+    if concurrency_error is not None:
+        return {
+            "status": "not_run",
+            "reason": concurrency_error,
+            "worker_concurrency": worker_concurrency,
+            "kubernetes": configuration,
+        }
+    workers, worker_error = _kubernetes_pod_records(
+        configuration,
+        role="worker",
+        selector=KUBERNETES_WORKER_SELECTOR,
+    )
+    if worker_error is not None:
+        return {"status": "not_run", "reason": worker_error, "kubernetes": configuration}
+    outbox, outbox_error = _kubernetes_pod_records(
+        configuration,
+        role="outbox-dispatcher",
+        selector=KUBERNETES_OUTBOX_SELECTOR,
+    )
+    if outbox_error is not None:
+        return {"status": "not_run", "reason": outbox_error, "kubernetes": configuration}
+    if len(workers) != PRODUCTION_MIN_WORKERS or len(workers) < min_workers:
+        return {
+            "status": "not_run",
+            "reason": (
+                "Kubernetes formal performance preflight requires exactly "
+                f"{PRODUCTION_MIN_WORKERS} ready worker Pods, found {len(workers)}"
+            ),
+            "worker_processes": workers,
+            "worker_count": len(workers),
+            "worker_concurrency": worker_concurrency,
+            "kubernetes": configuration,
+        }
+    if not outbox:
+        return {
+            "status": "not_run",
+            "reason": "at least one ready Kubernetes outbox-dispatcher Pod is required",
+            "worker_processes": workers,
+            "kubernetes": configuration,
+        }
+    configured_source = configuration.get("expected_source_fingerprint")
+    expected_image = cast(str | None, configuration.get("expected_image_digest"))
+    current_source = _source_fingerprint()
+    candidate_source = current_source.get("value")
+    if configured_source is not None:
+        if not isinstance(candidate_source, str) or candidate_source != configured_source:
+            return {
+                "status": "not_run",
+                "reason": "configured Kubernetes source fingerprint does not match checkout",
+                "worker_processes": workers,
+                "kubernetes": configuration,
+            }
+        expected_source = configured_source
+    elif (
+        expected_image is not None
+        and isinstance(candidate_source, str)
+        and _KUBERNETES_FINGERPRINT_RE.fullmatch(candidate_source)
+    ):
+        # An explicitly bound candidate image may use the current checkout
+        # source as its source side of the release binding.  Without an
+        # expected image, require a source label from every Pod instead of
+        # guessing that an arbitrary digest belongs to this checkout.
+        expected_source = candidate_source
+    else:
+        expected_source = None
+    attestation = _kubernetes_image_attestation(
+        workers,
+        expected_source=expected_source,
+        expected_image=expected_image,
+    )
+    if attestation.get("status") != "pass":
+        return {
+            "status": "not_run",
+            "reason": str(attestation.get("reason", "Kubernetes image attestation failed")),
+            "worker_processes": workers,
+            "kubernetes": configuration,
+            "worker_image_attestation": attestation,
+        }
+    outbox_attestation = _kubernetes_image_attestation(
+        outbox,
+        expected_source=expected_source,
+        expected_image=expected_image,
+        role="outbox-dispatcher",
+    )
+    if outbox_attestation.get("status") != "pass":
+        return {
+            "status": "not_run",
+            "reason": str(
+                outbox_attestation.get("reason", "Kubernetes outbox image attestation failed")
+            ),
+            "worker_processes": workers,
+            "kubernetes": configuration,
+            "worker_image_attestation": attestation,
+            "service_image_attestation": {
+                "worker": attestation,
+                "outbox-dispatcher": outbox_attestation,
+            },
+        }
+    attested_source = attestation.get("source_fingerprint")
+    if not isinstance(candidate_source, str) or attested_source != candidate_source:
+        return {
+            "status": "not_run",
+            "reason": "Kubernetes source fingerprint is not bound to this checkout",
+            "worker_processes": workers,
+            "kubernetes": configuration,
+            "worker_image_attestation": attestation,
+            "service_image_attestation": {
+                "worker": attestation,
+                "outbox-dispatcher": outbox_attestation,
+            },
+        }
+    namespace = cast(str, configuration["namespace"])
+    metrics_payload, metrics_error = _kubernetes_json(
+        [
+            "get",
+            "--raw",
+            f"/apis/{KUBERNETES_METRICS_API}/namespaces/{namespace}/pods",
+        ],
+        configuration,
+    )
+    if metrics_error is not None or metrics_payload is None:
+        return {
+            "status": "not_run",
+            "reason": metrics_error or "Kubernetes metrics API is unavailable",
+            "worker_processes": workers,
+            "kubernetes": configuration,
+            "worker_image_attestation": attestation,
+            "service_image_attestation": {
+                "worker": attestation,
+                "outbox-dispatcher": outbox_attestation,
+            },
+        }
+    participating = {
+        "worker": workers,
+        "outbox-dispatcher": outbox,
+    }
+    memory_observation = _kubernetes_metrics_memory_observation(
+        participating,
+        metrics_payload,
+        configured_limit_bytes=cast(int | None, configuration.get("memory_limit_bytes")),
+    )
+    if memory_observation.get("status") != "pass":
+        return {
+            "status": "not_run",
+            "reason": str(
+                memory_observation.get("reason", "Kubernetes memory evidence is unavailable")
+            ),
+            "worker_processes": workers,
+            "participating_processes": participating,
+            "kubernetes": configuration,
+            "worker_image_attestation": attestation,
+            "service_image_attestation": {
+                "worker": attestation,
+                "outbox-dispatcher": outbox_attestation,
+            },
+            "memory_observation": memory_observation,
+        }
+    return {
+        "status": "pass",
+        "worker_processes": workers,
+        "worker_count": len(workers),
+        "worker_concurrency": worker_concurrency,
+        "participating_processes": participating,
+        "kubernetes": {
+            **configuration,
+            "metrics_api": KUBERNETES_METRICS_API,
+            "namespace_bound": True,
+        },
+        "worker_image_attestation": attestation,
+        "service_image_attestation": {
+            "worker": attestation,
+            "outbox-dispatcher": outbox_attestation,
+        },
+        "memory_observation": memory_observation,
+    }
+
+
 def _worker_processes() -> tuple[dict[str, int | str], ...]:
-    """Find independent worker PIDs without requiring psutil or Docker."""
+    """Find independent worker identities without requiring psutil or Docker."""
+
+    if _kubernetes_mode():
+        try:
+            configuration = _kubernetes_configuration()
+        except ValueError:
+            return ()
+        workers, error = _kubernetes_pod_records(
+            configuration,
+            role="worker",
+            selector=KUBERNETES_WORKER_SELECTOR,
+        )
+        if error is not None:
+            return ()
+        return tuple(cast(dict[str, int | str], worker) for worker in workers)
 
     real_compose_project = os.getenv("TRPC_REAL_COMPOSE_PROJECT", "").strip()
     performance_compose_project = os.getenv("TRPC_PERF_COMPOSE_PROJECT", "").strip()
@@ -1677,6 +2801,88 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "resources": resources,
         }
+    if _kubernetes_mode(args):
+        kubernetes_preflight = _kubernetes_preflight(args, min_workers=min_workers)
+        if kubernetes_preflight.get("status") != "pass":
+            kubernetes_preflight.setdefault("resources", resources)
+            return kubernetes_preflight
+        workers_value = kubernetes_preflight.get("worker_processes")
+        if not isinstance(workers_value, Sequence) or isinstance(
+            workers_value, (str, bytes, bytearray)
+        ):
+            return {
+                "status": "not_run",
+                "reason": "Kubernetes preflight returned no worker identities",
+                "resources": resources,
+            }
+        workers = tuple(
+            cast(dict[str, int | str], item) for item in workers_value if isinstance(item, Mapping)
+        )
+        if len(workers) != len(workers_value):
+            return {
+                "status": "not_run",
+                "reason": "Kubernetes preflight returned invalid worker identities",
+                "resources": resources,
+            }
+        estimated_connections = _estimated_runtime_connections(
+            min_workers=len(workers),
+            db_pool_size=db_pool_size,
+        )
+        resources["estimated_runtime_connections"] = estimated_connections
+        if estimated_connections > MAX_ESTIMATED_RUNTIME_CONNECTIONS:
+            return {
+                "status": "not_run",
+                "reason": (
+                    "discovered Kubernetes runtime PostgreSQL connections exceed the safety "
+                    f"budget of {MAX_ESTIMATED_RUNTIME_CONNECTIONS}"
+                ),
+                "worker_processes": workers,
+                "resources": resources,
+            }
+        participating_value = kubernetes_preflight.get("participating_processes")
+        memory_value = kubernetes_preflight.get("memory_observation")
+        attestation_value = kubernetes_preflight.get("worker_image_attestation")
+        worker_count = kubernetes_preflight.get("worker_count")
+        worker_concurrency = kubernetes_preflight.get("worker_concurrency")
+        if (
+            worker_count != PRODUCTION_MIN_WORKERS
+            or worker_concurrency != PRODUCTION_WORKER_CONCURRENCY
+        ):
+            return {
+                "status": "not_run",
+                "reason": "Kubernetes preflight worker topology is not locked to 4x50",
+                "worker_count": worker_count,
+                "worker_concurrency": worker_concurrency,
+                "resources": resources,
+            }
+        if not isinstance(participating_value, Mapping) or not isinstance(memory_value, Mapping):
+            return {
+                "status": "not_run",
+                "reason": "Kubernetes preflight returned incomplete service evidence",
+                "worker_processes": workers,
+                "resources": resources,
+            }
+        source = _source_fingerprint()
+        return {
+            "status": "pass",
+            "worker_processes": workers,
+            "worker_count": worker_count,
+            "worker_concurrency": worker_concurrency,
+            "participating_processes": dict(participating_value),
+            "memory_observation": dict(memory_value),
+            "resources": resources,
+            "source_fingerprint": source,
+            "worker_image_attestation": (
+                dict(attestation_value) if isinstance(attestation_value, Mapping) else {}
+            ),
+            "service_image_attestation": (
+                dict(kubernetes_preflight["service_image_attestation"])
+                if isinstance(kubernetes_preflight.get("service_image_attestation"), Mapping)
+                else {}
+            ),
+            "kubernetes": kubernetes_preflight.get("kubernetes", {}),
+        }
+
     workers = _worker_processes()
     if len(workers) < min_workers:
         return {
@@ -1909,10 +3115,17 @@ async def _submit_feishu_http_batch(
     offered_rate: float,
     max_inflight: int,
     timeout_seconds: float,
+    warmup_requests: int = 0,
+    allow_kubernetes_service: bool = False,
+    kubernetes_namespace: str | None = None,
 ) -> dict[str, Any]:
     """Submit the sustained phase through the encrypted Feishu HTTP route."""
 
-    gateway = _loopback_gateway_metadata(gateway_base_url)
+    gateway = _gateway_metadata(
+        gateway_base_url,
+        allow_kubernetes_service=allow_kubernetes_service,
+        kubernetes_namespace=kubernetes_namespace,
+    )
     result = await run_feishu_http_performance(
         FeishuHTTPPerformanceOptions(
             base_url=gateway_base_url,
@@ -1928,7 +3141,9 @@ async def _submit_feishu_http_batch(
             timeout_seconds=timeout_seconds,
             chat_type="p2p",
             run_id=f"{run_id}-http",
-        )
+        ),
+        warmup_requests=warmup_requests,
+        latency_threshold_ms=DEFAULT_P95_MS,
     )
     accepted_external_ids = tuple(result.accepted_external_message_ids)
     lookup = await _lookup_authoritative_inbound_batch(
@@ -1942,6 +3157,30 @@ async def _submit_feishu_http_batch(
     accepted = int(result.accepted)
     errors = int(result.failed)
     p95_latency = float(result.p95_latency_ms or 0.0)
+    reported_warmup_requested = getattr(result, "warmup_requested", None)
+    reported_warmup_accepted = getattr(result, "warmup_accepted", None)
+    reported_warmup_failed = getattr(result, "warmup_failed", None)
+    warmup_requested: int | None
+    warmup_accepted: int | None
+    warmup_failed: int | None
+    if warmup_requests == 0:
+        # Older helper results do not carry HTTP warmup fields.  That is
+        # compatible only for the non-Kubernetes path, where no HTTP warmup
+        # was requested and direct-runtime warmup remains authoritative.
+        warmup_requested = int(reported_warmup_requested or 0)
+        warmup_accepted = int(reported_warmup_accepted or 0)
+        warmup_failed = int(reported_warmup_failed or 0)
+    else:
+        warmup_requested = (
+            int(reported_warmup_requested) if reported_warmup_requested is not None else None
+        )
+        warmup_accepted = (
+            int(reported_warmup_accepted) if reported_warmup_accepted is not None else None
+        )
+        warmup_failed = int(reported_warmup_failed) if reported_warmup_failed is not None else None
+    histogram = getattr(result, "latency_histogram", {})
+    if not isinstance(histogram, Mapping):
+        histogram = {}
     return {
         "mode": "synthetic_encrypted_feishu_http",
         "requested": int(result.requested),
@@ -1958,6 +3197,24 @@ async def _submit_feishu_http_batch(
         "ack_p95_ms": p95_latency,
         "ack_p50_ms": float(result.p50_latency_ms or 0.0),
         "ack_max_ms": float(result.max_latency_ms or 0.0),
+        "warmup_requested": warmup_requested,
+        "warmup_expected_requests": warmup_requests,
+        "warmup_accepted": warmup_accepted,
+        "warmup_failed": warmup_failed,
+        "p90_latency_ms": getattr(result, "p90_latency_ms", None),
+        "p99_latency_ms": getattr(result, "p99_latency_ms", None),
+        "latency_threshold_ms": getattr(result, "latency_threshold_ms", DEFAULT_P95_MS),
+        "over_threshold_count": getattr(result, "over_threshold_count", None),
+        "latency_histogram": dict(histogram),
+        "http_warmup_passed": _http_warmup_passed(
+            {
+                "mode": "synthetic_encrypted_feishu_http",
+                "warmup_requested": warmup_requested,
+                "warmup_accepted": warmup_accepted,
+                "warmup_failed": warmup_failed,
+            },
+            expected_requests=warmup_requests,
+        ),
         "elapsed_seconds": float(result.elapsed_ms) / 1000.0,
         "ack_elapsed_seconds": float(result.elapsed_ms) / 1000.0,
         "offered_rate_per_second": float(result.offered_rate_per_second),
@@ -1994,12 +3251,22 @@ async def _scoped_fetch(
 
 
 def _loopback_gateway_metadata(base_url: str) -> dict[str, Any]:
-    """Validate the performance gateway and return only safe endpoint metadata.
+    """Validate a loopback performance gateway and return safe endpoint metadata."""
 
-    The real acceptance load is deliberately restricted to a gateway bound on
-    the local machine.  This prevents an accidental environment value from
-    turning the acceptance script into a provider or third-party load tool.
-    The returned object never contains the URL itself.
+    return _gateway_metadata(base_url)
+
+
+def _gateway_metadata(
+    base_url: str,
+    *,
+    allow_kubernetes_service: bool = False,
+    kubernetes_namespace: str | None = None,
+) -> dict[str, Any]:
+    """Validate a loopback or explicitly bound in-cluster gateway endpoint.
+
+    Loopback remains the default.  In-cluster access is accepted only for the
+    fixed gateway Service name in the already-attested namespace, preventing
+    a performance run from becoming an arbitrary outbound load tool.
     """
 
     try:
@@ -2007,22 +3274,43 @@ def _loopback_gateway_metadata(base_url: str) -> dict[str, Any]:
     except ValueError:
         raise ValueError("performance gateway URL is invalid") from None
     host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or host not in {
-        "localhost",
-        "127.0.0.1",
-        "::1",
-    }:
-        raise ValueError("performance gateway must use localhost, 127.0.0.1, or ::1")
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
     if parsed.query or parsed.fragment or parsed.username or parsed.password:
         raise ValueError("performance gateway URL must not contain query or credentials")
     try:
         port = parsed.port
     except ValueError:
         raise ValueError("performance gateway URL has an invalid port") from None
+    actual_port = port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("performance gateway URL must use HTTP or HTTPS")
+    if host in loopback_hosts:
+        return {
+            "scheme": parsed.scheme,
+            "host_class": "loopback",
+            "port": actual_port,
+            "path_present": bool(parsed.path.rstrip("/")),
+        }
+    if not allow_kubernetes_service:
+        raise ValueError("performance gateway must use localhost, 127.0.0.1, or ::1")
+    namespace_value = kubernetes_namespace or ""
+    if _KUBERNETES_NAMESPACE_RE.fullmatch(namespace_value) is None:
+        raise ValueError("Kubernetes gateway namespace is invalid or missing")
+    namespace = namespace_value.lower()
+    allowed_hosts = {
+        KUBERNETES_GATEWAY_SERVICE,
+        f"{KUBERNETES_GATEWAY_SERVICE}.{namespace}",
+        f"{KUBERNETES_GATEWAY_SERVICE}.{namespace}.svc",
+        f"{KUBERNETES_GATEWAY_SERVICE}.{namespace}.svc.cluster.local",
+    }
+    if host not in allowed_hosts:
+        raise ValueError("Kubernetes performance gateway must use the attested gateway Service")
     return {
         "scheme": parsed.scheme,
-        "host_class": "loopback",
-        "port": port or (443 if parsed.scheme == "https" else 80),
+        "host_class": "kubernetes_service",
+        "service_name": KUBERNETES_GATEWAY_SERVICE,
+        "namespace": namespace,
+        "port": actual_port,
         "path_present": bool(parsed.path.rstrip("/")),
     }
 
@@ -2497,6 +3785,7 @@ def _phase_gate(
             isinstance(authoritative_lookup, Mapping)
             and authoritative_lookup.get("status") == "pass"
         )
+    http_warmup_passed = _http_warmup_passed(phase)
     passed = bool(
         accepted == requested
         and errors == 0
@@ -2504,6 +3793,7 @@ def _phase_gate(
         and p95 >= 0.0
         and p95 < required_p95_ms
         and lookup_passed
+        and http_warmup_passed
         and completion.get("status") == "pass"
         and int(inbound.get("committed", 0)) == requested
         and int(turns.get("committed", 0)) == requested
@@ -2514,8 +3804,46 @@ def _phase_gate(
         "accepted_message_loss": requested - accepted,
         "uncommitted_turns": requested - int(turns.get("committed", 0)),
         "mailbox_complete": mailbox_complete,
+        "http_warmup_passed": http_warmup_passed,
         "ack_p95_headroom_ms": (required_p95_ms - p95) if p95 is not None else None,
     }
+
+
+def _http_warmup_passed(phase: Mapping[str, Any], *, expected_requests: int | None = None) -> bool:
+    """Return whether the HTTP helper's optional warmup fully succeeded.
+
+    Non-Kubernetes/local runs use zero HTTP warmup requests for compatibility
+    with the existing direct-runtime warmup.  A requested HTTP warmup is
+    fail-closed when any of its evidence fields are missing or inconsistent.
+    """
+
+    if phase.get("mode") != "synthetic_encrypted_feishu_http":
+        return True
+    requested = phase.get("warmup_requested", 0)
+    accepted = phase.get("warmup_accepted", 0)
+    failed = phase.get("warmup_failed", 0)
+    try:
+        requested_count = int(requested)
+        accepted_count = int(accepted)
+        failed_count = int(failed)
+    except (TypeError, ValueError):
+        return False
+    expected_value = (
+        phase.get("warmup_expected_requests", requested)
+        if expected_requests is None
+        else expected_requests
+    )
+    try:
+        expected_count = int(expected_value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        requested_count >= 0
+        and expected_count >= 0
+        and requested_count == expected_count
+        and accepted_count == requested_count
+        and failed_count == 0
+    )
 
 
 def _production_gate_reasons(
@@ -2533,6 +3861,7 @@ def _production_gate_reasons(
     worker_image_attestation: Mapping[str, Any] | None = None,
     sustained_http_phase: Mapping[str, Any] | None = None,
     memory_observation: Mapping[str, Any] | None = None,
+    preflight: Mapping[str, Any] | None = None,
 ) -> list[str]:
     if not workload_passed:
         return ["sustained or burst performance phase failed"]
@@ -2546,6 +3875,16 @@ def _production_gate_reasons(
         return []
 
     reasons: list[str] = []
+    for name, expected in (
+        ("db_pool_size", DEFAULT_DB_POOL_SIZE),
+        ("max_inflight", DEFAULT_MAX_INFLIGHT),
+    ):
+        try:
+            configured = int(getattr(args, name, expected))
+        except (TypeError, ValueError):
+            configured = None
+        if configured != expected:
+            reasons.append(f"formal performance {name} must equal the locked value {expected}")
     if sustained_http_phase is None:
         reasons.append("sustained HTTP callback phase evidence is unavailable")
     else:
@@ -2572,9 +3911,24 @@ def _production_gate_reasons(
         lookup = sustained_http_phase.get("authoritative_lookup")
         if not isinstance(lookup, Mapping) or lookup.get("status") != "pass":
             reasons.append("sustained HTTP callbacks lack complete authoritative inbound rows")
+        if not _http_warmup_passed(sustained_http_phase):
+            reasons.append("sustained HTTP warmup did not fully succeed")
         gateway = sustained_http_phase.get("gateway")
-        if not isinstance(gateway, Mapping) or gateway.get("host_class") != "loopback":
-            reasons.append("sustained HTTP gateway loopback proof is unavailable")
+        gateway_class = gateway.get("host_class") if isinstance(gateway, Mapping) else None
+        if gateway_class == "loopback":
+            pass
+        elif gateway_class == "kubernetes_service":
+            kubernetes = preflight.get("kubernetes") if isinstance(preflight, Mapping) else None
+            if (
+                not isinstance(gateway, Mapping)
+                or not isinstance(kubernetes, Mapping)
+                or gateway.get("service_name") != KUBERNETES_GATEWAY_SERVICE
+                or gateway.get("namespace") != kubernetes.get("namespace")
+                or kubernetes.get("namespace_bound") is not True
+            ):
+                reasons.append("sustained HTTP gateway Kubernetes Service proof is unavailable")
+        else:
+            reasons.append("sustained HTTP gateway endpoint proof is unavailable")
         try:
             http_p95 = float(sustained_http_phase.get("ack_p95_ms", float("nan")))
         except (TypeError, ValueError):
@@ -2696,6 +4050,7 @@ def _production_gate_status(
     worker_image_attestation: Mapping[str, Any] | None = None,
     sustained_http_phase: Mapping[str, Any] | None = None,
     memory_observation: Mapping[str, Any] | None = None,
+    preflight: Mapping[str, Any] | None = None,
 ) -> str:
     if not workload_passed:
         return "fail"
@@ -2729,6 +4084,7 @@ def _production_gate_status(
             worker_image_attestation=worker_image_attestation,
             sustained_http_phase=sustained_http_phase,
             memory_observation=memory_observation,
+            preflight=preflight,
         )
         else "fail"
     )
@@ -2742,7 +4098,7 @@ def _redis_pending_delta(baseline: dict[str, int], final: Any) -> int | None:
 
 def _load_worker_command(args: argparse.Namespace, output: Path) -> list[str]:
     scheduler_version, stream, group = _scheduler_transport(args)
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "--load-worker",
@@ -2771,6 +4127,27 @@ def _load_worker_command(args: argparse.Namespace, output: Path) -> list[str]:
         "--output",
         str(output),
     ]
+    if bool(getattr(args, "kubernetes", False)):
+        command.append("--kubernetes")
+        for option, attribute in (
+            ("--kubernetes-namespace", "kubernetes_namespace"),
+            ("--kubernetes-context", "kubernetes_context"),
+            ("--kubernetes-kubeconfig", "kubernetes_kubeconfig"),
+            ("--kubernetes-image-digest", "kubernetes_image_digest"),
+            ("--kubernetes-source-fingerprint", "kubernetes_source_fingerprint"),
+        ):
+            value = getattr(args, attribute, None)
+            if value:
+                command.extend([option, str(value)])
+        memory_limit = getattr(args, "kubernetes_memory_limit_bytes", None)
+        if memory_limit is not None:
+            command.extend(["--kubernetes-memory-limit-bytes", str(memory_limit)])
+    if bool(getattr(args, "kubernetes_load_worker", False)):
+        command.append("--kubernetes-load-worker")
+        evidence_path = getattr(args, "kubernetes_preflight_evidence", None)
+        if evidence_path:
+            command.extend(["--kubernetes-preflight-evidence", str(evidence_path)])
+    return command
 
 
 def _supervision_failure(
@@ -2867,9 +4244,20 @@ def _mark_unconfirmed_termination(
 def _run_external_load(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
     """Supervise exactly one load-generator process and never mutate Docker."""
 
-    run_id = f"real-performance-{uuid4().hex}"
+    configured_run_id = os.getenv("TRPC_REAL_RUN_ID", "").strip()
+    run_id = (
+        configured_run_id
+        if bool(getattr(args, "kubernetes_load_worker", False))
+        and _KUBERNETES_RUN_ID_RE.fullmatch(configured_run_id)
+        else f"real-performance-{uuid4().hex}"
+    )
     process_timeout_seconds = _hard_process_timeout(args)
-    worker_token = uuid4().hex
+    configured_token = os.getenv(WORKER_TOKEN_ENV, "")
+    worker_token = (
+        configured_token
+        if bool(getattr(args, "kubernetes_load_worker", False)) and configured_token
+        else uuid4().hex
+    )
     process: subprocess.Popen[str] | None = None
     result: dict[str, Any] | None = None
     with tempfile.TemporaryDirectory(prefix=f".{run_id}-") as temporary_directory:
@@ -3144,6 +4532,14 @@ async def _run_real_once(args: argparse.Namespace, preflight: dict[str, Any]) ->
             offered_rate=args.callback_rate,
             max_inflight=getattr(args, "max_inflight", DEFAULT_MAX_INFLIGHT),
             timeout_seconds=args.timeout_seconds,
+            warmup_requests=(KUBERNETES_HTTP_WARMUP_REQUESTS if _kubernetes_mode(args) else 0),
+            allow_kubernetes_service=_kubernetes_mode(args),
+            kubernetes_namespace=(
+                str(preflight.get("kubernetes", {}).get("namespace"))
+                if isinstance(preflight.get("kubernetes"), Mapping)
+                and isinstance(preflight.get("kubernetes", {}).get("namespace"), str)
+                else None
+            ),
         )
         if sustained["authoritative_lookup"].get("status") == "pass":
             sustained_completion = await _wait_for_batch(
@@ -3208,10 +4604,22 @@ async def _run_real_once(args: argparse.Namespace, preflight: dict[str, Any]) ->
             participating = {}
         if not isinstance(preflight_resources, Mapping):
             preflight_resources = {}
-        memory_observation = _memory_observation(
-            cast(Mapping[str, Sequence[Mapping[str, Any]]], participating),
-            resources=preflight_resources,
-        )
+        if _kubernetes_mode(args):
+            observed_memory = preflight.get("memory_observation")
+            memory_observation = (
+                dict(observed_memory)
+                if isinstance(observed_memory, Mapping)
+                else {
+                    "status": "not_run",
+                    "reason": "Kubernetes memory evidence is unavailable",
+                    "coverage_complete": False,
+                }
+            )
+        else:
+            memory_observation = _memory_observation(
+                cast(Mapping[str, Sequence[Mapping[str, Any]]], participating),
+                resources=preflight_resources,
+            )
         accepted_inbound_ids = [
             *sustained["accepted_inbound_ids"],
             *burst["accepted_inbound_ids"],
@@ -3237,6 +4645,7 @@ async def _run_real_once(args: argparse.Namespace, preflight: dict[str, Any]) ->
             worker_image_attestation=worker_image_attestation,
             sustained_http_phase=sustained,
             memory_observation=memory_observation,
+            preflight=preflight,
         )
         candidate = {
             "mode": "real_postgresql_redis_multiprocess",
@@ -3246,6 +4655,10 @@ async def _run_real_once(args: argparse.Namespace, preflight: dict[str, Any]) ->
             "parameters": _run_parameters(args),
             "pool_prewarmed": pool_prewarmed,
             "warmup": {
+                "mode": "direct_runtime",
+                "description": (
+                    "direct runtime warmup; excluded from the sustained HTTP measurement"
+                ),
                 "stages": warmup,
                 "passed": warmup_passed,
                 "excluded_from_burst_overlap": True,
@@ -3272,6 +4685,16 @@ async def _run_real_once(args: argparse.Namespace, preflight: dict[str, Any]) ->
                 "ack_p50_ms": sustained["ack_p50_ms"],
                 "ack_p95_ms": sustained["ack_p95_ms"],
                 "ack_max_ms": sustained["ack_max_ms"],
+                "warmup_requested": sustained["warmup_requested"],
+                "warmup_expected_requests": sustained["warmup_expected_requests"],
+                "warmup_accepted": sustained["warmup_accepted"],
+                "warmup_failed": sustained["warmup_failed"],
+                "http_warmup_passed": sustained["http_warmup_passed"],
+                "p90_latency_ms": sustained["p90_latency_ms"],
+                "p99_latency_ms": sustained["p99_latency_ms"],
+                "latency_threshold_ms": sustained["latency_threshold_ms"],
+                "over_threshold_count": sustained["over_threshold_count"],
+                "latency_histogram": sustained["latency_histogram"],
                 "callback_submission_started_at": sustained["callback_submission_started_at"],
                 "callback_submission_last_started_at": sustained[
                     "callback_submission_last_started_at"
@@ -3370,6 +4793,7 @@ async def _run_real_once(args: argparse.Namespace, preflight: dict[str, Any]) ->
             worker_image_attestation=worker_image_attestation,
             sustained_http_phase=sustained,
             memory_observation=memory_observation,
+            preflight=preflight,
         )
         below_locked_target = (
             args.callbacks < DEFAULT_CALLBACKS
@@ -3500,6 +4924,12 @@ async def _watch_parent_process(
 
 
 async def _run_real(args: argparse.Namespace, preflight: dict[str, Any]) -> dict[str, Any]:
+    if bool(getattr(args, "kubernetes_load_worker", False)):
+        # A Kubernetes Job is supervised by its parent gate through the Job
+        # lifecycle and signed handoff.  A host PID is neither meaningful nor
+        # available across Pods, so never weaken the local-process watchdog;
+        # this branch is reachable only after the signed evidence path passed.
+        return await _run_real_once(args, preflight)
     parent_pid = _load_worker_parent_pid()
     if parent_pid is None:
         return _not_run_report(
@@ -3654,7 +5084,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args=args,
         )
         return 1 if args.require_production else 0
-    preflight = _preflight(args)
+    try:
+        preflight = _preflight_for_execution(args)
+    except ValueError as error:
+        preflight = {"status": "not_run", "reason": str(error)}
     if preflight["status"] != "pass":
         report = {
             "baseline": {

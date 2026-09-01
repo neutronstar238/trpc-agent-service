@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 from copy import deepcopy
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
@@ -12,7 +15,9 @@ from scripts.evidence_lineage import source_fingerprint
 from scripts.real_runtime_gate import (
     FAULT_STAGE_NAMES,
     LOAD_STAGE_NAMES,
+    MAX_KILL_TARGET_AGE_SECONDS,
     _active_duplicate_publish_probe,
+    _active_turn_evidence,
     _allowed_runtime_project,
     _attach_compose_cleanup_evidence,
     _cleanup_owned_compose,
@@ -42,6 +47,7 @@ from scripts.real_runtime_gate import (
     _set_proxy,
     _stage_marker,
     _status,
+    _turn_state_evidence,
     _wait_for_batch,
     _wait_for_dlq,
     _wait_for_healthy_containers,
@@ -326,9 +332,7 @@ def test_real_runtime_compose_up_refuses_to_touch_preexisting_project(monkeypatc
 
 
 def test_real_runtime_prestarted_mode_is_explicit_and_bound() -> None:
-    prestarted = _parser().parse_args(
-        ["--project", "trpc-fault-test", "--compose-prestarted"]
-    )
+    prestarted = _parser().parse_args(["--project", "trpc-fault-test", "--compose-prestarted"])
     parameters = _run_parameters(prestarted)
 
     assert parameters["compose_up"] is True
@@ -337,9 +341,7 @@ def test_real_runtime_prestarted_mode_is_explicit_and_bound() -> None:
 
 
 def test_real_runtime_prestarted_mode_requires_a_non_empty_dedicated_project(monkeypatch) -> None:
-    args = _parser().parse_args(
-        ["--project", "trpc-fault-test", "--compose-prestarted"]
-    )
+    args = _parser().parse_args(["--project", "trpc-fault-test", "--compose-prestarted"])
     monkeypatch.setattr(
         "scripts.real_runtime_gate._compose_project_container_ids", lambda _args: ()
     )
@@ -402,8 +404,7 @@ def test_live_runtime_entry_requires_current_release_binding(tmp_path, monkeypat
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["gate"] == "not_run"
     assert any(
-        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason
-        for reason in report["rejection_reasons"]
+        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason for reason in report["rejection_reasons"]
     )
 
 
@@ -419,9 +420,7 @@ def test_database_role_evidence_is_fail_closed_and_recomputes_privileges() -> No
     functions = snapshot["functions"]
     assert isinstance(functions, dict)
     first_signature = next(
-        signature
-        for signature in functions
-        if signature == "public.list_channel_bindings(text)"
+        signature for signature in functions if signature == "public.list_channel_bindings(text)"
     )
     functions[first_signature]["execute"] = True
     assert _role_evidence_check(evidence)[0] == "fail"
@@ -506,9 +505,7 @@ async def test_scoped_phase_stops_before_work_when_worker_role_evidence_does_not
         raise AssertionError("fault work must not start without passing worker role evidence")
 
     monkeypatch.setattr("scripts.real_runtime_gate._open_runtime", fake_open_runtime)
-    monkeypatch.setattr(
-        "scripts.real_runtime_gate._database_role_evidence", missing_role_evidence
-    )
+    monkeypatch.setattr("scripts.real_runtime_gate._database_role_evidence", missing_role_evidence)
     monkeypatch.setattr("scripts.real_runtime_gate._fault_phase", unexpected_fault_phase)
 
     report = await _run_real(args)
@@ -618,9 +615,7 @@ async def _run_real_with_passing_phases(monkeypatch, args):
         return _role_evidence_fixture()
 
     monkeypatch.setattr("scripts.real_runtime_gate._open_runtime", open_runtime)
-    monkeypatch.setattr(
-        "scripts.real_runtime_gate._database_role_evidence", passing_role_evidence
-    )
+    monkeypatch.setattr("scripts.real_runtime_gate._database_role_evidence", passing_role_evidence)
     monkeypatch.setattr("scripts.real_runtime_gate._load_phase", passing_load)
     monkeypatch.setattr("scripts.real_runtime_gate._fault_phase", passing_faults)
     report = await _run_real(args)
@@ -751,9 +746,7 @@ async def test_all_does_not_start_fault_phase_after_load_failure(monkeypatch) ->
         return _role_evidence_fixture()
 
     monkeypatch.setattr("scripts.real_runtime_gate._open_runtime", open_runtime)
-    monkeypatch.setattr(
-        "scripts.real_runtime_gate._database_role_evidence", passing_role_evidence
-    )
+    monkeypatch.setattr("scripts.real_runtime_gate._database_role_evidence", passing_role_evidence)
     monkeypatch.setattr("scripts.real_runtime_gate._load_phase", failed_load)
     monkeypatch.setattr("scripts.real_runtime_gate._fault_phase", unexpected_faults)
 
@@ -859,9 +852,7 @@ def test_real_runtime_evidence_becomes_available_only_for_complete_sample(tmp_pa
                     "image_id": "sha256:" + "a" * 64,
                     "source_fingerprint": _current_source_fingerprint(),
                 },
-                "participating_services": _attested_participating_services(
-                    _attested_workers()
-                ),
+                "participating_services": _attested_participating_services(_attested_workers()),
             },
         },
     }
@@ -1829,7 +1820,7 @@ async def test_stale_fencing_probe_requires_conflict_and_current_replacement(mon
         {"lease_owner": "worker-new", "lease_epoch": 2, "turn_id": "turn-1"},
     ]
 
-    async def evidence(*_args):
+    async def evidence(*_args, **_kwargs):
         return observations.pop(0)
 
     monkeypatch.setattr("scripts.real_runtime_gate._active_turn_evidence", evidence)
@@ -1860,7 +1851,7 @@ async def test_stale_fencing_probe_requires_conflict_and_current_replacement(mon
 
 @pytest.mark.asyncio
 async def test_stale_fencing_probe_fails_if_old_commit_succeeds(monkeypatch) -> None:
-    async def evidence(*_args):
+    async def evidence(*_args, **_kwargs):
         return {"lease_owner": "worker-new", "lease_epoch": 2, "turn_id": "turn-1"}
 
     monkeypatch.setattr("scripts.real_runtime_gate._active_turn_evidence", evidence)
@@ -1891,7 +1882,7 @@ async def test_stale_fencing_probe_fails_if_old_commit_succeeds(monkeypatch) -> 
 async def test_active_turn_owner_requires_batch_scope(monkeypatch) -> None:
     called = False
 
-    async def evidence(*_args):
+    async def evidence(*_args, **_kwargs):
         nonlocal called
         called = True
         return {"lease_owner": "worker-a"}
@@ -1917,7 +1908,10 @@ async def test_takeover_requires_new_epoch_different_owner_and_attempt(monkeypat
         },
     ]
 
-    async def evidence(*_args):
+    calls = []
+
+    async def evidence(*_args, **kwargs):
+        calls.append(kwargs)
         return observations.pop(0) if observations else observations[-1]
 
     monkeypatch.setattr("scripts.real_runtime_gate._active_turn_evidence", evidence)
@@ -1928,12 +1922,113 @@ async def test_takeover_requires_new_epoch_different_owner_and_attempt(monkeypat
         inbound_ids=("inbound",),
         killed_owner="worker-a",
         previous_epoch=1,
+        target_turn_id="00000000-0000-0000-0000-000000000001",
+        target_inbound_id="00000000-0000-0000-0000-000000000002",
         wait_seconds=1,
     )
 
     assert result["status"] == "pass"
     assert result["lease_epoch_monotonic"] is True
     assert result["takeover_owner_differs"] is True
+    assert all(call["turn_id"].endswith("0001") for call in calls)
+    assert all(call["inbound_id"].endswith("0002") for call in calls)
+    assert all(call["max_started_age_seconds"] == MAX_KILL_TARGET_AGE_SECONDS for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_active_turn_evidence_selects_only_freshest_processing_turn(monkeypatch) -> None:
+    captured = {}
+
+    async def fetch(_pool, _tenant_id, query, *args):
+        captured["query"] = query
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr("scripts.real_runtime_gate._scoped_fetch", fetch)
+    result = await _active_turn_evidence(
+        None,
+        "tenant",
+        "session",
+        ("00000000-0000-0000-0000-000000000003",),
+        max_started_age_seconds=MAX_KILL_TARGET_AGE_SECONDS,
+    )
+
+    assert result is None
+    assert "ORDER BY turn.started_at DESC" in captured["query"]
+    assert "turn.started_at >=" in captured["query"]
+    assert "turn.fencing_token=session.lease_epoch" in captured["query"]
+    assert captured["args"][-1] == MAX_KILL_TARGET_AGE_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_active_turn_evidence_normalizes_database_types_for_reports(monkeypatch) -> None:
+    async def fetch(*_args):
+        return [
+            {
+                "lease_owner": "worker-a",
+                "lease_epoch": 2,
+                "turn_id": UUID("00000000-0000-0000-0000-000000000006"),
+                "inbound_id": UUID("00000000-0000-0000-0000-000000000007"),
+                "attempt": 2,
+                "fencing_token": 2,
+                "started_at": datetime(2026, 9, 1, tzinfo=UTC),
+                "processing_age_seconds": Decimal("0.125"),
+            }
+        ]
+
+    monkeypatch.setattr("scripts.real_runtime_gate._scoped_fetch", fetch)
+    result = await _active_turn_evidence(
+        None,
+        "tenant",
+        "session",
+        ("00000000-0000-0000-0000-000000000007",),
+    )
+
+    assert result is not None
+    assert result["turn_id"].endswith("0006")
+    assert result["inbound_id"].endswith("0007")
+    assert result["started_at"] == "2026-09-01T00:00:00.000000Z"
+    assert result["processing_age_seconds"] == 0.125
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_turn_state_evidence_is_scoped_to_exact_target(monkeypatch) -> None:
+    captured = {}
+
+    async def fetch(_pool, _tenant_id, query, *args):
+        captured["query"] = query
+        captured["args"] = args
+        return [
+            {
+                "turn_id": args[-2],
+                "inbound_id": args[-1],
+                "status": "committed",
+                "attempt": 1,
+                "started_at": None,
+                "committed_at": None,
+                "lease_owner": None,
+                "lease_epoch": 1,
+            }
+        ]
+
+    monkeypatch.setattr("scripts.real_runtime_gate._scoped_fetch", fetch)
+    result = await _turn_state_evidence(
+        None,
+        tenant_id="tenant",
+        session_id="session",
+        turn_id="00000000-0000-0000-0000-000000000004",
+        inbound_id="00000000-0000-0000-0000-000000000005",
+    )
+
+    assert result is not None
+    assert result["status"] == "committed"
+    assert isinstance(result["turn_id"], str)
+    assert isinstance(result["inbound_id"], str)
+    json.dumps(result, allow_nan=False)
+    assert "turn.turn_id=$3::uuid" in captured["query"]
+    assert str(captured["args"][-2]).endswith("0004")
+    assert str(captured["args"][-1]).endswith("0005")
 
 
 @pytest.mark.asyncio

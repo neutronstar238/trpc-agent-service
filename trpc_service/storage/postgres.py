@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -37,6 +38,7 @@ from trpc_service.storage.models import (
     SessionMailbox,
     SessionSnapshot,
     TurnCommit,
+    WeComBindingLeaseGrant,
 )
 from trpc_service.storage.protocols import DeliveryInProgress, FencingConflict
 from trpc_service.tenant.models import Channel, ChannelBinding, TenantConfig, TenantContext
@@ -90,7 +92,13 @@ class PostgresRuntimeRepository:
             min_size=min_size,
             max_size=max_size,
             command_timeout=30,
-            server_settings={"application_name": "trpc-agent-service"},
+            server_settings={
+                "application_name": "trpc-agent-service",
+                "tcp_keepalives_idle": "10",
+                "tcp_keepalives_interval": "5",
+                "tcp_keepalives_count": "3",
+                "tcp_user_timeout": "30000",
+            },
         )
         return cls(pool, ready_replay_cooldown_seconds=ready_replay_cooldown_seconds)
 
@@ -2601,43 +2609,269 @@ class PostgresRuntimeRepository:
 
 
 class PostgresBindingLease:
-    """Keep one session-level advisory lock per active WeCom connection."""
+    """Keep one fenced advisory lock per tenant-scoped WeCom connection."""
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
-        self._held: dict[str, tuple[str, asyncpg.Connection]] = {}
+        self._held: dict[tuple[str, str], tuple[WeComBindingLeaseGrant, asyncpg.Connection]] = {}
         self._lock = asyncio.Lock()
 
-    async def acquire_binding(self, binding_id: str, owner_id: str) -> bool:
+    async def acquire_binding(
+        self, binding: ChannelBinding, owner_id: str
+    ) -> WeComBindingLeaseGrant | None:
+        key = (binding.tenant_id, binding.binding_id)
+        owner_hash = _wecom_identifier_hash(
+            "owner", binding.tenant_id, binding.binding_id, owner_id
+        )
+        advisory_key = _wecom_advisory_lock_key(binding.tenant_id, binding.binding_id)
         async with self._lock:
-            if binding_id in self._held:
-                return self._held[binding_id][0] == owner_id
+            held = self._held.get(key)
+            if held is not None:
+                return held[0] if held[0].owner_hash == owner_hash else None
             connection = await self._pool.acquire()
             try:
                 acquired = await connection.fetchval(
-                    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", binding_id
+                    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", advisory_key
                 )
             except BaseException:
                 await self._pool.release(connection)
                 raise
             if not acquired:
                 await self._pool.release(connection)
-                return False
-            self._held[binding_id] = (owner_id, connection)
-            return True
+                return None
+            try:
+                async with connection.transaction():
+                    await connection.execute(
+                        "SELECT set_config('app.tenant_id', $1, true)", binding.tenant_id
+                    )
+                    previous = await connection.fetchrow(
+                        """
+                        SELECT epoch,released_at
+                          FROM wecom_connection_state
+                         WHERE tenant_id=$1 AND binding_id=$2
+                         FOR UPDATE
+                        """,
+                        binding.tenant_id,
+                        binding.binding_id,
+                    )
+                    previous_epoch = int(previous["epoch"]) if previous is not None else 0
+                    event_type = (
+                        "takeover"
+                        if previous is not None and previous["released_at"] is None
+                        else "acquired"
+                    )
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO wecom_connection_state (
+                            tenant_id,binding_id,owner_hash,epoch,phase,acquired_at,
+                            authenticated_at,disconnected_at,released_at,
+                            last_provider_event_hash,last_provider_event_at,updated_at
+                        ) VALUES (
+                            $1,$2,$3,$4,'acquired',clock_timestamp(),
+                            NULL,NULL,NULL,NULL,NULL,clock_timestamp()
+                        )
+                        ON CONFLICT (tenant_id,binding_id) DO UPDATE
+                           SET owner_hash=EXCLUDED.owner_hash,
+                               epoch=EXCLUDED.epoch,
+                               phase='acquired',
+                               acquired_at=EXCLUDED.acquired_at,
+                               authenticated_at=NULL,
+                               disconnected_at=NULL,
+                               released_at=NULL,
+                               last_provider_event_hash=NULL,
+                               last_provider_event_at=NULL,
+                               updated_at=EXCLUDED.updated_at
+                         WHERE wecom_connection_state.epoch=$5
+                        RETURNING epoch,acquired_at
+                        """,
+                        binding.tenant_id,
+                        binding.binding_id,
+                        owner_hash,
+                        previous_epoch + 1,
+                        previous_epoch,
+                    )
+                    if row is None:
+                        raise RuntimeError("WeCom connection epoch changed during acquisition")
+                    grant = WeComBindingLeaseGrant(
+                        tenant_id=binding.tenant_id,
+                        binding_id=binding.binding_id,
+                        owner_hash=owner_hash,
+                        epoch=int(row["epoch"]),
+                        acquired_at=row["acquired_at"],
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO im_acceptance_evidence_events (
+                            tenant_id,binding_id,channel,connection_epoch,event_type,
+                            owner_hash
+                        ) VALUES ($1,$2,'wecom_ai_bot',$3,$4,$5)
+                        """,
+                        grant.tenant_id,
+                        grant.binding_id,
+                        grant.epoch,
+                        event_type,
+                        grant.owner_hash,
+                    )
+            except BaseException:
+                try:
+                    await connection.execute(
+                        "SELECT pg_advisory_unlock(hashtextextended($1, 0))", advisory_key
+                    )
+                finally:
+                    await self._pool.release(connection)
+                raise
+            self._held[key] = (grant, connection)
+            return grant
 
-    async def release_binding(self, binding_id: str, owner_id: str) -> None:
+    async def mark_authenticated(self, grant: WeComBindingLeaseGrant) -> bool:
+        return await self._record_fenced_event(grant, "authenticated")
+
+    async def record_provider_event(
+        self, grant: WeComBindingLeaseGrant, provider_event_id: str
+    ) -> bool:
+        provider_hash = _wecom_identifier_hash(
+            "provider-event",
+            grant.tenant_id,
+            grant.binding_id,
+            provider_event_id,
+        )
+        return await self._record_fenced_event(
+            grant,
+            "provider_event",
+            provider_event_hash=provider_hash,
+        )
+
+    async def mark_disconnected(self, grant: WeComBindingLeaseGrant) -> bool:
+        return await self._record_fenced_event(grant, "disconnected")
+
+    async def release_binding(self, grant: WeComBindingLeaseGrant) -> None:
+        key = (grant.tenant_id, grant.binding_id)
         async with self._lock:
-            held = self._held.get(binding_id)
-            if not held or held[0] != owner_id:
+            held = self._held.get(key)
+            if held is None or held[0] != grant:
                 return
-            _, connection = self._held.pop(binding_id)
+            _, connection = self._held.pop(key)
+            failure: BaseException | None = None
+            try:
+                await self._record_fenced_event_on_connection(connection, grant, "released")
+            except BaseException as error:
+                failure = error
+            advisory_key = _wecom_advisory_lock_key(grant.tenant_id, grant.binding_id)
             try:
                 await connection.execute(
-                    "SELECT pg_advisory_unlock(hashtextextended($1, 0))", binding_id
+                    "SELECT pg_advisory_unlock(hashtextextended($1, 0))", advisory_key
                 )
+            except BaseException as error:
+                if failure is None:
+                    failure = error
             finally:
                 await self._pool.release(connection)
+            if failure is not None:
+                raise failure
+
+    async def _record_fenced_event(
+        self,
+        grant: WeComBindingLeaseGrant,
+        event_type: str,
+        *,
+        provider_event_hash: str | None = None,
+    ) -> bool:
+        key = (grant.tenant_id, grant.binding_id)
+        async with self._lock:
+            held = self._held.get(key)
+            if held is None or held[0] != grant:
+                return False
+            return await self._record_fenced_event_on_connection(
+                held[1],
+                grant,
+                event_type,
+                provider_event_hash=provider_event_hash,
+            )
+
+    async def _record_fenced_event_on_connection(
+        self,
+        connection: asyncpg.Connection,
+        grant: WeComBindingLeaseGrant,
+        event_type: str,
+        *,
+        provider_event_hash: str | None = None,
+    ) -> bool:
+        async with connection.transaction():
+            await connection.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", grant.tenant_id
+            )
+            row = await connection.fetchrow(
+                """
+                WITH fenced AS (
+                    UPDATE wecom_connection_state
+                       SET phase=CASE
+                               WHEN $6='provider_event' THEN phase
+                               ELSE $6
+                           END,
+                           authenticated_at=CASE
+                               WHEN $6='authenticated' THEN
+                                   COALESCE(authenticated_at,clock_timestamp())
+                               ELSE authenticated_at
+                           END,
+                           disconnected_at=CASE
+                               WHEN $6='disconnected' THEN
+                                   COALESCE(disconnected_at,clock_timestamp())
+                               ELSE disconnected_at
+                           END,
+                           released_at=CASE
+                               WHEN $6='released' THEN
+                                   COALESCE(released_at,clock_timestamp())
+                               ELSE released_at
+                           END,
+                           last_provider_event_hash=CASE
+                               WHEN $6='provider_event' THEN $5
+                               ELSE last_provider_event_hash
+                           END,
+                           last_provider_event_at=CASE
+                               WHEN $6='provider_event' THEN clock_timestamp()
+                               ELSE last_provider_event_at
+                           END,
+                           updated_at=clock_timestamp()
+                     WHERE tenant_id=$1 AND binding_id=$2
+                       AND epoch=$3 AND owner_hash=$4
+                       AND released_at IS NULL
+                       AND (
+                           ($6='authenticated' AND phase='acquired')
+                           OR ($6='provider_event'
+                               AND phase IN ('acquired','authenticated'))
+                           OR ($6='disconnected'
+                               AND phase IN ('acquired','authenticated'))
+                           OR $6='released'
+                       )
+                    RETURNING tenant_id,binding_id,epoch,owner_hash
+                )
+                INSERT INTO im_acceptance_evidence_events (
+                    tenant_id,binding_id,channel,connection_epoch,event_type,
+                    owner_hash,provider_event_hash
+                )
+                SELECT tenant_id,binding_id,'wecom_ai_bot',epoch,$6,owner_hash,$5
+                  FROM fenced
+                RETURNING event_id
+                """,
+                grant.tenant_id,
+                grant.binding_id,
+                grant.epoch,
+                grant.owner_hash,
+                provider_event_hash,
+                event_type,
+            )
+        return row is not None
+
+
+def _wecom_identifier_hash(domain: str, tenant_id: str, binding_id: str, value: str) -> str:
+    material = "\x00".join(("trpc-wecom-evidence-v1", domain, tenant_id, binding_id, value))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _wecom_advisory_lock_key(tenant_id: str, binding_id: str) -> str:
+    """Return a PostgreSQL TEXT-safe identity for the binding lease lock."""
+
+    return _wecom_identifier_hash("binding-lease-lock", tenant_id, binding_id, "")
 
 
 __all__ = ["PostgresBindingLease", "PostgresRuntimeRepository"]

@@ -123,13 +123,13 @@ def test_cli_offline_entry_rejects_missing_current_release_binding(tmp_path, mon
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["gate"] == "not_run"
     assert any(
-        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason
-        for reason in report["rejection_reasons"]
+        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason for reason in report["rejection_reasons"]
     )
 
 
 class _WeComClient:
     is_connected = True
+    is_authenticated = True
 
     def __init__(self, response: object = None, error: BaseException | None = None) -> None:
         self.response = response
@@ -300,6 +300,7 @@ async def test_wecom_ack_and_unknown_response_mapping(
         owner_id="offline",
     )
     connector._clients[binding.binding_id] = _WeComClient(response=response)
+    connector._fenced_bindings.add(binding.binding_id)
     receipt = await connector.send(envelope, binding)
     assert receipt.status == status
     assert receipt.provider_code == provider_code
@@ -331,6 +332,7 @@ async def test_wecom_sdk_exception_never_becomes_delivered(
         owner_id="offline",
     )
     connector._clients[binding.binding_id] = _WeComClient(error=error)
+    connector._fenced_bindings.add(binding.binding_id)
     receipt = await connector.send(envelope, binding)
     assert (receipt.status, receipt.provider_code) == (status, provider_code)
 

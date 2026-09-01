@@ -89,6 +89,50 @@ PROVIDER_EVIDENCE_PATHS = {
     "feishu": ("provider_callback", "provider_send_ack"),
     "wecom": ("provider_ws_event", "provider_send_ack"),
 }
+FEISHU_RECONNECT_FIELDS = (
+    "failed_endpoint_id",
+    "replacement_endpoint_id",
+    "endpoint_set_observed",
+    "received_after_failover_event_id",
+    "outbound_request_id",
+    "acknowledged_request_id",
+    "ready_endpoint_count",
+    "unready_endpoint_count",
+    "terminating_endpoint_count",
+)
+IDEMPOTENCY_BASE_FIELDS = ("duplicate_event_id", "unique_inbound_id", "duplicate_count")
+FEISHU_IDEMPOTENCY_FIELDS = ("original_event_id", "provider_delivery_count")
+WECOM_IDEMPOTENCY_FIELDS = ("duplicate_source", "original_event_id", "replayed_event_id")
+WECOM_DUPLICATE_SOURCE = "service_replay_of_provider_event"
+WECOM_RECONNECT_FIELDS = (
+    "disconnect_event_id",
+    "reconnect_event_id",
+    "received_after_reconnect_event_id",
+    "lock_takeover_event_id",
+    "old_lock_owner_released",
+    "new_lock_owner_acquired",
+    "lock_epoch",
+)
+WECOM_OUTAGE_MODES = frozenset({"service_failover", "provider_delivery_gap"})
+WECOM_SERVICE_FAILOVER_FIELDS = (
+    "failed_instance_id",
+    "takeover_instance_id",
+    "old_lock_owner_released",
+    "new_lock_owner_acquired",
+    "connection_epoch",
+    "event_during_outage_id",
+    "reply_for_event_id",
+    "outbound_request_id",
+    "acknowledged_request_id",
+    "reply_count",
+    "ack_count",
+    "pending_count",
+    "dlq_count",
+)
+# Contract v1 has no provider replay/cursor API.  A total WSS outage therefore
+# remains a fail/not-supported result; no self-reported replay fields can
+# promote it to a pass.
+WECOM_PROVIDER_DELIVERY_GAP_FIELDS: tuple[str, ...] = ()
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
 SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -104,6 +148,10 @@ PROBE_URL_ALLOWLIST_ENV = "TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST"
 PROBE_URL_ALLOWLIST_ALIASES = (PROBE_URL_ALLOWLIST_ENV, "TRPC_IM_ONLINE_PROBE_ALLOWLIST")
 PROBE_IDENTITY_ENV = "TRPC_IM_ONLINE_PROBE_IDENTITY"
 PROBE_IDENTITY_HASH_ENV = "TRPC_IM_ONLINE_PROBE_IDENTITY_SHA256"
+CONTROL_PROFILE_HASH_ENV = {
+    "feishu": "TRPC_IM_ONLINE_FEISHU_CONTROL_PROFILE_SHA256",
+    "wecom": "TRPC_IM_ONLINE_WECOM_CONTROL_PROFILE_SHA256",
+}
 PROBE_TRUST_PATH = ROOT / "deploy" / "im-probe-trust.json"
 MAX_PROBE_TRUST_BYTES = 8 * 1024
 RELEASE_ID_ENV = "TRPC_RELEASE_ID"
@@ -389,7 +437,13 @@ def _normalized_probe_response_sha256(
     runtime = response.get("runtime")
     runtime_projection: dict[str, Any] = {}
     if isinstance(runtime, dict):
-        for field in ("status", "run_nonce", "image_digest", "identity_fingerprint"):
+        for field in (
+            "status",
+            "run_nonce",
+            "image_digest",
+            "identity_fingerprint",
+            "control_profile_sha256",
+        ):
             value = runtime.get(field)
             if isinstance(value, (str, int, float, bool)) or value is None:
                 runtime_projection[field] = value
@@ -418,6 +472,7 @@ def _probe_response_digest_binding(
     run_id: str,
     run_nonce: str,
     response_sha256: str,
+    control_profile_sha256: str,
     trust: dict[str, Any],
 ) -> str:
     return canonical_sha256(
@@ -426,6 +481,7 @@ def _probe_response_digest_binding(
             "run_id": run_id,
             "run_nonce": run_nonce,
             "response_sha256": response_sha256,
+            "control_profile_sha256": control_profile_sha256,
             "trust_key_id": trust["key_id"],
             "trust_key_sha256": trust["key_sha256"],
             "trust_config_sha256": trust["config_sha256"],
@@ -441,6 +497,7 @@ def _validate_probe_runtime(
     image_digest: str,
     configured_identity: str | None,
     identity_hash: str,
+    control_profile_sha256: str,
 ) -> tuple[bool, str | None]:
     """Validate a content-free probe attestation without retaining identity data."""
 
@@ -453,6 +510,8 @@ def _validate_probe_runtime(
     observed_digest = runtime.get("image_digest")
     if observed_digest != image_digest:
         return False, "probe runtime image attestation did not match candidate"
+    if runtime.get("control_profile_sha256") != control_profile_sha256:
+        return False, "probe runtime control profile did not match candidate"
     observed_hash = runtime.get("identity_fingerprint")
     if observed_hash != identity_hash:
         observed_identity = runtime.get("identity")
@@ -551,21 +610,18 @@ def _provider_code_number(value: object) -> int | None:
         return None
 
 
-def _required_observation_fields(case: str) -> tuple[str, ...]:
+def _required_observation_fields(
+    case: str,
+    *,
+    channel: str | None = None,
+    observation: object | None = None,
+) -> tuple[str, ...]:
     common = ("provider_event_id", "observed_at")
     specific: dict[str, tuple[str, ...]] = {
         "round_trip": ("callback_event_id", "outbound_request_id", "provider_code"),
-        "idempotency": ("duplicate_event_id", "unique_inbound_id", "duplicate_count"),
+        "idempotency": IDEMPOTENCY_BASE_FIELDS,
         "media": ("media_id_hash", "sha256", "bytes"),
-        "reconnect": (
-            "disconnect_event_id",
-            "reconnect_event_id",
-            "received_after_reconnect_event_id",
-            "lock_takeover_event_id",
-            "old_lock_owner_released",
-            "new_lock_owner_acquired",
-            "lock_epoch",
-        ),
+        "reconnect": (),
         "rate_limit_retry_after": (
             "provider_error_code",
             "retry_after_seconds",
@@ -587,7 +643,22 @@ def _required_observation_fields(case: str) -> tuple[str, ...]:
             "auto_replay_count",
         ),
     }
-    return common + specific[case]
+    fields = common + specific[case]
+    if case == "idempotency":
+        return fields + (
+            FEISHU_IDEMPOTENCY_FIELDS if channel == "feishu" else WECOM_IDEMPOTENCY_FIELDS
+        )
+    if case == "reconnect":
+        return fields + (FEISHU_RECONNECT_FIELDS if channel == "feishu" else WECOM_RECONNECT_FIELDS)
+    if case != "prolonged_outage" or channel != "wecom":
+        return fields
+    fields += ("outage_mode",)
+    mode = observation.get("outage_mode") if isinstance(observation, dict) else None
+    if mode == "service_failover":
+        fields += WECOM_SERVICE_FAILOVER_FIELDS
+    elif mode == "provider_delivery_gap":
+        fields += WECOM_PROVIDER_DELIVERY_GAP_FIELDS
+    return fields
 
 
 def _validate_provider_evidence(
@@ -619,8 +690,14 @@ def _validate_provider_evidence(
         errors.append("provider_evidence.independent_paths are not the channel contract")
     if evidence.get("run_nonce") != run_nonce:
         errors.append("provider_evidence.run_nonce does not match this run")
-    account_value = os.getenv(CHANNEL_ACCOUNT_VARIABLE[channel], "").strip()
-    expected_account_hash = _fingerprint(account_value, label=CHANNEL_ACCOUNT_VARIABLE[channel])
+    account_variable = CHANNEL_ACCOUNT_VARIABLE[channel]
+    expected_account_hash = credential_fingerprints.get(account_variable)
+    if (
+        not isinstance(expected_account_hash, str)
+        or HEX64_RE.fullmatch(expected_account_hash) is None
+    ):
+        errors.append("configured account credential fingerprint is missing or invalid")
+        expected_account_hash = ""
     if evidence.get("account_fingerprint") != expected_account_hash:
         errors.append("provider_evidence.account_fingerprint does not match the configured account")
 
@@ -654,6 +731,9 @@ def _validate_provider_evidence(
         "disconnect_event_id",
         "reconnect_event_id",
         "received_after_reconnect_event_id",
+        "failed_endpoint_id",
+        "replacement_endpoint_id",
+        "received_after_failover_event_id",
         "lock_takeover_event_id",
         "retry_request_id",
         "old_credential_event_id",
@@ -661,6 +741,13 @@ def _validate_provider_evidence(
         "post_rotation_event_id",
         "outage_event_id",
         "recovery_event_id",
+        "failed_instance_id",
+        "takeover_instance_id",
+        "event_during_outage_id",
+        "reply_for_event_id",
+        "acknowledged_request_id",
+        "original_event_id",
+        "replayed_event_id",
         "ambiguous_event_id",
         "manual_review_id",
     )
@@ -671,16 +758,23 @@ def _validate_provider_evidence(
             continue
         if observation.get("run_nonce") != run_nonce:
             errors.append(f"provider_evidence.observations.{case}.run_nonce mismatch")
-        for field in _required_observation_fields(case):
+        required_fields = _required_observation_fields(
+            case, channel=channel, observation=observation
+        )
+        for field in required_fields:
             if field not in observation:
                 errors.append(f"provider_evidence.observations.{case}.{field} is missing")
+        if case == "idempotency" and set(observation) != {
+            "status",
+            "run_nonce",
+            *required_fields,
+        }:
+            errors.append("provider_evidence.observations.idempotency has an invalid schema")
         provider_id = _safe_identifier(observation.get("provider_event_id"))
         if provider_id is None:
             errors.append(f"provider_evidence.observations.{case}.provider_event_id is invalid")
         elif provider_id in provider_event_ids:
-            errors.append(
-                f"provider_evidence.observations.{case}.provider_event_id must be unique"
-            )
+            errors.append(f"provider_evidence.observations.{case}.provider_event_id must be unique")
         else:
             provider_event_ids.add(provider_id)
         observed_at = _parse_timestamp(observation.get("observed_at"))
@@ -695,12 +789,52 @@ def _validate_provider_evidence(
             and _safe_identifier(observation.get("unique_inbound_id")) is None
         ):
             errors.append(f"provider_evidence.observations.{case}.unique_inbound_id is invalid")
-        if case == "idempotency" and (
-            not isinstance(observation.get("duplicate_count"), int)
-            or isinstance(observation.get("duplicate_count"), bool)
-            or observation["duplicate_count"] < 1
-        ):
-            errors.append(f"provider_evidence.observations.{case}.duplicate_count must be positive")
+        if case == "idempotency":
+            if (
+                not isinstance(observation.get("duplicate_count"), int)
+                or isinstance(observation.get("duplicate_count"), bool)
+                or observation["duplicate_count"] < 1
+            ):
+                errors.append(
+                    f"provider_evidence.observations.{case}.duplicate_count must be positive"
+                )
+            if channel == "feishu":
+                delivery_count = observation.get("provider_delivery_count")
+                if (
+                    not isinstance(delivery_count, int)
+                    or isinstance(delivery_count, bool)
+                    or delivery_count < 2
+                ):
+                    errors.append(
+                        "provider_evidence.observations.idempotency."
+                        "provider_delivery_count must be at least 2"
+                    )
+                duplicate_event = _safe_identifier(observation.get("duplicate_event_id"))
+                original_event = _safe_identifier(observation.get("original_event_id"))
+                if (
+                    duplicate_event is not None
+                    and original_event is not None
+                    and duplicate_event != original_event
+                ):
+                    errors.append(
+                        "provider_evidence.observations.idempotency.duplicate_event_id "
+                        "must match original_event_id"
+                    )
+            else:
+                if observation.get("duplicate_source") != WECOM_DUPLICATE_SOURCE:
+                    errors.append(
+                        "provider_evidence.observations.idempotency.duplicate_source is invalid"
+                    )
+                original_event = _safe_identifier(observation.get("original_event_id"))
+                replayed_event = _safe_identifier(observation.get("replayed_event_id"))
+                if (
+                    original_event is not None
+                    and replayed_event is not None
+                    and original_event == replayed_event
+                ):
+                    errors.append(
+                        "provider_evidence.observations.idempotency processing actions must differ"
+                    )
         if case == "media":
             if not isinstance(observation.get("bytes"), int) or observation["bytes"] <= 0:
                 errors.append(f"provider_evidence.observations.{case}.bytes must be positive")
@@ -739,28 +873,73 @@ def _validate_provider_evidence(
                 errors.append(
                     f"provider_evidence.observations.{case}.retry_elapsed_seconds is invalid"
                 )
-            elif _finite_number(
-                retry_after,
-                minimum=0.001,
-                maximum=MAX_RETRY_AFTER_SECONDS,
-            ) and float(retry_elapsed) < float(retry_after) * 0.9:
+            elif (
+                isinstance(retry_elapsed, (int, float))
+                and not isinstance(retry_elapsed, bool)
+                and isinstance(retry_after, (int, float))
+                and not isinstance(retry_after, bool)
+                and _finite_number(
+                    retry_after,
+                    minimum=0.001,
+                    maximum=MAX_RETRY_AFTER_SECONDS,
+                )
+                and float(retry_elapsed) < float(retry_after) * 0.9
+            ):
                 errors.append(
                     f"provider_evidence.observations.{case}.retry_elapsed_seconds did not "
                     "honor Retry-After"
                 )
-        if case == "reconnect":
+        if case == "reconnect" and channel == "wecom":
             for field in ("old_lock_owner_released", "new_lock_owner_acquired"):
                 if observation.get(field) is not True:
-                    errors.append(
-                        f"provider_evidence.observations.{case}.{field} must be true"
-                    )
+                    errors.append(f"provider_evidence.observations.{case}.{field} must be true")
             lock_epoch = observation.get("lock_epoch")
-            if (
-                not isinstance(lock_epoch, int)
-                or isinstance(lock_epoch, bool)
-                or lock_epoch < 1
-            ):
+            if not isinstance(lock_epoch, int) or isinstance(lock_epoch, bool) or lock_epoch < 1:
                 errors.append(f"provider_evidence.observations.{case}.lock_epoch is invalid")
+        if case == "reconnect" and channel == "feishu":
+            failed_endpoint = _safe_identifier(observation.get("failed_endpoint_id"))
+            replacement_endpoint = _safe_identifier(observation.get("replacement_endpoint_id"))
+            if failed_endpoint is None:
+                errors.append(
+                    "provider_evidence.observations.reconnect.failed_endpoint_id is invalid"
+                )
+            if replacement_endpoint is None:
+                errors.append(
+                    "provider_evidence.observations.reconnect.replacement_endpoint_id is invalid"
+                )
+            if (
+                failed_endpoint is not None
+                and replacement_endpoint is not None
+                and failed_endpoint == replacement_endpoint
+            ):
+                errors.append(
+                    "provider_evidence.observations.reconnect.failed_endpoint_id and "
+                    "replacement_endpoint_id must differ"
+                )
+            if observation.get("endpoint_set_observed") is not True:
+                errors.append(
+                    "provider_evidence.observations.reconnect.endpoint_set_observed must be true"
+                )
+            outbound_request = _safe_identifier(observation.get("outbound_request_id"))
+            acknowledged_request = _safe_identifier(observation.get("acknowledged_request_id"))
+            if (
+                outbound_request is not None
+                and acknowledged_request is not None
+                and outbound_request != acknowledged_request
+            ):
+                errors.append(
+                    "provider_evidence.observations.reconnect.acknowledged_request_id must "
+                    "match outbound_request_id"
+                )
+            ready_count = observation.get("ready_endpoint_count")
+            if not isinstance(ready_count, int) or isinstance(ready_count, bool) or ready_count < 1:
+                errors.append(
+                    "provider_evidence.observations.reconnect.ready_endpoint_count must be positive"
+                )
+            for field in ("unready_endpoint_count", "terminating_endpoint_count"):
+                value = observation.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value != 0:
+                    errors.append(f"provider_evidence.observations.reconnect.{field} must be 0")
         if case == "credential_rotation" and observation.get("old_credential_rejected") is not True:
             errors.append(
                 f"provider_evidence.observations.{case}.old_credential_rejected must be true"
@@ -776,6 +955,98 @@ def _validate_provider_evidence(
                     f"provider_evidence.observations.{case}.outage_seconds must be between "
                     f"{MIN_PROLONGED_OUTAGE_SECONDS} and {MAX_OUTAGE_SECONDS}"
                 )
+            if channel == "wecom":
+                outage_mode = observation.get("outage_mode")
+                if outage_mode not in WECOM_OUTAGE_MODES:
+                    errors.append(f"provider_evidence.observations.{case}.outage_mode is invalid")
+                elif outage_mode == "service_failover":
+                    failure_instance = _safe_identifier(observation.get("failed_instance_id"))
+                    takeover_instance = _safe_identifier(observation.get("takeover_instance_id"))
+                    if failure_instance is None:
+                        errors.append(
+                            f"provider_evidence.observations.{case}.failed_instance_id is invalid"
+                        )
+                    if takeover_instance is None:
+                        errors.append(
+                            f"provider_evidence.observations.{case}.takeover_instance_id is invalid"
+                        )
+                    if (
+                        failure_instance is not None
+                        and takeover_instance is not None
+                        and failure_instance == takeover_instance
+                    ):
+                        errors.append(
+                            f"provider_evidence.observations.{case}.failed_instance_id and "
+                            "takeover_instance_id must differ"
+                        )
+                    for field in ("old_lock_owner_released", "new_lock_owner_acquired"):
+                        if observation.get(field) is not True:
+                            errors.append(
+                                f"provider_evidence.observations.{case}.{field} must be true"
+                            )
+                    connection_epoch = observation.get("connection_epoch")
+                    if (
+                        not isinstance(connection_epoch, int)
+                        or isinstance(connection_epoch, bool)
+                        or connection_epoch < 1
+                    ):
+                        errors.append(
+                            f"provider_evidence.observations.{case}.connection_epoch is invalid"
+                        )
+                    outage_event = _safe_identifier(observation.get("event_during_outage_id"))
+                    reply_event = _safe_identifier(observation.get("reply_for_event_id"))
+                    outbound_request = _safe_identifier(observation.get("outbound_request_id"))
+                    acknowledged_request = _safe_identifier(
+                        observation.get("acknowledged_request_id")
+                    )
+                    for field, value in (
+                        ("event_during_outage_id", outage_event),
+                        ("reply_for_event_id", reply_event),
+                        ("outbound_request_id", outbound_request),
+                        ("acknowledged_request_id", acknowledged_request),
+                    ):
+                        if value is None:
+                            errors.append(
+                                f"provider_evidence.observations.{case}.{field} is invalid"
+                            )
+                    if (
+                        outage_event is not None
+                        and reply_event is not None
+                        and reply_event != outage_event
+                    ):
+                        errors.append(
+                            f"provider_evidence.observations.{case}.reply_for_event_id must "
+                            "match event_during_outage_id"
+                        )
+                    if (
+                        outbound_request is not None
+                        and acknowledged_request is not None
+                        and acknowledged_request != outbound_request
+                    ):
+                        errors.append(
+                            f"provider_evidence.observations.{case}.acknowledged_request_id "
+                            "must match outbound_request_id"
+                        )
+                    for field, expected in (
+                        ("reply_count", 1),
+                        ("ack_count", 1),
+                        ("pending_count", 0),
+                        ("dlq_count", 0),
+                    ):
+                        value = observation.get(field)
+                        if (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value != expected
+                        ):
+                            errors.append(
+                                f"provider_evidence.observations.{case}.{field} must be {expected}"
+                            )
+                else:
+                    errors.append(
+                        f"provider_evidence.observations.{case}.provider_delivery_gap is "
+                        "not supported by contract v1; provider replay is unavailable"
+                    )
         if case == "ambiguous":
             if observation.get("drop_response_observed") is not True:
                 errors.append(
@@ -807,10 +1078,31 @@ def _validate_provider_evidence(
             sanitized["provider_event_id_hash"] = _fingerprint(
                 provider_id, label=f"{channel}:{case}"
             )
+        correlation_labels: dict[str, str] = {}
+        if case == "idempotency" and channel == "feishu":
+            correlation_labels = {
+                "duplicate_event_id": "provider_delivery_event",
+                "original_event_id": "provider_delivery_event",
+            }
+        if case == "idempotency" and channel == "wecom":
+            correlation_labels = {
+                "original_event_id": "service_processing_action",
+                "replayed_event_id": "service_processing_action",
+            }
+        if channel == "feishu" and case == "reconnect":
+            correlation_labels = {
+                "failed_endpoint_id": "endpoint",
+                "replacement_endpoint_id": "endpoint",
+                "outbound_request_id": "outbound_request",
+                "acknowledged_request_id": "outbound_request",
+            }
         for field in (*event_fields, "unique_inbound_id"):
             value = _safe_identifier(observation.get(field))
             if value is not None:
-                sanitized[field + "_hash"] = _fingerprint(value, label=f"{channel}:{case}:{field}")
+                semantic_label = correlation_labels.get(field, field)
+                sanitized[field + "_hash"] = _fingerprint(
+                    value, label=f"{channel}:{case}:{semantic_label}"
+                )
         for field in ("provider_code", "provider_error_code"):
             value = observation.get(field)
             if isinstance(value, (str, int)) and not isinstance(value, bool):
@@ -835,19 +1127,81 @@ def _validate_provider_evidence(
             ):
                 sanitized["retry_attempts"] = value
             value = observation.get("retry_elapsed_seconds")
-            if _finite_number(value, minimum=0.0, maximum=MAX_RETRY_AFTER_SECONDS):
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and _finite_number(value, minimum=0.0, maximum=MAX_RETRY_AFTER_SECONDS)
+            ):
                 sanitized["retry_elapsed_seconds"] = float(value)
-        if case == "reconnect":
+        if case == "reconnect" and channel == "wecom":
             value = observation.get("lock_epoch")
             if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
                 sanitized["lock_epoch"] = value
             for field in ("old_lock_owner_released", "new_lock_owner_acquired"):
                 if isinstance(observation.get(field), bool):
                     sanitized[field] = observation[field]
-        for field in ("duplicate_count", "bytes", "auto_replay_count"):
+        if case == "reconnect" and channel == "feishu":
+            if isinstance(observation.get("endpoint_set_observed"), bool):
+                sanitized["endpoint_set_observed"] = observation["endpoint_set_observed"]
+            for field in (
+                "ready_endpoint_count",
+                "unready_endpoint_count",
+                "terminating_endpoint_count",
+            ):
+                value = observation.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    sanitized[field] = value
+        if channel == "wecom" and case == "prolonged_outage":
+            mode = observation.get("outage_mode")
+            if mode in WECOM_OUTAGE_MODES:
+                sanitized["outage_mode"] = mode
+            if mode == "service_failover":
+                correlation_labels = {
+                    "event_during_outage_id": "inbound_event",
+                    "reply_for_event_id": "inbound_event",
+                    "outbound_request_id": "outbound_request",
+                    "acknowledged_request_id": "outbound_request",
+                }
+                for field in (
+                    "failed_instance_id",
+                    "takeover_instance_id",
+                    *correlation_labels,
+                ):
+                    value = _safe_identifier(observation.get(field))
+                    if value is not None:
+                        semantic_label = correlation_labels.get(field, field)
+                        sanitized[field + "_hash"] = _fingerprint(
+                            value, label=f"{channel}:{case}:{semantic_label}"
+                        )
+                for field in ("old_lock_owner_released", "new_lock_owner_acquired"):
+                    if isinstance(observation.get(field), bool):
+                        sanitized[field] = observation[field]
+                connection_epoch = observation.get("connection_epoch")
+                if (
+                    isinstance(connection_epoch, int)
+                    and not isinstance(connection_epoch, bool)
+                    and connection_epoch >= 1
+                ):
+                    sanitized["connection_epoch"] = connection_epoch
+                for field in ("reply_count", "ack_count", "pending_count", "dlq_count"):
+                    value = observation.get(field)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        sanitized[field] = value
+        for field in (
+            "duplicate_count",
+            "provider_delivery_count",
+            "bytes",
+            "auto_replay_count",
+        ):
             value = observation.get(field)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 sanitized[field] = value
+        if (
+            channel == "wecom"
+            and case == "idempotency"
+            and observation.get("duplicate_source") == WECOM_DUPLICATE_SOURCE
+        ):
+            sanitized["duplicate_source"] = WECOM_DUPLICATE_SOURCE
         if isinstance(observation.get("old_credential_rejected"), bool):
             sanitized["old_credential_rejected"] = observation["old_credential_rejected"]
         if isinstance(observation.get("drop_response_observed"), bool):
@@ -1005,6 +1359,7 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
     probe_trust, probe_trust_error = _load_probe_trust()
     missing = []
     credential_fingerprints: dict[str, dict[str, str]] = {}
+    control_profile_hashes: dict[str, str] = {}
     for channel, variables in CHANNEL_CREDENTIALS.items():
         channel_fingerprints: dict[str, str] = {}
         for variable in variables:
@@ -1016,6 +1371,12 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
             else:
                 channel_fingerprints[variable] = _fingerprint(credential_value, label=variable)
         credential_fingerprints[channel] = channel_fingerprints
+        control_env = CONTROL_PROFILE_HASH_ENV[channel]
+        control_hash = os.getenv(control_env, "").strip().lower()
+        if HEX64_RE.fullmatch(control_hash) is None or control_hash == "0" * 64:
+            missing.append(f"{control_env} (nonzero 64 hex)")
+        else:
+            control_profile_hashes[channel] = control_hash
     if not probe_url:
         missing.append("TRPC_IM_ONLINE_PROBE_URL")
     if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_digest) or image_digest.lower() in {
@@ -1098,6 +1459,7 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
                     "expected_image_digest": image_digest,
                     "credential_fingerprints": credential_fingerprints[channel],
                     "probe_identity_sha256": identity_hash,
+                    "control_profile_sha256": control_profile_hashes[channel],
                     "account_fingerprint": _fingerprint(
                         os.getenv(CHANNEL_ACCOUNT_VARIABLE[channel], "").strip(),
                         label=CHANNEL_ACCOUNT_VARIABLE[channel],
@@ -1113,6 +1475,7 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
                 image_digest=image_digest,
                 configured_identity=configured_identity,
                 identity_hash=identity_hash,
+                control_profile_sha256=control_profile_hashes[channel],
             )
             if not runtime_ok:
                 raise RuntimeError(runtime_error or "probe runtime attestation failed")
@@ -1140,6 +1503,7 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
             ):
                 candidate["channels"][channel] = {
                     "status": "pass",
+                    "control_profile_sha256": control_profile_hashes[channel],
                     "cases": channel_cases,
                     "provider_evidence": provider_evidence,
                     "signature_response": {
@@ -1157,6 +1521,7 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
                         response_sha256=candidate["channels"][channel]["signature_response"][
                             "response_sha256"
                         ],
+                        control_profile_sha256=control_profile_hashes[channel],
                         trust=probe_trust,
                     )
                 )
@@ -1166,6 +1531,7 @@ def _run(output: Path, *, timeout: float, require_production: bool) -> int:
         if channel not in candidate["channels"]:
             candidate["channels"][channel] = {
                 "status": "not_run",
+                "control_profile_sha256": control_profile_hashes[channel],
                 "cases": channel_cases,
             }
 

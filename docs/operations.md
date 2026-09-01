@@ -17,6 +17,10 @@ Session Reconciler 三个有界循环。它只依赖 PostgreSQL；Compose 只等
 减少无必要的数据库竞争。收到 SIGTERM 时停止新轮次并取消三个循环，终止宽限建议至少 30 秒。
 
 Worker 接收媒体时必须配置 S3-compatible Artifact 后端，否则不会在未持久化原文件的情况下继续处理。
+`artifact-gc` 使用独立 worker 数据库身份，每轮通过 `FOR UPDATE SKIP LOCKED` 清理超过 24 小时仍为
+`staged` 的元数据与对象，并分页检查 S3 staging 前缀，回收上传成功但元数据事务未提交的孤儿对象。
+默认每轮最多 100 项、每 60 秒轮询；对象删除成功后才把元数据 CAS 为 `deleted`，供应商故障会保留
+记录供下轮幂等重试。Compose/Kubernetes 均以单副本启动，也可依靠行锁安全扩容。
 `yqzl` 基线用固定版本 MinIO 容器，仅监听 `127.0.0.1:9000`，数据位于
 `/www/wwwroot/tx.nstarzx.cn/data/minio`，凭证位于只读 `secrets/`；容器设置 512 MiB 内存、1 CPU
 和 256 PID 上限。小规模图片/PDF 验收时 Worker 常驻约几十 MiB，峰值额外内存主要由当前下载项、
@@ -53,7 +57,33 @@ PDF 解析和模型 SDK 决定；每个 Worker 当前顺序消费消息，默认
 
 发布门禁要求 callback ack p95 <200ms、已接受消息零丢失、错误率 <0.1%、突发结束后队列归零。
 PDB 保持关键角色可用，preStop 停止拉新任务并等待当前 turn；终止宽限必须大于 lease 续期间隔和常见
-turn p95。备份需要同时验证 PG PITR、对象版本和密钥恢复，季度执行按租户恢复演练。
+turn p95。备份需要同时验证 PG PITR、对象版本和密钥恢复，季度执行按租户恢复演练。三个隔离恢复作业
+分别输出 `runs/drill/postgres_pitr.json`、`artifact_restore.json`、`key_restore.json` 后，显式设置
+`TRPC_DR_DRILL_ENABLED=true` 并运行 `scripts/disaster_recovery_gate.py --require-production`。三份证据
+必须共享同一 drill/tenant canary，恢复前后 SHA-256 一致，绑定当前 candidate lock，并同时满足配置的
+RPO/RTO；未执行或只写一份“通过”摘要时门禁保持 `not_run`。
+
+没有跨区 OSS、KMS 或持久卷时，可运行零成本功能灾备检查来验证三条恢复代码路径。它从同一个
+`deploy/runtime-gate.yaml` 读取 kubeconfig、context、`image_pull_secret`、support 镜像和当前
+candidate lock，在集群内创建临时 `trpc-dr-functional-*` Namespace；Namespace 只使用 `emptyDir`，
+不挂 PVC/hostPath，也不接触生产数据。PostgreSQL 检查是合成数据的逻辑快照恢复，MinIO 检查对象版本
+恢复，密钥检查使用临时 Secret 中的合成 wrapping key；因此它只能证明功能链路，不能代替生产 PITR、
+异地对象冗余或外部 KMS。三个 Job 会一起提交，完成后收集 Kubernetes API 与 Job 输出证据，成功或失败
+都会按 Namespace UID 校验后清理临时 Namespace，报告固定为 `production_gate=not_run`。
+
+执行时先准备配置文件和当前 nonce，再显式开启：
+
+```powershell
+$env:TRPC_DR_FUNCTIONAL_ENABLED = "true"
+python -m scripts.kubernetes_functional_disaster_recovery `
+  --config deploy/runtime-gate.yaml `
+  --require-functional
+```
+
+Job 内部入口必须使用 `python -m scripts.dr_functional_job`，不要改成脚本文件路径；这样容器从
+`/app` 启动时能正确解析 `scripts` 包。报告写入
+`runs/multitenant/disaster-recovery-functional.json`，功能检查通过也不能用于
+`scripts.disaster_recovery_gate.py --require-production`。
 
 调度器 `v1` 与 `v2` 的 Redis stream、consumer group 和数据库处理语义不同。相同版本的
 代码升级可以使用 Kubernetes RollingUpdate；`v1↔v2` 是协议切换，必须先停入站、排空旧
@@ -81,7 +111,7 @@ turn p95。备份需要同时验证 PG PITR、对象版本和密钥恢复，季�
    引用的旧密钥必须同时存在并在轮换完成后移除。
 3. 使用独立 `trpc_migration` 账号执行 `trpc-service migrate --revision head`，确认
    `alembic_version` 为 checkout head；运行角色使用非 owner 的 `trpc_runtime`。
-4. 启动 Redis/MinIO，再启动 `gateway`、`admin`、`session-recovery`、`worker`、两个
+4. 启动 Redis/MinIO，再启动 `gateway`、`admin`、`session-recovery`、`artifact-gc`、`worker`、两个
    dispatcher、projector 和 `wecom-connector` 全部 systemd role。
 5. 设置 `TRPC_VERIFY_TENANT_ID` 与 `TRPC_VERIFY_BINDING_ID` 后执行
    `deploy/yqzl/verify_runtime.sh`。该脚本会检查 binding/secret 引用、WeCom connector、

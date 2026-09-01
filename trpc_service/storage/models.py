@@ -180,6 +180,16 @@ class MailboxLease(RecordModel):
         return self.owner_id
 
 
+class WeComBindingLeaseGrant(RecordModel):
+    """Fenced ownership of one tenant-scoped WeCom connection."""
+
+    tenant_id: str
+    binding_id: str
+    owner_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    epoch: int = Field(ge=1)
+    acquired_at: datetime
+
+
 class SessionClaim(RecordModel):
     """Result of a mailbox claim, including non-claim outcomes."""
 
@@ -262,4 +272,5 @@ __all__ = [
     "SummarySnapshot",
     "TurnCommit",
     "TurnStatus",
+    "WeComBindingLeaseGrant",
 ]

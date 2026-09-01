@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 
 import httpx
 import pytest
@@ -8,8 +10,11 @@ from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from scripts.feishu_http_performance import (
+    DEFAULT_CONCURRENCY,
+    MAX_WARMUP_REQUESTS,
     FeishuHTTPPerformanceOptions,
     _actual_start_rate,
+    _latency_histogram,
     _owned_http_client,
     run_feishu_http_performance,
     validate_options,
@@ -128,6 +133,181 @@ async def test_group_mode_has_unique_chat_and_message_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_warmup_uses_same_encrypted_client_and_is_excluded_from_formal_metrics() -> None:
+    adapter = FeishuAdapter(LocalSecretProvider(allow_literal=True))
+    binding = _binding()
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        callback = adapter.verify_and_parse(
+            WebhookRequest(
+                method=request.method,
+                headers=dict(request.headers),
+                body=request.content,
+            ),
+            binding,
+        )
+        assert callback.envelope is not None
+        return httpx.Response(200, json={"msg": "success"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await run_feishu_http_performance(
+            _options(total_requests=4),
+            client=client,
+            warmup_requests=2,
+            latency_threshold_ms=0.000001,
+        )
+
+    assert len(requests) == 6
+    assert result.requested == 4
+    assert result.accepted == 4
+    assert result.failed == 0
+    assert result.warmup_requested == 2
+    assert result.warmup_accepted == 2
+    assert result.warmup_failed == 0
+    assert all("-warmup-" not in value for value in result.accepted_external_message_ids)
+    assert all("-warmup-" in value for value in result.warmup_accepted_external_message_ids)
+    assert "-warmup-" not in result.session_identity_inputs[0].external_user_id
+    assert all(
+        "-warmup-" in value.external_user_id for value in result.warmup_session_identity_inputs
+    )
+    assert result.latency_threshold_ms == 0.000001
+    assert result.p90_latency_ms is not None
+    assert result.p99_latency_ms is not None
+    assert result.p99_latency_ms >= result.p90_latency_ms
+    assert result.over_threshold_count == 4
+    assert sum(result.latency_histogram.values()) == 4
+    assert result.latency_histogram == {
+        "0_10ms": 4,
+        "10_25ms": 0,
+        "25_50ms": 0,
+        "50_100ms": 0,
+        "100_200ms": 0,
+        "200_500ms": 0,
+        "500_1000ms": 0,
+        "gt_1000ms": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_warmup_failures_are_separate_from_formal_status_and_failure_counts() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json={"msg": "success"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await run_feishu_http_performance(
+            _options(total_requests=3), client=client, warmup_requests=2
+        )
+
+    assert calls == 5
+    assert result.warmup_requested == 2
+    assert result.warmup_accepted == 1
+    assert result.warmup_failed == 1
+    assert result.accepted == 3
+    assert result.failed == 0
+    assert result.status_counts == {200: 3}
+    assert result.failure_counts == {}
+    assert len(result.warmup_accepted_external_message_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_warmup_timeout_is_counted_without_affecting_formal_requests() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"msg": "success"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await run_feishu_http_performance(
+            _options(total_requests=2, timeout_seconds=0.001),
+            client=client,
+            warmup_requests=2,
+        )
+
+    assert calls == 4
+    assert result.warmup_requested == 2
+    assert result.warmup_accepted == 0
+    assert result.warmup_failed == 2
+    assert result.accepted == 2
+    assert result.failed == 0
+    assert result.status_counts == {200: 2}
+    assert result.failure_counts == {}
+
+
+@pytest.mark.parametrize("failure_kind", ["invalid_ack", "transport", "client_error"])
+@pytest.mark.asyncio
+async def test_warmup_client_failures_are_safe_and_separate(failure_kind: str) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if failure_kind == "invalid_ack":
+                return httpx.Response(200, json={"msg": "not-success"}, request=request)
+            if failure_kind == "transport":
+                raise httpx.ConnectError("secret-and-user-data", request=request)
+            raise RuntimeError("secret-and-user-data")
+        return httpx.Response(200, json={"msg": "success"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await run_feishu_http_performance(
+            _options(total_requests=1), client=client, warmup_requests=1
+        )
+
+    assert result.warmup_requested == 1
+    assert result.warmup_accepted == 0
+    assert result.warmup_failed == 1
+    assert result.accepted == 1
+    assert result.failed == 0
+    assert result.status_counts == {200: 1}
+    assert result.failure_counts == {}
+    rendered = repr(result)
+    assert "secret-and-user-data" not in rendered
+
+
+def test_latency_evidence_histogram_is_fixed_and_bounded() -> None:
+    histogram = _latency_histogram(
+        [
+            0.0,
+            10.0,
+            10.01,
+            25.0,
+            50.0,
+            100.0,
+            200.0,
+            500.0,
+            1_000.0,
+            1_000.01,
+            math.nan,
+        ]
+    )
+    assert tuple(histogram) == (
+        "0_10ms",
+        "10_25ms",
+        "25_50ms",
+        "50_100ms",
+        "100_200ms",
+        "200_500ms",
+        "500_1000ms",
+        "gt_1000ms",
+    )
+    assert sum(histogram.values()) == 11
+    assert all(isinstance(value, int) and value >= 0 for value in histogram.values())
+
+
+@pytest.mark.asyncio
 async def test_invalid_ack_http_status_and_transport_are_counted_without_response_content() -> None:
     calls = 0
 
@@ -173,6 +353,52 @@ def test_rate_schedule_has_a_bounded_total_window() -> None:
         validate_options(_options(total_requests=2, rate_per_second=0.0001))
 
 
+@pytest.mark.parametrize(
+    ("warmup_requests", "latency_threshold_ms"),
+    [
+        (-1, 200.0),
+        (MAX_WARMUP_REQUESTS + 1, 200.0),
+        (0, 0.0),
+        (0, math.nan),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_evidence_limits_are_checked_before_network_activity(
+    warmup_requests: int, latency_threshold_ms: float
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"msg": "success"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError):
+            await run_feishu_http_performance(
+                _options(),
+                client=client,
+                warmup_requests=warmup_requests,
+                latency_threshold_ms=latency_threshold_ms,
+            )
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_default_run_evidence_fields_remain_compatible() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"msg": "success"}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await run_feishu_http_performance(_options(total_requests=2), client=client)
+
+    assert result.warmup_requested == 0
+    assert result.warmup_accepted == 0
+    assert result.warmup_failed == 0
+    assert result.latency_threshold_ms == 200.0
+    assert sum(result.latency_histogram.values()) == 2
+
+
 def test_query_credentials_and_url_data_are_rejected() -> None:
     with pytest.raises(ValueError, match="query"):
         validate_options(_options(base_url="https://example.test/callback?secret=leak"))
@@ -214,3 +440,16 @@ def test_owned_http_client_pool_matches_the_bounded_concurrency() -> None:
         import asyncio
 
         asyncio.run(client.aclose())
+
+
+def test_formal_http_default_concurrency_matches_performance_gate() -> None:
+    options = FeishuHTTPPerformanceOptions(
+        base_url="http://testserver",
+        binding_id=BINDING_ID,
+        app_id=APP_ID,
+        verification_token=VERIFICATION_TOKEN,
+        encrypt_key=ENCRYPT_KEY,
+    )
+
+    assert DEFAULT_CONCURRENCY == 64
+    assert options.concurrency == DEFAULT_CONCURRENCY

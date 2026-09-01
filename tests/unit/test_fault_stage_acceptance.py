@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -223,9 +224,7 @@ class FakeBackend:
         # so the fixture does not manufacture an invalid stopped-survivor
         # evidence snapshot merely because the observer starts before health.
         while not any(  # noqa: ASYNC110 - yield until the concurrent survivor start completes
-            key != killed_container_id
-            and value.status == "running"
-            and value.health == "healthy"
+            key != killed_container_id and value.status == "running" and value.health == "healthy"
             for key, value in self.compose.containers.items()
         ):
             await asyncio.sleep(0)
@@ -794,9 +793,7 @@ async def test_v2_exact_ack_probe_accepts_xack_xdel_absent_entry() -> None:
     )
     backend = object.__new__(fault_stage_acceptance.PostgresRuntimeStageBackend)
     backend._redis = RedisDouble()
-    backend._queue = SimpleNamespace(
-        stream="trpc:session-ready:v2", group="trpc-session-ready-v2"
-    )
+    backend._queue = SimpleNamespace(stream="trpc:session-ready:v2", group="trpc-session-ready-v2")
     backend._scheduler_version = SchedulerVersion.V2
 
     assert await backend._v2_delivery_acknowledged(state, state.accepted) is True
@@ -918,9 +915,7 @@ async def test_recovery_observer_starts_before_survivor_health_and_keeps_fast_ev
             await self.compose.started.wait()
             self.returned_before_health = not self.compose.health_ready
             survivors = tuple(
-                worker
-                for worker in case_workers_before_health
-                if worker.container_id != "worker-a"
+                worker for worker in case_workers_before_health if worker.container_id != "worker-a"
             )
             return RecoveryEvidence(
                 owner_worker_id="worker-b",
@@ -1082,6 +1077,7 @@ async def test_recovery_observer_owner_epoch_survive_final_lease_clear() -> None
     backend._scheduler_version = SchedulerVersion.V2
     backend._timeout_seconds = 0.2
     backend._project = PROJECT
+
     class TransientEmptyInventoryCompose(FakeCompose):
         def __init__(self) -> None:
             super().__init__()
@@ -1190,8 +1186,7 @@ async def test_final_survivor_inventory_persistent_unhealthy_keeps_original_reas
     class UnhealthyInventoryCompose(FakeCompose):
         def list_workers(self, project: str) -> tuple[WorkerContainer, ...]:
             return tuple(
-                replace(worker, health="starting")
-                for worker in super().list_workers(project)
+                replace(worker, health="starting") for worker in super().list_workers(project)
             )
 
     compose = UnhealthyInventoryCompose()
@@ -1809,12 +1804,12 @@ async def test_postgres_cleanup_retains_case_until_redis_cleanup_succeeds() -> N
 
     class ConnectionDouble:
         def __init__(self) -> None:
-            self.statements = 0
+            self.calls: list[tuple[str, tuple[str, str, str]]] = []
 
-        async def execute(self, query: str, tenant_id: str) -> None:
-            assert "DELETE FROM" in query
-            assert tenant_id == case.tenant_id
-            self.statements += 1
+        async def fetchval(self, query: str, *args: str) -> dict[str, int]:
+            assert len(args) == 3
+            self.calls.append((query, (args[0], args[1], args[2])))
+            return {"tenants": 1}
 
     connection = ConnectionDouble()
     backend = object.__new__(fault_stage_acceptance.PostgresRuntimeStageBackend)
@@ -1822,7 +1817,7 @@ async def test_postgres_cleanup_retains_case_until_redis_cleanup_succeeds() -> N
     backend._scheduler_version = SchedulerVersion.V2
 
     @asynccontextmanager
-    async def fake_tenant_transaction(tenant_id: str):
+    async def fake_tenant_transaction(tenant_id: str) -> AsyncIterator[ConnectionDouble]:
         assert tenant_id == case.tenant_id
         yield connection
 
@@ -1835,17 +1830,21 @@ async def test_postgres_cleanup_retains_case_until_redis_cleanup_succeeds() -> N
         if redis_attempts == 1:
             raise StageAcceptanceError("temporary Redis failure")
 
-    backend._cleanup_redis_delivery = cleanup_redis  # type: ignore[method-assign]
+    backend._cleanup_redis_delivery = cleanup_redis  # type: ignore[assignment]
 
     with pytest.raises(StageAcceptanceError, match="exact Redis fault delivery cleanup failed"):
         await backend.cleanup_case(case)
     assert case.case_id in backend._cases
-    first_sql_count = connection.statements
-    assert first_sql_count > 0
+    assert connection.calls == []
 
     await backend.cleanup_case(case)
     assert case.case_id not in backend._cases
-    assert connection.statements == first_sql_count * 2
+    assert connection.calls == [
+        (
+            "SELECT public.cleanup_fault_stage_fixture($1, $2, $3)",
+            (case.tenant_id, case.run_id, case.case_id),
+        )
+    ]
     assert redis_attempts == 2
 
 
@@ -1866,12 +1865,12 @@ async def test_postgres_cleanup_accepts_authoritative_ids_after_acceptance() -> 
 
     class ConnectionDouble:
         def __init__(self) -> None:
-            self.statements = 0
+            self.calls: list[tuple[str, tuple[str, str, str]]] = []
 
-        async def execute(self, query: str, tenant_id: str) -> None:
-            assert "DELETE FROM" in query
-            assert tenant_id == original.tenant_id
-            self.statements += 1
+        async def fetchval(self, query: str, *args: str) -> str:
+            assert len(args) == 3
+            self.calls.append((query, (args[0], args[1], args[2])))
+            return '{"tenants":1}'
 
     connection = ConnectionDouble()
     backend = object.__new__(fault_stage_acceptance.PostgresRuntimeStageBackend)
@@ -1879,7 +1878,7 @@ async def test_postgres_cleanup_accepts_authoritative_ids_after_acceptance() -> 
     backend._scheduler_version = SchedulerVersion.V2
 
     @asynccontextmanager
-    async def fake_tenant_transaction(tenant_id: str):
+    async def fake_tenant_transaction(tenant_id: str) -> AsyncIterator[ConnectionDouble]:
         assert tenant_id == original.tenant_id
         yield connection
 
@@ -1888,8 +1887,49 @@ async def test_postgres_cleanup_accepts_authoritative_ids_after_acceptance() -> 
     async def cleanup_redis(_state: object) -> None:
         return None
 
-    backend._cleanup_redis_delivery = cleanup_redis  # type: ignore[method-assign]
+    backend._cleanup_redis_delivery = cleanup_redis  # type: ignore[assignment]
 
     await backend.cleanup_case(accepted)
     assert accepted.case_id not in backend._cases
-    assert connection.statements > 0
+    assert connection.calls == [
+        (
+            "SELECT public.cleanup_fault_stage_fixture($1, $2, $3)",
+            (original.tenant_id, original.run_id, original.case_id),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_cleanup_retains_authority_when_tenant_count_is_not_one() -> None:
+    case = CaseIdentity.create(FaultStage.ENQUEUE, run_id="cleanup-count")
+    state = fault_stage_acceptance._RuntimeCaseState(
+        case=case,
+        binding_id="binding-count",
+        app_id="app-count",
+        account_id="account-count",
+    )
+
+    class ConnectionDouble:
+        async def fetchval(self, query: str, *args: str) -> dict[str, int]:
+            assert query == "SELECT public.cleanup_fault_stage_fixture($1, $2, $3)"
+            assert args == (case.tenant_id, case.run_id, case.case_id)
+            return {"tenants": 0}
+
+    backend = object.__new__(fault_stage_acceptance.PostgresRuntimeStageBackend)
+    backend._cases = {case.case_id: state}
+
+    @asynccontextmanager
+    async def fake_tenant_transaction(tenant_id: str) -> AsyncIterator[ConnectionDouble]:
+        assert tenant_id == case.tenant_id
+        yield ConnectionDouble()
+
+    backend._tenant_transaction = fake_tenant_transaction  # type: ignore[method-assign]
+
+    async def cleanup_redis(_state: object) -> None:
+        return None
+
+    backend._cleanup_redis_delivery = cleanup_redis  # type: ignore[assignment]
+
+    with pytest.raises(StageAcceptanceError, match="exactly one tenant"):
+        await backend.cleanup_case(case)
+    assert case.case_id in backend._cases

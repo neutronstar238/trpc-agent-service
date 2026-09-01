@@ -7,7 +7,7 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -358,7 +358,7 @@ def _materialize_fault_children(payload: dict[str, object], report_path: Path) -
             "ended_at": generated_at,
             "gate": "pass",
             "production_gate": "not_run",
-            "candidate": {expected_phase: child_phase},
+            "candidate": {"faults" if expected_phase == "fault" else expected_phase: child_phase},
             "case_deltas": {"requested_phase": expected_phase},
         }
         scope = trusted_root / run_id
@@ -372,6 +372,7 @@ def _materialize_fault_children(payload: dict[str, object], report_path: Path) -
         item["child_report_mtime_ns"] = child_path.stat().st_mtime_ns
         item["child_report_started_at"] = generated_at
         item["child_report_ended_at"] = generated_at
+        item["child_phase"] = expected_phase
         item["child_phase_status"] = "pass"
         item["child_production_gate"] = "not_run"
 
@@ -636,6 +637,24 @@ def _valid_online_im_report(trust: dict[str, str] | None = None) -> dict[str, ob
         observations = {case: observation(case) for case in cases}
         if channel == "wecom":
             observations["rate_limit_retry_after"]["provider_error_code"] = "45009"
+            observations["prolonged_outage"].update(
+                {
+                    "outage_mode": "service_failover",
+                    "failed_instance_id_hash": "1" * 64,
+                    "takeover_instance_id_hash": "2" * 64,
+                    "old_lock_owner_released": True,
+                    "new_lock_owner_acquired": True,
+                    "connection_epoch": 3,
+                    "event_during_outage_id_hash": "3" * 64,
+                    "reply_for_event_id_hash": "3" * 64,
+                    "outbound_request_id_hash": "4" * 64,
+                    "acknowledged_request_id_hash": "4" * 64,
+                    "reply_count": 1,
+                    "ack_count": 1,
+                    "pending_count": 0,
+                    "dlq_count": 0,
+                }
+            )
         channels[channel] = {
             "status": "pass",
             "cases": {case: {"status": "pass"} for case in cases},
@@ -838,13 +857,13 @@ def _performance_candidate() -> dict[str, object]:
         "parameters": {
             "db_pool_size": 32,
             "min_workers": 4,
-            "max_inflight": 32,
+            "max_inflight": 64,
             "timeout_seconds": 300.0,
             "callbacks": 200,
             "callback_rate_per_second": 100.0,
             "burst_turns": 200,
             "target_max_turn_overlap": 200,
-            "max_inflight_accepts": 32,
+            "max_inflight_accepts": 64,
             "db_pool_scope": "load_generator_only",
             "scheduler_version": "v2",
             "redis_stream": "trpc:session-ready:v2",
@@ -852,6 +871,8 @@ def _performance_candidate() -> dict[str, object]:
         },
         "preflight": {
             "status": "pass",
+            "worker_count": 4,
+            "worker_concurrency": 50,
             "worker_processes": workers,
             "source_fingerprint": source,
             "resources": {
@@ -927,6 +948,115 @@ def _valid_performance_report() -> dict[str, object]:
         "rejection_reasons": [],
         "production_rejection_reasons": [],
     }
+
+
+def _valid_kubernetes_performance_report() -> dict[str, object]:
+    report = _valid_performance_report()
+    candidate = report["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    source = _current_candidate_source_fingerprint()["value"]
+
+    worker_processes = [
+        {
+            "role": "worker",
+            "pod_name": f"worker-{index}",
+            "pod_uid": f"pod-uid-worker-{index}",
+            "container_name": "worker",
+            "container_id": f"containerd://worker-{index}",
+            "image_id": "sha256:" + "a" * 64,
+            "source_fingerprint": None,
+            "memory_limit_bytes": 2 * 1024**3,
+        }
+        for index in range(4)
+    ]
+    outbox_processes = [
+        {
+            "role": "outbox-dispatcher",
+            "pod_name": "outbox-0",
+            "pod_uid": "pod-uid-outbox-0",
+            "container_name": "outbox-dispatcher",
+            "container_id": "containerd://outbox-0",
+            "image_id": "sha256:" + "a" * 64,
+            "source_fingerprint": source,
+            "memory_limit_bytes": 1 * 1024**3,
+        }
+    ]
+    participating = {"worker": worker_processes, "outbox-dispatcher": outbox_processes}
+    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    role_observations = {
+        "worker": {
+            "identity_count": len(worker_processes),
+            "observed_count": len(worker_processes),
+            "observations": [
+                {
+                    **identity,
+                    "memory_bytes": 128 * 1024**2,
+                    "sampled_memory_bytes": 128 * 1024**2,
+                    "sampling_source": "kubernetes_metrics_api",
+                    "metrics_timestamp": timestamp,
+                    "metrics_window": "15s",
+                }
+                for identity in worker_processes
+            ],
+        },
+        "outbox-dispatcher": {
+            "identity_count": len(outbox_processes),
+            "observed_count": len(outbox_processes),
+            "observations": [
+                {
+                    **outbox_processes[0],
+                    "memory_bytes": 64 * 1024**2,
+                    "sampled_memory_bytes": 64 * 1024**2,
+                    "sampling_source": "kubernetes_metrics_api",
+                    "metrics_timestamp": timestamp,
+                    "metrics_window": "15s",
+                }
+            ],
+        },
+    }
+    memory_observation = {
+        "status": "pass",
+        "sampling_method": "kubernetes_metrics_api",
+        "metrics_api": "metrics.k8s.io/v1beta1",
+        "sample_count": 1,
+        "sampling_interval_seconds": 15.0,
+        "sample_timestamps": [timestamp],
+        "required_roles": ["worker", "outbox-dispatcher"],
+        "role_observations": role_observations,
+        "coverage_complete": True,
+        "observed_identity_count": 5,
+        "sampled_memory_bytes": 576 * 1024**2,
+        "peak_bytes": 576 * 1024**2,
+        "safety_threshold_bytes": 9 * 1024**3,
+        "threshold_source": "pod_resource_limits",
+        "within_safety_threshold": True,
+        "observed_at": timestamp,
+    }
+    preflight["worker_processes"] = worker_processes
+    preflight["participating_processes"] = participating
+    preflight["memory_observation"] = memory_observation
+    preflight["kubernetes"] = {
+        "namespace": "acceptance",
+        "context": "test-context",
+        "metrics_api": "metrics.k8s.io/v1beta1",
+        "namespace_bound": True,
+        "memory_limit_bytes": None,
+    }
+    candidate["memory_observation"] = memory_observation
+    evidence = report["evidence"]
+    assert isinstance(evidence, dict)
+    parameters = candidate["parameters"]
+    assert isinstance(parameters, dict)
+    evidence["runtime_fingerprint"] = _runtime_fingerprint(
+        mode="real_postgresql_redis_multiprocess",
+        workers=cast(list[object], worker_processes),
+        stream="trpc:session-ready:v2",
+        group="trpc-session-ready-v2",
+        parameters=parameters,
+    )
+    return report
 
 
 REAL_RUNTIME_LOAD_STAGE_NAMES = (
@@ -1551,6 +1681,22 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "ready_replicas": 2,
         },
     }
+    external_path = (
+        f"/apis/external.metrics.k8s.io/v1beta1/namespaces/{namespace}/trpc_session_ready_backlog"
+    )
+    for phase in ("before", "during", "after"):
+        observation = hpa_observation[phase]
+        metric_value = observation["metric_value"]
+        observation["external_metric"] = {
+            "api_observed": True,
+            "api_version": "v1beta1",
+            "api_path": external_path,
+            "metric_name": "trpc_session_ready_backlog",
+            "namespace": namespace,
+            "label_namespace": namespace,
+            "item_count": 1,
+            "value": metric_value,
+        }
     post_ready = {name: {"status": "pass"} for name in release_gate.K8S_REQUIRED_DEPLOYMENTS}
     node_eviction = {
         "status": "pass",
@@ -1679,6 +1825,72 @@ def _valid_kubernetes_report() -> dict[str, object]:
         "evidence": evidence,
         "rejection_reasons": [],
         "production_rejection_reasons": [],
+    }
+
+
+def _valid_disaster_recovery_report(directory) -> dict[str, object]:
+    source = _current_candidate_source_fingerprint()
+    release_binding = _current_evidence()["release_binding"]
+    repository = "registry.example/acme/trpc-agent-service"
+    initial_digest = "sha256:" + "a" * 64
+    upgrade_digest = "sha256:" + "b" * 64
+    binding = {
+        "schema_version": 1,
+        "kind": "registry_candidate_binding",
+        "release_binding": release_binding,
+        "source_fingerprint": source,
+        "repository": repository,
+        "image_digest": initial_digest,
+        "images": {
+            "initial": {
+                "digest": initial_digest,
+                "reference": f"{repository}@{initial_digest}",
+            },
+            "upgrade": {
+                "digest": upgrade_digest,
+                "reference": f"{repository}@{upgrade_digest}",
+            },
+        },
+    }
+    lock = {
+        "schema_version": 1,
+        "kind": "release_candidate_lock",
+        "release_binding": release_binding,
+        "source_fingerprint": source,
+        "binding_sha256": release_gate.canonical_sha256(binding),
+        "repository": repository,
+        "image_digest": initial_digest,
+        "images": binding["images"],
+    }
+    binding_path = directory / "registry-image-binding.json"
+    lock_path = directory / "candidate-lock.json"
+    atomic_write_json(binding_path, binding)
+    atomic_write_json(lock_path, lock)
+    components = {
+        name: {
+            "status": "pass",
+            "run_id": f"{name}-run",
+            "rpo_seconds": 30,
+            "rto_seconds": 120,
+        }
+        for name in ("postgres_pitr", "artifact_restore", "key_restore")
+    }
+    return {
+        "schema_version": 1,
+        "baseline": {
+            "required_components": ["postgres_pitr", "artifact_restore", "key_restore"],
+            "max_rpo_seconds": 300,
+            "max_rto_seconds": 3_600,
+        },
+        "candidate": {
+            "mode": "isolated_restore_drill",
+            "lineage": {"image_digest": initial_digest},
+            "candidate_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+            "components": components,
+        },
+        "case_deltas": {"failed_components": []},
+        "production_gate": "pass",
+        "evidence": _current_evidence("scripts.disaster_recovery_gate"),
     }
 
 
@@ -1822,7 +2034,7 @@ def _valid_migration_report() -> dict[str, object]:
                 "source_fingerprint": evidence["source_fingerprint"]["value"],  # type: ignore[index]
                 "runtime_fingerprint": evidence["runtime_fingerprint"]["value"],  # type: ignore[index]
                 "image_digest": "sha256:" + "a" * 64,
-            }
+            },
         },
         "migration_evidence": {
             "status": "pass",
@@ -1973,8 +2185,7 @@ def test_real_runtime_rejects_global_participating_process_identity_mutations(
     assert status in {"not_run", "fail"}
     assert reasons
     assert any(
-        marker in reasons[0].lower()
-        for marker in ("identity", "duplicated", "pid", "container")
+        marker in reasons[0].lower() for marker in ("identity", "duplicated", "pid", "container")
     )
 
 
@@ -2429,6 +2640,216 @@ def test_performance_pass_accepts_matching_current_candidate_evidence(tmp_path) 
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("db_pool_size", 16),
+        ("max_inflight", 32),
+    ),
+)
+def test_performance_promotion_requires_formal_producer_topology(
+    tmp_path: Path, field: str, value: int
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    parameters = candidate["parameters"]
+    assert isinstance(parameters, dict)
+    parameters[field] = value
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    workers = preflight["worker_processes"]
+    assert isinstance(workers, list)
+    evidence = report_value["evidence"]
+    assert isinstance(evidence, dict)
+    evidence["runtime_fingerprint"] = _runtime_fingerprint(
+        mode="real_postgresql_redis_multiprocess",
+        workers=workers,
+        stream="trpc:session-ready:v2",
+        group="trpc-session-ready-v2",
+        parameters=parameters,
+    )
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "fail"
+    assert field in reasons[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_status"),
+    (
+        ("worker_count", None, "not_run"),
+        ("worker_count", 3, "fail"),
+        ("worker_concurrency", None, "not_run"),
+        ("worker_concurrency", 49, "fail"),
+    ),
+)
+def test_performance_promotion_requires_auditable_worker_topology(
+    tmp_path: Path,
+    field: str,
+    value: int | None,
+    expected_status: str,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    if value is None:
+        preflight.pop(field)
+    else:
+        preflight[field] = value
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == expected_status
+    assert field in reasons[0]
+
+
+def test_performance_promotion_accepts_attested_kubernetes_gateway_service(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    preflight["kubernetes"] = {
+        "namespace": "acceptance",
+        "namespace_bound": True,
+    }
+    sustained = candidate["sustained"]
+    assert isinstance(sustained, dict)
+    sustained["gateway"] = {
+        "host_class": "kubernetes_service",
+        "service_name": "trpc-gateway",
+        "namespace": "acceptance",
+        "scheme": "http",
+        "port": 8080,
+    }
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    assert _status(report, production_field=True) == ("pass", [])
+
+
+def test_performance_promotion_rejects_unbound_kubernetes_gateway_service(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    sustained = candidate["sustained"]
+    assert isinstance(sustained, dict)
+    sustained["gateway"] = {
+        "host_class": "kubernetes_service",
+        "service_name": "trpc-gateway",
+        "namespace": "acceptance",
+        "scheme": "http",
+        "port": 8080,
+    }
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert "candidate.preflight.kubernetes" in reasons[0]
+
+
+def test_performance_pass_accepts_kubernetes_metrics_with_unlabeled_workers(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_kubernetes_performance_report()
+    workers = report_value["candidate"]["preflight"]["worker_processes"]  # type: ignore[index]
+    assert all(worker["source_fingerprint"] is None for worker in workers)
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    assert _status(report, production_field=True) == ("pass", [])
+
+
+def test_performance_non_kubernetes_worker_source_fingerprint_is_required(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    workers = preflight["worker_processes"]
+    assert isinstance(workers, list)
+    for worker in workers:
+        assert isinstance(worker, dict)
+        worker["source_fingerprint"] = None
+    parameters = candidate["parameters"]
+    assert isinstance(parameters, dict)
+    evidence = report_value["evidence"]
+    assert isinstance(evidence, dict)
+    evidence["runtime_fingerprint"] = _runtime_fingerprint(
+        mode="real_postgresql_redis_multiprocess",
+        workers=workers,
+        stream="trpc:session-ready:v2",
+        group="trpc-session-ready-v2",
+        parameters=parameters,
+    )
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert "worker process image/source identity" in reasons[0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_pod_uid", "forged_container_identity", "missing_memory_bytes", "forged_pod_limit"),
+)
+def test_performance_kubernetes_metrics_memory_evidence_fails_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    report_value = _valid_kubernetes_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    participating = preflight["participating_processes"]
+    assert isinstance(participating, dict)
+    memory_observation = candidate["memory_observation"]
+    assert isinstance(memory_observation, dict)
+    observations = memory_observation["role_observations"]
+    assert isinstance(observations, dict)
+    worker_observations = observations["worker"]
+    assert isinstance(worker_observations, dict)
+    worker_observation = worker_observations["observations"][0]
+    assert isinstance(worker_observation, dict)
+    if mutation == "missing_pod_uid":
+        worker_participating = participating["worker"]
+        assert isinstance(worker_participating, list)
+        worker_participating[0].pop("pod_uid")
+    elif mutation == "forged_container_identity":
+        worker_observation["container_id"] = "containerd://forged"
+    elif mutation == "missing_memory_bytes":
+        worker_observation.pop("memory_bytes")
+    else:
+        worker_observation["memory_limit_bytes"] += 1
+
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert reasons
+    assert "memory" in reasons[0].lower() or "pod" in reasons[0].lower()
+
+
+@pytest.mark.parametrize(
     "field",
     ("value", "worker_identity_summary_sha256", "parameters_sha256"),
 )
@@ -2725,6 +3146,56 @@ def test_fault_production_pass_requires_complete_observed_scenarios(tmp_path) ->
     assert "complete inventory" in reasons[0]
 
 
+@pytest.mark.parametrize("scenario_name", ("redis_interrupt", "republish", "dlq"))
+def test_fault_production_reads_real_faults_child_phase(tmp_path, scenario_name: str) -> None:
+    report_path = tmp_path / REPORTS["fault_injection"][0]
+    payload = _valid_fault_report(report_path)
+    scenario = payload["candidate"]["scenarios"][scenario_name]  # type: ignore[index]
+    child_path = Path(scenario["child_report"])  # type: ignore[index]
+    child = json.loads(child_path.read_text(encoding="utf-8"))
+
+    assert scenario["child_phase"] == "fault"  # type: ignore[index]
+    assert child["case_deltas"]["requested_phase"] == "fault"
+    assert "faults" in child["candidate"]
+    assert "fault" not in child["candidate"]
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _status(report_path, production_field=True) == ("pass", [])
+
+
+def test_fault_production_prefers_component_markers_over_aggregate_and_rejects_tamper(
+    tmp_path,
+) -> None:
+    report_path = tmp_path / REPORTS["fault_injection"][0]
+    payload = _valid_fault_report(report_path)
+    scenario = payload["candidate"]["scenarios"]["redis_interrupt"]  # type: ignore[index]
+    assert isinstance(scenario, dict)
+    child_path = Path(scenario["child_report"])
+    child = json.loads(child_path.read_text(encoding="utf-8"))
+    phase = child["candidate"]["faults"]
+    assert isinstance(phase, dict)
+    component = phase["redis"]
+    assert isinstance(component, dict)
+    parent_markers = scenario["stage_markers"]
+    assert isinstance(parent_markers, list)
+    selected_markers = [dict(marker, component="redis") for marker in parent_markers]
+    scenario["stage_markers"] = selected_markers
+    component["stage_markers"] = selected_markers
+    phase["stage_markers"] = [dict(marker, component="postgres") for marker in selected_markers]
+    atomic_write_json(child_path, child)
+    scenario["child_report_sha256"] = canonical_sha256(child)
+    scenario["child_report_mtime_ns"] = child_path.stat().st_mtime_ns
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert _status(report_path, production_field=True) == ("pass", [])
+
+    selected_markers[0]["component"] = "tampered"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    status, reasons = _status(report_path, production_field=True)
+
+    assert status == "not_run"
+    assert "child mismatch" in reasons[0]
+
+
 def test_fault_production_pass_requires_ambiguous_provider_ledger(tmp_path) -> None:
     payload = _valid_fault_report(tmp_path / REPORTS["fault_injection"][0])
     scenario = payload["candidate"]["scenarios"]["ambiguous"]  # type: ignore[index]
@@ -2918,6 +3389,57 @@ def test_online_im_pass_requires_complete_provider_evidence(
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        ("outage_mode", "provider_delivery_gap", "outage_mode=service_failover"),
+        ("takeover_instance_id_hash", "1" * 64, "distinct failover instances"),
+        ("old_lock_owner_released", None, "lock handoff evidence"),
+        ("new_lock_owner_acquired", False, "lock handoff evidence"),
+        ("connection_epoch", 1, "connection_epoch"),
+        ("reply_for_event_id_hash", "5" * 64, "reply event binding"),
+        ("acknowledged_request_id_hash", "6" * 64, "send acknowledgement binding"),
+        ("reply_count", 2, "reply_count=1"),
+        ("pending_count", 1, "pending_count=0"),
+    ],
+)
+def test_online_im_release_rechecks_wecom_service_failover_invariants(
+    tmp_path, field: str, value: object, expected_reason: str, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    outage = payload["candidate"]["channels"]["wecom"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ]["prolonged_outage"]
+    outage[field] = value
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert expected_reason in reasons[0]
+
+
+def test_online_im_release_accepts_wecom_hard_failover_without_fake_release(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    observations = payload["candidate"]["channels"]["wecom"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ]
+    observations["reconnect"]["old_lock_owner_released"] = False
+    observations["prolonged_outage"]["old_lock_owner_released"] = False
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "pass"
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
     "mutation", ("identity", "signature", "allowlist", "nonfinite", "oversized")
 )
 def test_online_im_production_pass_rejects_unbound_or_out_of_range_probe_values(
@@ -3039,6 +3561,8 @@ def test_each_production_report_accepts_only_its_reserved_producer(tmp_path, mon
                 if filename == REPORTS["online_im"][0]
                 else _valid_kubernetes_report()
                 if filename == REPORTS["deployment"][0]
+                else _valid_disaster_recovery_report(tmp_path)
+                if filename == REPORTS["disaster_recovery"][0]
                 else {
                     "production_gate": "pass",
                     "evidence": _current_evidence(expected_producer),
@@ -3162,6 +3686,8 @@ def _write_complete_report_set(
                 if filename == REPORTS["online_im"][0]
                 else _valid_kubernetes_report()
                 if filename == REPORTS["deployment"][0]
+                else _valid_disaster_recovery_report(directory)
+                if filename == REPORTS["disaster_recovery"][0]
                 else {
                     "production_gate": "pass",
                     "evidence": _current_evidence(PRODUCTION_EVIDENCE_PRODUCERS[filename]),
@@ -3347,10 +3873,7 @@ def test_release_gate_rejects_runtime_without_database_role_evidence(tmp_path) -
 
     assert _status(report, production_field=True) == (
         "not_run",
-        [
-            "real runtime evidence is missing or invalid "
-            "candidate.database_role_evidence is missing"
-        ],
+        ["real runtime evidence is missing or invalid candidate.database_role_evidence is missing"],
     )
 
 

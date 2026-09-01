@@ -26,9 +26,7 @@ class Resource:
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch, **updates: Any) -> ServiceSettings:
-    monkeypatch.setenv(
-        "TRPC_SERVICE_DATABASE_DSN", "postgresql+asyncpg://trpc_runtime@db/service"
-    )
+    monkeypatch.setenv("TRPC_SERVICE_DATABASE_DSN", "postgresql+asyncpg://trpc_runtime@db/service")
     monkeypatch.setenv(
         "TRPC_SERVICE_WORKER_DATABASE_DSN",
         "postgresql+asyncpg://trpc_worker@db/service",

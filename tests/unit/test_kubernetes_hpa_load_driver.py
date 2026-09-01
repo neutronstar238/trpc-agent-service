@@ -139,9 +139,7 @@ def test_job_manifest_uses_configured_image_pull_secret() -> None:
         "image_pull_secret": "ghcr-pull",
     }
     manifest = hpa_driver._job_manifest(config)
-    assert manifest["spec"]["template"]["spec"]["imagePullSecrets"] == [
-        {"name": "ghcr-pull"}
-    ]
+    assert manifest["spec"]["template"]["spec"]["imagePullSecrets"] == [{"name": "ghcr-pull"}]
     assert ".dockerconfigjson" not in json.dumps(manifest)
 
 
@@ -221,9 +219,7 @@ def test_clear_uses_async_delete_and_polls_exact_job_until_absent(monkeypatch) -
 
 
 @pytest.mark.parametrize("delete_outcome", ["nonzero", "timeout"])
-def test_clear_confirms_absence_after_ambiguous_delete(
-    monkeypatch, delete_outcome: str
-) -> None:
+def test_clear_confirms_absence_after_ambiguous_delete(monkeypatch, delete_outcome: str) -> None:
     config = {
         "namespace": "runtime-gate",
         "nonce": "a" * 32,
@@ -248,15 +244,11 @@ def test_clear_confirms_absence_after_ambiguous_delete(
         del timeout, input_text
         if delete_outcome == "timeout":
             raise hpa_driver._TransientKubectlError("kubectl command timed out")
-        return type(
-            "Completed", (), {"returncode": 1, "stdout": "", "stderr": "unexpected EOF"}
-        )()
+        return type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "unexpected EOF"})()
 
     monkeypatch.setattr(hpa_driver, "_whoami", lambda *_args: None)
     monkeypatch.setattr(hpa_driver, "_cluster_fingerprint", lambda _timeout: "b" * 64)
-    monkeypatch.setattr(
-        hpa_driver, "_get_job", lambda _config, _timeout: next(observed_jobs)
-    )
+    monkeypatch.setattr(hpa_driver, "_get_job", lambda _config, _timeout: next(observed_jobs))
     monkeypatch.setattr(hpa_driver, "_kubectl", fake_delete)
 
     result = hpa_driver._clear(config, 5)
@@ -286,9 +278,7 @@ def test_clear_retries_transient_post_delete_read(monkeypatch) -> None:
         },
         "status": {"succeeded": 1},
     }
-    observed_jobs = iter(
-        (job_payload, hpa_driver._TransientKubectlError("connection reset"), None)
-    )
+    observed_jobs = iter((job_payload, hpa_driver._TransientKubectlError("connection reset"), None))
 
     def fake_get_job(_config, _timeout):
         observed = next(observed_jobs)
@@ -333,9 +323,7 @@ def test_clear_retries_transient_initial_job_read(monkeypatch) -> None:
             "labels": hpa_driver._labels(config),
         }
     }
-    observed_jobs = iter(
-        (hpa_driver._TransientKubectlError("unexpected EOF"), job_payload, None)
-    )
+    observed_jobs = iter((hpa_driver._TransientKubectlError("unexpected EOF"), job_payload, None))
 
     def fake_get_job(_config, _timeout):
         observed = next(observed_jobs)
@@ -398,9 +386,7 @@ def test_clear_retries_ambiguous_delete_while_same_job_remains(monkeypatch) -> N
 
     monkeypatch.setattr(hpa_driver, "_whoami", lambda *_args: None)
     monkeypatch.setattr(hpa_driver, "_cluster_fingerprint", lambda _timeout: "b" * 64)
-    monkeypatch.setattr(
-        hpa_driver, "_get_job", lambda _config, _timeout: next(observed_jobs)
-    )
+    monkeypatch.setattr(hpa_driver, "_get_job", lambda _config, _timeout: next(observed_jobs))
     monkeypatch.setattr(hpa_driver, "_kubectl", fake_delete)
     monkeypatch.setattr(hpa_driver.time, "sleep", lambda _seconds: None)
 

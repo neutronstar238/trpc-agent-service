@@ -5,7 +5,7 @@ import json
 import re
 from typing import Annotated, Any
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -257,6 +257,59 @@ def create_admin_router(
     ) -> list[dict[str, Any]]:
         require_role(actor, Role.AUDITOR, tenant_id=tenant_id)
         return await repository.dead_letters(tenant_id, limit=limit)
+
+    @router.get("/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/wecom")
+    async def wecom_acceptance_snapshot(
+        tenant_id: str,
+        binding_id: str,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ) -> dict[str, Any]:
+        role = Role.AUDITOR if Role.AUDITOR in actor.roles else Role.TENANT_ADMIN
+        require_role(actor, role, tenant_id=tenant_id)
+        result = await repository.wecom_acceptance_snapshot(tenant_id, binding_id, limit=limit)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="resource not found",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.get("/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/evidence")
+    async def im_acceptance_evidence(
+        tenant_id: str,
+        binding_id: str,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+        run_id: Annotated[
+            str,
+            Query(
+                min_length=1,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$",
+            ),
+        ],
+        outbound_id: Annotated[UUID, Query()],
+    ) -> dict[str, Any]:
+        role = Role.AUDITOR if Role.AUDITOR in actor.roles else Role.TENANT_ADMIN
+        require_role(actor, role, tenant_id=tenant_id)
+        result = await repository.im_acceptance_outbound_evidence(
+            tenant_id,
+            binding_id,
+            run_id=run_id,
+            outbound_id=outbound_id,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="resource not found",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
 
     @router.post("/tenants/{tenant_id}/outbound/{outbound_id}:replay", status_code=202)
     async def replay_outbound(

@@ -68,6 +68,7 @@ REPORTS = {
     "im_resilience_contract": ("im-resilience-offline.json", False),
     "privacy_leak": ("privacy-leak-offline.json", False),
     "online_im": ("im-online.json", True),
+    "disaster_recovery": ("disaster-recovery.json", True),
 }
 
 # A current-candidate envelope is useful only when it was emitted by the
@@ -83,6 +84,7 @@ PRODUCTION_EVIDENCE_PRODUCERS = {
     "migration-live.json": "scripts.migrate_data",
     "kubernetes-runtime.json": "scripts.kubernetes_runtime_gate",
     "im-online.json": "scripts.im_online_gate",
+    "disaster-recovery.json": "scripts.disaster_recovery_gate",
 }
 
 BACKEND_REQUIRED_SELECTORS = ("tests/integration",)
@@ -156,8 +158,7 @@ def _runtime_fingerprint_matches(
                         if isinstance(item, Mapping) and isinstance(item.get("role"), str)
                     }
                 )
-                and value.get("participating_container_count")
-                == len(participating_identities)
+                and value.get("participating_container_count") == len(participating_identities)
             )
         )
     )
@@ -271,6 +272,12 @@ PERFORMANCE_REQUIRED_CALLBACKS = 200
 PERFORMANCE_REQUIRED_CALLBACK_RATE = 100.0
 PERFORMANCE_REQUIRED_BURST_TURNS = 200
 PERFORMANCE_REQUIRED_WORKERS = 4
+PERFORMANCE_REQUIRED_WORKER_CONCURRENCY = 50
+# The formal run must use the same bounded producer topology as the gate
+# defaults.  Keeping these values in the release validator prevents an older
+# low-capacity report from being promoted by changing only production_gate.
+PERFORMANCE_REQUIRED_DB_POOL_SIZE = 32
+PERFORMANCE_REQUIRED_INFLIGHT = 64
 PERFORMANCE_MAX_ACK_P95_MS = 200.0
 PERFORMANCE_REQUIRED_WARMUP_STEPS = (1, 4, 8)
 # Keep the producer's hard safety envelope duplicated here.  A release report
@@ -289,6 +296,8 @@ PERFORMANCE_WORKER_POOL_MAX_SIZE = 8
 PERFORMANCE_OUTBOX_POOL_MAX_SIZE = 4
 PERFORMANCE_RECOVERY_POOL_MAX_SIZE = 2
 PERFORMANCE_PROBE_CONNECTION_HEADROOM = 8
+PERFORMANCE_MAX_KUBERNETES_MEMORY_BYTES = 2**60 - 1
+PERFORMANCE_MAX_KUBERNETES_MEMORY_IDENTITIES = 128
 PERFORMANCE_REQUIRED_MEMORY_ROLES = (
     "worker",
     "outbox-dispatcher",
@@ -354,6 +363,22 @@ IM_CASE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
         "auto_replay_count",
     ),
 }
+IM_WECOM_SERVICE_FAILOVER_FIELDS = (
+    "outage_mode",
+    "failed_instance_id_hash",
+    "takeover_instance_id_hash",
+    "old_lock_owner_released",
+    "new_lock_owner_acquired",
+    "connection_epoch",
+    "event_during_outage_id_hash",
+    "reply_for_event_id_hash",
+    "outbound_request_id_hash",
+    "acknowledged_request_id_hash",
+    "reply_count",
+    "ack_count",
+    "pending_count",
+    "dlq_count",
+)
 
 REAL_RUNTIME_REQUIRED_PHASE = "all"
 REAL_RUNTIME_REQUIRED_WORKERS = 4
@@ -415,6 +440,7 @@ def _toxiproxy_listen_matches(expected: object, observed: object) -> bool:
         and expected_port.isdecimal()
         and expected_port == observed_port
     )
+
 
 # A migration report may only promote the live gate after the complete,
 # operator-controlled Redis -> PostgreSQL cutover has been observed.  The
@@ -493,6 +519,8 @@ K8S_REQUIRED_ACTIONS = (
 K8S_REQUIRED_DEPLOYMENTS = (
     "trpc-gateway",
     "trpc-session-recovery",
+    "trpc-artifact-gc",
+    "trpc-backlog-exporter",
     "trpc-admin",
     "trpc-worker",
     "trpc-outbox-dispatcher",
@@ -533,6 +561,8 @@ MIGRATION_TARGET_EMPTY_TABLES = (
     "audit_logs",
     "session_mailboxes",
     "session_mailbox_items",
+    "wecom_connection_state",
+    "im_acceptance_evidence_events",
     "migration_checkpoints",
     "migration_scope_manifests",
     "migration_leases",
@@ -774,6 +804,345 @@ def _validate_http_status_counts(
     return None
 
 
+def _validate_kubernetes_performance_memory_observation(
+    observation: Mapping[str, Any],
+    preflight: Mapping[str, Any],
+    resources: Mapping[str, Any],
+    *,
+    worker_processes: Sequence[Any],
+) -> tuple[str | None, str | None] | None:
+    """Validate metrics-server memory evidence against Pod identities."""
+
+    if observation.get("metrics_api") != "metrics.k8s.io/v1beta1":
+        return _missing_semantic("candidate.memory_observation.metrics_api")
+    kubernetes = preflight.get("kubernetes")
+    if kubernetes is not None:
+        if (
+            not isinstance(kubernetes, Mapping)
+            or kubernetes.get("metrics_api") != "metrics.k8s.io/v1beta1"
+            or kubernetes.get("namespace_bound") is not True
+        ):
+            return _missing_semantic("candidate.preflight.kubernetes metrics binding")
+    sample_count, problem = _int_field(
+        observation,
+        "sample_count",
+        "candidate.memory_observation.sample_count",
+        exact=1,
+    )
+    if problem is not None or sample_count is None:
+        return problem or _missing_semantic("candidate.memory_observation.sample_count")
+    sample_interval = _strict_number(observation.get("sampling_interval_seconds"))
+    if sample_interval is None or sample_interval <= 0 or sample_interval > 60:
+        return _missing_semantic("candidate.memory_observation.sampling_interval_seconds")
+
+    required_roles = observation.get("required_roles")
+    if not _is_json_sequence(required_roles):
+        return _missing_semantic("candidate.memory_observation.required_roles")
+    if tuple(cast(Sequence[Any], required_roles)) != PERFORMANCE_REQUIRED_MEMORY_ROLES:
+        return _missing_semantic("candidate.memory_observation.required_roles")
+    if observation.get("coverage_complete") is not True:
+        return _missing_semantic("candidate.memory_observation.coverage_complete=true")
+
+    sample_timestamps, problem = _list_field(
+        observation,
+        "sample_timestamps",
+        "candidate.memory_observation.sample_timestamps",
+    )
+    if problem is not None or sample_timestamps is None:
+        return problem or _missing_semantic("candidate.memory_observation.sample_timestamps")
+    if not sample_timestamps or any(
+        not isinstance(timestamp, str) or not timestamp.strip() for timestamp in sample_timestamps
+    ):
+        return _missing_semantic("candidate.memory_observation.sample_timestamps")
+    if len({str(timestamp) for timestamp in sample_timestamps}) != len(sample_timestamps):
+        return _missing_semantic("candidate.memory_observation.sample_timestamps")
+    for timestamp in sample_timestamps:
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return _missing_semantic("candidate.memory_observation.sample_timestamps")
+        if parsed_timestamp.tzinfo is None:
+            return _missing_semantic("candidate.memory_observation.sample_timestamps")
+
+    participating, problem = _mapping_field(
+        preflight,
+        "participating_processes",
+        "candidate.preflight.participating_processes",
+    )
+    if problem is not None or participating is None:
+        return problem or _missing_semantic("candidate.preflight.participating_processes")
+    if set(participating) != set(PERFORMANCE_REQUIRED_MEMORY_ROLES):
+        return _missing_semantic("candidate.preflight.participating_processes exact required roles")
+
+    # Pod UID, container name, and container ID together identify the sampled
+    # runtime object without relying on a host PID that is not visible in
+    # Kubernetes mode.
+    expected_identity_keys: dict[str, set[tuple[str, str, str]]] = {}
+    expected_pod_names: dict[tuple[str, tuple[str, str, str]], str] = {}
+    expected_limits: dict[tuple[str, str, str], int] = {}
+    all_identity_keys: set[tuple[str, str, str]] = set()
+    all_pod_uids: set[str] = set()
+    all_container_ids: set[str] = set()
+    for role in PERFORMANCE_REQUIRED_MEMORY_ROLES:
+        identities = participating.get(role)
+        if not _is_json_sequence(identities) or not identities:
+            return _missing_semantic(f"candidate.preflight.participating_processes.{role}")
+        role_keys: set[tuple[str, str, str]] = set()
+        for identity in cast(Sequence[Any], identities):
+            if not isinstance(identity, Mapping) or identity.get("role") != role:
+                return _missing_semantic(
+                    f"candidate.preflight.participating_processes.{role} identity"
+                )
+            pod_name = identity.get("pod_name")
+            pod_uid = identity.get("pod_uid")
+            container_name = identity.get("container_name")
+            container_id = identity.get("container_id")
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name.strip()
+                or not isinstance(pod_uid, str)
+                or not pod_uid.strip()
+                or not isinstance(container_name, str)
+                or not container_name.strip()
+                or container_name != role
+                or not isinstance(container_id, str)
+                or not container_id.strip()
+            ):
+                return _missing_semantic(
+                    f"candidate.preflight.participating_processes.{role} Pod identity"
+                )
+            limit = _strict_int(identity.get("memory_limit_bytes"))
+            if limit is None or limit <= 0 or limit > PERFORMANCE_MAX_KUBERNETES_MEMORY_BYTES:
+                return _missing_semantic(
+                    f"candidate.preflight.participating_processes.{role}.memory_limit_bytes"
+                )
+            key = (pod_uid, container_name, container_id)
+            if (
+                key in role_keys
+                or key in all_identity_keys
+                or pod_uid in all_pod_uids
+                or container_id in all_container_ids
+            ):
+                return _failed_semantic("Kubernetes memory Pod identities are duplicated")
+            role_keys.add(key)
+            all_identity_keys.add(key)
+            all_pod_uids.add(pod_uid)
+            all_container_ids.add(container_id)
+            expected_pod_names[(role, key)] = pod_name
+            expected_limits[key] = limit
+        expected_identity_keys[role] = role_keys
+    if len(all_identity_keys) > PERFORMANCE_MAX_KUBERNETES_MEMORY_IDENTITIES:
+        return _failed_semantic("Kubernetes memory Pod identity count exceeds safety cap")
+
+    worker_details: dict[tuple[str, str, str], tuple[str, int]] = {}
+    for worker in worker_processes:
+        if not isinstance(worker, Mapping):
+            return _missing_semantic("candidate.preflight.worker_processes")
+        pod_name = worker.get("pod_name")
+        pod_uid = worker.get("pod_uid")
+        container_name = worker.get("container_name")
+        container_id = worker.get("container_id")
+        limit = _strict_int(worker.get("memory_limit_bytes"))
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name.strip()
+            or not isinstance(pod_uid, str)
+            or not pod_uid.strip()
+            or not isinstance(container_name, str)
+            or not container_name.strip()
+            or container_name != "worker"
+            or not isinstance(container_id, str)
+            or not container_id.strip()
+            or limit is None
+            or limit <= 0
+            or limit > PERFORMANCE_MAX_KUBERNETES_MEMORY_BYTES
+        ):
+            return _missing_semantic("candidate.preflight.worker_processes Pod identity")
+        key = (pod_uid, container_name, container_id)
+        if key in worker_details:
+            return _failed_semantic("independent worker Pod identities are duplicated")
+        worker_details[key] = (pod_name, limit)
+    expected_worker_details = {
+        key: (expected_pod_names[("worker", key)], expected_limits[key])
+        for key in expected_identity_keys["worker"]
+    }
+    if worker_details != expected_worker_details:
+        return _missing_semantic("worker Pod identities matching participating_processes")
+
+    role_observations, problem = _mapping_field(
+        observation,
+        "role_observations",
+        "candidate.memory_observation.role_observations",
+    )
+    if problem is not None or role_observations is None:
+        return problem or _missing_semantic("candidate.memory_observation.role_observations")
+    if set(role_observations) != set(PERFORMANCE_REQUIRED_MEMORY_ROLES):
+        return _missing_semantic(
+            "candidate.memory_observation.role_observations exact required roles"
+        )
+
+    observed_identity_keys: set[tuple[str, str, str]] = set()
+    total_memory_bytes = 0
+    total_identity_count = 0
+    for role in PERFORMANCE_REQUIRED_MEMORY_ROLES:
+        role_value, problem = _mapping_field(
+            role_observations,
+            role,
+            f"candidate.memory_observation.role_observations.{role}",
+        )
+        if problem is not None or role_value is None:
+            return problem or _missing_semantic(f"memory role {role}")
+        identity_count, problem = _int_field(
+            role_value,
+            "identity_count",
+            f"candidate.memory_observation.{role}.identity_count",
+            exact=len(expected_identity_keys[role]),
+        )
+        if problem is not None or identity_count is None:
+            return problem or _missing_semantic(f"memory role {role} identity count")
+        observed_count, problem = _int_field(
+            role_value,
+            "observed_count",
+            f"candidate.memory_observation.{role}.observed_count",
+            exact=identity_count,
+        )
+        if problem is not None or observed_count is None:
+            return problem or _missing_semantic(f"memory role {role} observed count")
+        observations, problem = _list_field(
+            role_value,
+            "observations",
+            f"candidate.memory_observation.{role}.observations",
+        )
+        if problem is not None or observations is None:
+            return problem or _missing_semantic(f"memory role {role} observations")
+        if len(observations) != identity_count:
+            return _failed_semantic(f"memory role {role} observation count mismatch")
+        role_observed_keys: set[tuple[str, str, str]] = set()
+        role_memory_bytes = 0
+        for item in observations:
+            if not isinstance(item, Mapping) or item.get("role") != role:
+                return _missing_semantic(f"memory role {role} identity binding")
+            pod_name = item.get("pod_name")
+            pod_uid = item.get("pod_uid")
+            container_name = item.get("container_name")
+            container_id = item.get("container_id")
+            if (
+                not isinstance(pod_uid, str)
+                or not pod_uid.strip()
+                or not isinstance(container_name, str)
+                or not container_name.strip()
+                or container_name != role
+                or not isinstance(container_id, str)
+                or not container_id.strip()
+            ):
+                return _missing_semantic(f"memory role {role} Pod identity")
+            key = (pod_uid, container_name, container_id)
+            if key in role_observed_keys or key in observed_identity_keys:
+                return _failed_semantic(f"memory role {role} identities are duplicated")
+            if key not in expected_identity_keys[role]:
+                return _missing_semantic(f"memory role {role} identity binding")
+            if item.get("pod_name") != expected_pod_names[(role, key)]:
+                return _missing_semantic(f"memory role {role} Pod identity binding")
+            role_observed_keys.add(key)
+            observed_identity_keys.add(key)
+            memory_bytes = _strict_int(item.get("memory_bytes"))
+            if (
+                memory_bytes is None
+                or memory_bytes <= 0
+                or memory_bytes > PERFORMANCE_MAX_KUBERNETES_MEMORY_BYTES
+            ):
+                return _missing_semantic(f"memory role {role} memory_bytes")
+            if item.get("sampled_memory_bytes") != memory_bytes:
+                return _missing_semantic(f"memory role {role} sampled_memory_bytes")
+            if item.get("sampling_source") != "kubernetes_metrics_api":
+                return _missing_semantic(f"memory role {role} sampling_source")
+            if item.get("metrics_timestamp") not in sample_timestamps:
+                return _missing_semantic(f"memory role {role} metrics_timestamp")
+            metrics_window = item.get("metrics_window")
+            if (
+                not isinstance(metrics_window, str)
+                or not metrics_window.strip()
+                or re.fullmatch(r"\d+(?:\.\d+)?(?:s|m|h)", metrics_window.strip()) is None
+            ):
+                return _missing_semantic(f"memory role {role} metrics_window")
+            limit = _strict_int(item.get("memory_limit_bytes"))
+            if (
+                limit is None
+                or limit <= 0
+                or limit > PERFORMANCE_MAX_KUBERNETES_MEMORY_BYTES
+                or limit != expected_limits[key]
+            ):
+                return _missing_semantic(f"memory role {role} pod_resource_limits")
+            role_memory_bytes += memory_bytes
+        if role_observed_keys != expected_identity_keys[role]:
+            return _missing_semantic(f"memory role {role} identity binding")
+        if role_memory_bytes <= 0:
+            return _missing_semantic(f"memory role {role} memory_bytes")
+        total_memory_bytes += role_memory_bytes
+        total_identity_count += identity_count
+
+    if observed_identity_keys != all_identity_keys:
+        return _missing_semantic("candidate.memory_observation observed Pod identities")
+    observed_total, problem = _int_field(
+        observation,
+        "observed_identity_count",
+        "candidate.memory_observation.observed_identity_count",
+        exact=total_identity_count,
+    )
+    if problem is not None or observed_total is None:
+        return problem or _missing_semantic("memory observed identity total")
+    sampled_total, problem = _int_field(
+        observation,
+        "sampled_memory_bytes",
+        "candidate.memory_observation.sampled_memory_bytes",
+        exact=total_memory_bytes,
+    )
+    if problem is not None or sampled_total is None:
+        return problem or _missing_semantic("sampled memory bytes")
+    peak_bytes, problem = _int_field(
+        observation,
+        "peak_bytes",
+        "candidate.memory_observation.peak_bytes",
+        exact=total_memory_bytes,
+    )
+    if problem is not None or peak_bytes is None:
+        return problem or _missing_semantic("memory peak bytes")
+    threshold, problem = _int_field(
+        observation,
+        "safety_threshold_bytes",
+        "candidate.memory_observation.safety_threshold_bytes",
+        minimum=1,
+    )
+    if problem is not None or threshold is None:
+        return problem or _missing_semantic("memory safety threshold")
+    threshold_source = observation.get("threshold_source")
+    limits_total = sum(expected_limits.values())
+    if threshold_source == "pod_resource_limits":
+        if threshold != limits_total:
+            return _failed_semantic("Kubernetes memory threshold does not match Pod limits")
+    elif threshold_source == "configured":
+        kubernetes = preflight.get("kubernetes")
+        configured_limit = (
+            kubernetes.get("memory_limit_bytes") if isinstance(kubernetes, Mapping) else None
+        )
+        configured_value = _strict_int(configured_limit)
+        if (
+            configured_value is None
+            or configured_value <= 0
+            or configured_value != threshold
+            or configured_value > limits_total
+        ):
+            return _missing_semantic("candidate.memory_observation configured memory limit")
+    else:
+        return _missing_semantic("candidate.memory_observation.threshold_source")
+    if observation.get("within_safety_threshold") is not True or peak_bytes > threshold:
+        return _failed_semantic("observed peak memory exceeds the safety threshold")
+    available_memory = _strict_int(resources.get("available_memory_bytes"))
+    if available_memory is None or available_memory <= 0:
+        return _missing_semantic("candidate.preflight.resources.available_memory_bytes")
+    return None
+
+
 def _validate_performance_memory_observation(
     candidate: Mapping[str, Any],
     preflight: Mapping[str, Any],
@@ -790,6 +1159,21 @@ def _validate_performance_memory_observation(
         return _failed_semantic("candidate.memory_observation reported fail")
     if observation.get("status") != "pass":
         return _missing_semantic("candidate.memory_observation.status=pass")
+    if observation.get("sampling_method") == "kubernetes_metrics_api":
+        preflight_observation = preflight.get("memory_observation")
+        if isinstance(preflight_observation, Mapping) and preflight_observation != observation:
+            return _missing_semantic("candidate.preflight.memory_observation matching candidate")
+        workers, problem = _list_field(
+            preflight, "worker_processes", "candidate.preflight.worker_processes"
+        )
+        if problem is not None or workers is None:
+            return problem or _missing_semantic("candidate.preflight.worker_processes")
+        return _validate_kubernetes_performance_memory_observation(
+            observation,
+            preflight,
+            resources,
+            worker_processes=workers,
+        )
     if observation.get("sampling_method") != "kernel_peak_counters":
         return _missing_semantic("candidate.memory_observation.sampling_method")
     sample_count = _strict_int(observation.get("sample_count"))
@@ -1036,6 +1420,11 @@ def _validate_real_performance_semantics(
         return problem or _missing_semantic("candidate.parameters.db_pool_size")
     if db_pool_size > PERFORMANCE_MAX_DB_POOL_SIZE:
         return _failed_semantic("candidate.parameters.db_pool_size exceeds the safety cap")
+    if db_pool_size != PERFORMANCE_REQUIRED_DB_POOL_SIZE:
+        return _failed_semantic(
+            "candidate.parameters.db_pool_size must equal the locked formal value "
+            f"{PERFORMANCE_REQUIRED_DB_POOL_SIZE}"
+        )
     max_inflight, problem = _int_field(
         parameters, "max_inflight", "candidate.parameters.max_inflight", minimum=1
     )
@@ -1043,6 +1432,11 @@ def _validate_real_performance_semantics(
         return problem or _missing_semantic("candidate.parameters.max_inflight")
     if max_inflight > PERFORMANCE_MAX_INFLIGHT:
         return _failed_semantic("candidate.parameters.max_inflight exceeds the safety cap")
+    if max_inflight != PERFORMANCE_REQUIRED_INFLIGHT:
+        return _failed_semantic(
+            "candidate.parameters.max_inflight must equal the locked formal value "
+            f"{PERFORMANCE_REQUIRED_INFLIGHT}"
+        )
     if db_pool_size > max_inflight:
         return _failed_semantic("database pool exceeds the bounded in-flight limit")
     max_inflight_accepts, problem = _int_field(
@@ -1078,6 +1472,22 @@ def _validate_real_performance_semantics(
         return _failed_semantic("candidate.preflight reported fail")
     if preflight_status != "pass":
         return _missing_semantic("candidate.preflight.status=pass")
+    preflight_worker_count, problem = _int_field(
+        preflight,
+        "worker_count",
+        "candidate.preflight.worker_count",
+        exact=PERFORMANCE_REQUIRED_WORKERS,
+    )
+    if problem is not None:
+        return problem
+    _, problem = _int_field(
+        preflight,
+        "worker_concurrency",
+        "candidate.preflight.worker_concurrency",
+        exact=PERFORMANCE_REQUIRED_WORKER_CONCURRENCY,
+    )
+    if problem is not None:
+        return problem
     resources, problem = _mapping_field(preflight, "resources", "candidate.preflight.resources")
     if problem is not None or resources is None:
         return problem or _missing_semantic("candidate.preflight.resources")
@@ -1147,30 +1557,67 @@ def _validate_real_performance_semantics(
     )
     if problem is not None or workers is None:
         return problem or _missing_semantic("candidate.preflight.worker_processes")
+    memory_observation = candidate.get("memory_observation")
+    kubernetes_memory_mode = (
+        isinstance(memory_observation, Mapping)
+        and memory_observation.get("sampling_method") == "kubernetes_metrics_api"
+    )
     worker_ids: list[str] = []
     worker_pids: list[int] = []
+    worker_pod_uids: set[str] = set()
     worker_images: set[str] = set()
     for worker in workers:
         if not isinstance(worker, Mapping) or not isinstance(worker.get("container_id"), str):
             return _missing_semantic("candidate.preflight.worker_processes")
-        worker_ids.append(worker["container_id"])
+        container_id = worker["container_id"]
+        if kubernetes_memory_mode:
+            pod_uid = worker.get("pod_uid")
+            container_name = worker.get("container_name")
+            pod_name = worker.get("pod_name")
+            memory_limit = _strict_int(worker.get("memory_limit_bytes"))
+            if (
+                worker.get("role") != "worker"
+                or not container_id.strip()
+                or not isinstance(pod_name, str)
+                or not pod_name.strip()
+                or not isinstance(pod_uid, str)
+                or not pod_uid.strip()
+                or not isinstance(container_name, str)
+                or not container_name.strip()
+                or container_name != "worker"
+                or memory_limit is None
+                or memory_limit <= 0
+            ):
+                return _missing_semantic("candidate.preflight worker Pod identity")
+            if pod_uid in worker_pod_uids:
+                return _failed_semantic("independent worker Pod identities are duplicated")
+            worker_pod_uids.add(pod_uid)
+        worker_ids.append(container_id)
         pid = _strict_int(worker.get("pid"))
         image_id = worker.get("image_id")
         source_value = worker.get("source_fingerprint")
         if (
-            pid is None
-            or pid < 2
+            (not kubernetes_memory_mode and (pid is None or pid < 2))
             or not isinstance(image_id, str)
             or PRODUCTION_IMAGE_DIGEST_RE.fullmatch(image_id.lower()) is None
             or not isinstance(evidence_source, Mapping)
-            or source_value != evidence_source.get("value")
+            or (
+                source_value != evidence_source.get("value")
+                and (source_value is not None or not kubernetes_memory_mode)
+            )
         ):
             return _missing_semantic("candidate.preflight worker process image/source identity")
-        worker_pids.append(pid)
+        if not kubernetes_memory_mode:
+            assert pid is not None
+            worker_pids.append(pid)
         worker_images.add(image_id.lower())
     if len(worker_ids) < PERFORMANCE_REQUIRED_WORKERS or len(worker_ids) != len(set(worker_ids)):
         return _failed_semantic("independent worker identities are incomplete or duplicated")
-    if len(worker_pids) != len(set(worker_pids)) or len(worker_images) != 1:
+    if preflight_worker_count != len(worker_ids):
+        return _failed_semantic("preflight worker_count does not match worker identities")
+    if not kubernetes_memory_mode and len(worker_pids) != len(set(worker_pids)):
+        return _failed_semantic("worker process identities are inconsistent")
+    if len(worker_images) != 1:
         return _failed_semantic("worker process or immutable image identities are inconsistent")
     if resource_values["cpu_count"] < len(worker_ids):
         return _failed_semantic("preflight CPU capacity is below discovered worker count")
@@ -1365,8 +1812,24 @@ def _validate_real_performance_semantics(
     gateway, problem = _mapping_field(sustained, "gateway", "candidate.sustained.gateway")
     if problem is not None or gateway is None:
         return problem or _missing_semantic("candidate.sustained.gateway")
-    if gateway.get("host_class") != "loopback" or gateway.get("scheme") not in {"http", "https"}:
-        return _missing_semantic("candidate.sustained.gateway loopback proof")
+    gateway_class = gateway.get("host_class")
+    if gateway_class not in {"loopback", "kubernetes_service"} or gateway.get("scheme") not in {
+        "http",
+        "https",
+    }:
+        return _missing_semantic("candidate.sustained.gateway endpoint proof")
+    if gateway_class == "kubernetes_service":
+        kubernetes, problem = _mapping_field(
+            preflight, "kubernetes", "candidate.preflight.kubernetes"
+        )
+        if problem is not None or kubernetes is None:
+            return problem or _missing_semantic("candidate.preflight.kubernetes")
+        if (
+            gateway.get("service_name") != "trpc-gateway"
+            or gateway.get("namespace") != kubernetes.get("namespace")
+            or kubernetes.get("namespace_bound") is not True
+        ):
+            return _missing_semantic("candidate.sustained.gateway Kubernetes Service binding")
     _, problem = _int_field(gateway, "port", "candidate.sustained.gateway.port", minimum=1)
     if problem is not None:
         return problem
@@ -1911,8 +2374,7 @@ def _validate_real_runtime_semantics(
     compose_start_mode = parameters.get("compose_start_mode")
     if compose_start_mode not in REAL_RUNTIME_COMPOSE_START_MODES:
         return _runtime_missing(
-            "candidate.parameters.compose_start_mode must be gate-owned or "
-            "wrapper-prestarted-owned"
+            "candidate.parameters.compose_start_mode must be gate-owned or wrapper-prestarted-owned"
         )
     for key in ("use_toxiproxy", "kill_worker", "compose_up", "republish_probe"):
         if parameters.get(key) is not True:
@@ -2032,12 +2494,13 @@ def _validate_real_runtime_semantics(
             return _runtime_missing(f"candidate.preflight.participating_services.{service_name}")
         service_ids: list[str] = []
         for container in cast(Sequence[Any], service_containers):
+            pid = _strict_int(container.get("pid")) if isinstance(container, Mapping) else None
             if (
                 not isinstance(container, Mapping)
                 or not isinstance(container.get("container_id"), str)
                 or not container["container_id"].strip()
-                or _strict_int(container.get("pid")) is None
-                or _strict_int(container.get("pid")) <= 0
+                or pid is None
+                or pid <= 0
                 or container.get("status") != "running"
                 or container.get("health") != "healthy"
                 or container.get("source_fingerprint") != source_value
@@ -2046,7 +2509,6 @@ def _validate_real_runtime_semantics(
                 return _runtime_missing(
                     f"candidate.preflight.participating_services.{service_name} identity"
                 )
-            pid = _strict_int(container.get("pid"))
             assert pid is not None
             route = container.get("connection_env")
             database_route = route.get("database") if isinstance(route, Mapping) else None
@@ -2679,9 +3141,7 @@ def _validate_k8s_image_evidence_binding(
         for deployment in expected_deployments
     }
     if not isinstance(changed, Mapping) or set(changed) != expected_deployments:
-        return _k8s_missing(
-            "candidate.checks.rolling_upgrade.image_ids.changed deployment set"
-        )
+        return _k8s_missing("candidate.checks.rolling_upgrade.image_ids.changed deployment set")
     if any(not isinstance(value, bool) for value in changed.values()):
         return _k8s_missing("candidate.checks.rolling_upgrade.image_ids.changed booleans")
     if dict(changed) != expected_changed:
@@ -4233,11 +4693,13 @@ def _validate_fault_semantics(
                 or child_deltas.get("requested_phase") != expected_phase
             ):
                 return _fault_missing(f"candidate.scenarios.{scenario_name}.child phase")
-            child_phase = child_candidate.get(expected_phase)
+            child_candidate_key = "faults" if expected_phase == "fault" else expected_phase
+            child_phase = child_candidate.get(child_candidate_key)
             if not isinstance(child_phase, Mapping):
                 return _fault_missing(f"candidate.scenarios.{scenario_name}.child phase")
             if child_phase.get("status") != scenario.get("child_phase_status"):
                 return _fault_missing(f"candidate.scenarios.{scenario_name}.child phase status")
+            selected_child: object
             if scenario_name == "ambiguous":
                 selected_child = child_phase
             elif scenario_name == "fencing":
@@ -4268,18 +4730,34 @@ def _validate_fault_semantics(
                 return _fault_missing(
                     f"candidate.scenarios.{scenario_name}.child evidence mismatch"
                 )
-            for raw_markers in (
-                child_phase.get("stage_markers"),
-                selected_child.get("stage_markers"),
-            ):
-                if not _is_json_sequence(raw_markers):
-                    continue
-                for raw_marker in cast(Sequence[Any], raw_markers):
+            selected_marker_names: set[str] = set()
+            selected_markers = selected_child.get("stage_markers")
+            if _is_json_sequence(selected_markers):
+                for raw_marker in cast(Sequence[Any], selected_markers):
                     if not isinstance(raw_marker, Mapping) or not isinstance(
                         raw_marker.get("name"), str
                     ):
                         return _fault_missing(f"candidate.scenarios.{scenario_name}.child markers")
                     marker_name = raw_marker["name"]
+                    if marker_name in selected_marker_names:
+                        return _fault_missing(
+                            f"candidate.scenarios.{scenario_name}.child marker duplicates"
+                        )
+                    selected_marker_names.add(marker_name)
+                    child_marker_map[marker_name] = raw_marker
+
+            aggregate_markers = child_phase.get("stage_markers")
+            if _is_json_sequence(aggregate_markers):
+                for raw_marker in cast(Sequence[Any], aggregate_markers):
+                    if not isinstance(raw_marker, Mapping) or not isinstance(
+                        raw_marker.get("name"), str
+                    ):
+                        return _fault_missing(f"candidate.scenarios.{scenario_name}.child markers")
+                    marker_name = raw_marker["name"]
+                    if marker_name in selected_marker_names:
+                        continue
+                    if marker_name not in required_markers:
+                        continue
                     if marker_name in child_marker_map and canonical_sha256(
                         dict(child_marker_map[marker_name])
                     ) != canonical_sha256(dict(raw_marker)):
@@ -4800,6 +5278,8 @@ def _validate_online_im_semantics(
         if not isinstance(observations, Mapping) or set(observations) != set(IM_REQUIRED_CASES):
             return _im_missing(f"candidate.channels.{channel_name}.observations exact inventory")
         for case_name, required_fields in IM_CASE_REQUIRED_FIELDS.items():
+            if channel_name == "wecom" and case_name == "prolonged_outage":
+                required_fields += IM_WECOM_SERVICE_FAILOVER_FIELDS
             observation = observations.get(case_name)
             if not isinstance(observation, Mapping) or observation.get("status") != "pass":
                 return _im_missing(
@@ -4851,15 +5331,21 @@ def _validate_online_im_semantics(
                     f"candidate.channels.{channel_name}.observations.{case_name}.bytes bounds"
                 )
             if case_name == "reconnect":
-                if (
-                    observation.get("old_lock_owner_released") is not True
-                    or observation.get("new_lock_owner_acquired") is not True
-                ):
+                released = observation.get("old_lock_owner_released")
+                acquired = observation.get("new_lock_owner_acquired")
+                released_is_valid = (
+                    type(released) is bool if channel_name == "wecom" else released is True
+                )
+                if acquired is not True or not released_is_valid:
                     return _im_missing(
-                        f"candidate.channels.{channel_name}.observations."
-                        f"{case_name} lock takeover"
+                        f"candidate.channels.{channel_name}.observations.{case_name} lock takeover"
                     )
-                if not _bounded_int(observation.get("lock_epoch"), minimum=1, maximum=2**63 - 1):
+                minimum_epoch = 2 if channel_name == "wecom" else 1
+                if not _bounded_int(
+                    observation.get("lock_epoch"),
+                    minimum=minimum_epoch,
+                    maximum=2**63 - 1,
+                ):
                     return _im_missing(
                         f"candidate.channels.{channel_name}.observations.{case_name}.lock_epoch"
                     )
@@ -4871,7 +5357,11 @@ def _validate_online_im_semantics(
                         f"{case_name}.provider rate-limit code"
                     )
                 retry_after = observation.get("retry_after_seconds")
-                if not _bounded_number(retry_after, minimum=0.001, maximum=3600.0):
+                if (
+                    not _bounded_number(retry_after, minimum=0.001, maximum=3600.0)
+                    or not isinstance(retry_after, (int, float))
+                    or isinstance(retry_after, bool)
+                ):
                     return _im_missing(
                         f"candidate.channels.{channel_name}.observations."
                         f"{case_name}.retry_after_seconds bounds"
@@ -4884,7 +5374,11 @@ def _validate_online_im_semantics(
                         f"{case_name}.retry_attempts bounds"
                     )
                 elapsed = observation.get("retry_elapsed_seconds")
-                if not _bounded_number(elapsed, minimum=0.001, maximum=3600.0):
+                if (
+                    not _bounded_number(elapsed, minimum=0.001, maximum=3600.0)
+                    or not isinstance(elapsed, (int, float))
+                    or isinstance(elapsed, bool)
+                ):
                     return _im_missing(
                         f"candidate.channels.{channel_name}.observations."
                         f"{case_name}.retry_elapsed_seconds bounds"
@@ -4903,6 +5397,58 @@ def _validate_online_im_semantics(
                     f"candidate.channels.{channel_name}.observations."
                     f"{case_name}.outage_seconds bounds"
                 )
+            if channel_name == "wecom" and case_name == "prolonged_outage":
+                if observation.get("outage_mode") != "service_failover":
+                    return _im_missing(
+                        "candidate.channels.wecom.observations.prolonged_outage."
+                        "outage_mode=service_failover"
+                    )
+                if observation.get("failed_instance_id_hash") == observation.get(
+                    "takeover_instance_id_hash"
+                ):
+                    return _im_missing(
+                        "candidate.channels.wecom.observations.prolonged_outage."
+                        "distinct failover instances"
+                    )
+                released = observation.get("old_lock_owner_released")
+                if (
+                    type(released) is not bool
+                    or observation.get("new_lock_owner_acquired") is not True
+                ):
+                    return _im_missing(
+                        "candidate.channels.wecom.observations.prolonged_outage."
+                        "lock handoff evidence"
+                    )
+                if not _bounded_int(
+                    observation.get("connection_epoch"), minimum=2, maximum=2**63 - 1
+                ):
+                    return _im_missing(
+                        "candidate.channels.wecom.observations.prolonged_outage.connection_epoch"
+                    )
+                if observation.get("event_during_outage_id_hash") != observation.get(
+                    "reply_for_event_id_hash"
+                ):
+                    return _im_missing(
+                        "candidate.channels.wecom.observations.prolonged_outage.reply event binding"
+                    )
+                if observation.get("outbound_request_id_hash") != observation.get(
+                    "acknowledged_request_id_hash"
+                ):
+                    return _im_missing(
+                        "candidate.channels.wecom.observations.prolonged_outage."
+                        "send acknowledgement binding"
+                    )
+                for field, expected in (
+                    ("reply_count", 1),
+                    ("ack_count", 1),
+                    ("pending_count", 0),
+                    ("dlq_count", 0),
+                ):
+                    if not _bounded_int(observation.get(field), minimum=expected, maximum=expected):
+                        return _im_missing(
+                            "candidate.channels.wecom.observations.prolonged_outage."
+                            f"{field}={expected}"
+                        )
             if case_name == "ambiguous" and observation.get("drop_response_observed") is not True:
                 return _im_missing(
                     f"candidate.channels.{channel_name}.observations.{case_name} drop-response"
@@ -4924,6 +5470,85 @@ def _validate_online_im_semantics(
     deltas = report.get("case_deltas")
     if not isinstance(deltas, Mapping) or deltas.get("failed_cases") != []:
         return _im_missing("case_deltas.failed_cases empty")
+    return None, None
+
+
+def _validate_disaster_recovery_semantics(
+    report: Mapping[str, Any], *, report_path: Path | None
+) -> tuple[str | None, str | None]:
+    def bounded(value: object, *, minimum: float, maximum: float) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and minimum <= float(value) <= maximum
+        )
+
+    candidate = report.get("candidate")
+    baseline = report.get("baseline")
+    deltas = report.get("case_deltas")
+    if not isinstance(candidate, Mapping) or candidate.get("mode") != "isolated_restore_drill":
+        return "not_run", "disaster recovery candidate mode is not a real isolated drill"
+    if not isinstance(baseline, Mapping):
+        return "not_run", "disaster recovery objectives are missing"
+    max_rpo = baseline.get("max_rpo_seconds")
+    max_rto = baseline.get("max_rto_seconds")
+    if not bounded(max_rpo, minimum=0, maximum=86_400) or not bounded(
+        max_rto, minimum=0, maximum=7 * 86_400
+    ):
+        return "not_run", "disaster recovery RPO/RTO objectives are invalid"
+    assert isinstance(max_rpo, (int, float))
+    assert isinstance(max_rto, (int, float))
+    required = ("postgres_pitr", "artifact_restore", "key_restore")
+    if baseline.get("required_components") != list(required):
+        return "not_run", "disaster recovery component contract is incomplete"
+    components = candidate.get("components")
+    if not isinstance(components, Mapping) or set(components) != set(required):
+        return "not_run", "disaster recovery component evidence is incomplete"
+    for name in required:
+        component = components.get(name)
+        if (
+            not isinstance(component, Mapping)
+            or component.get("status") != "pass"
+            or not isinstance(component.get("run_id"), str)
+            or not bounded(component.get("rpo_seconds"), minimum=0, maximum=float(max_rpo))
+            or not bounded(component.get("rto_seconds"), minimum=0, maximum=float(max_rto))
+        ):
+            return "not_run", f"disaster recovery component {name} is not production-valid"
+    if not isinstance(deltas, Mapping) or deltas.get("failed_components") != []:
+        return "not_run", "disaster recovery failed_components is not empty"
+    lineage = candidate.get("lineage")
+    image_digest = lineage.get("image_digest") if isinstance(lineage, Mapping) else None
+    if (
+        not isinstance(image_digest, str)
+        or PRODUCTION_IMAGE_DIGEST_RE.fullmatch(image_digest) is None
+    ):
+        return "not_run", "disaster recovery image digest is invalid"
+    if report_path is None:
+        return "not_run", "disaster recovery report path is unavailable"
+    lock_path = report_path.parent / "candidate-lock.json"
+    binding_path = report_path.parent / "registry-image-binding.json"
+    if (
+        lock_path.is_symlink()
+        or binding_path.is_symlink()
+        or not lock_path.is_file()
+        or not binding_path.is_file()
+    ):
+        return "not_run", "disaster recovery candidate lock or image binding is missing"
+    try:
+        lock = _strict_json_loads(lock_path.read_text(encoding="utf-8"))
+        binding = _strict_json_loads(binding_path.read_text(encoding="utf-8"))
+        from scripts.candidate_lock import verify_candidate_lock
+
+        lock_reasons = verify_candidate_lock(lock, binding)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, TypeError) as error:
+        return "not_run", f"disaster recovery candidate lock is invalid: {type(error).__name__}"
+    if lock_reasons:
+        return "not_run", lock_reasons[0]
+    if candidate.get("candidate_lock_sha256") != hashlib.sha256(lock_path.read_bytes()).hexdigest():
+        return "not_run", "disaster recovery candidate lock content changed"
+    if lock.get("image_digest") != image_digest:
+        return "not_run", "disaster recovery candidate lock image digest changed"
     return None, None
 
 
@@ -4991,6 +5616,10 @@ def _production_evidence_result(
             if not isinstance(evidence, Mapping):
                 return "not_run", "online IM evidence is missing current-candidate lineage"
             return _validate_online_im_semantics(report, evidence)
+        if report_name == REPORTS["disaster_recovery"][0]:
+            if not isinstance(evidence, Mapping):
+                return "not_run", "disaster recovery evidence is missing current-candidate lineage"
+            return _validate_disaster_recovery_semantics(report, report_path=report_path)
         return None, None
     # Keep the historical performance wording stable for existing operators;
     # all production reports use the same validator underneath.

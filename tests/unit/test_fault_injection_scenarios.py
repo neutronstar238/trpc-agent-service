@@ -469,17 +469,13 @@ def test_real_fault_entry_requires_current_release_binding(tmp_path, monkeypatch
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["gate"] == "not_run"
     assert any(
-        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason
-        for reason in report["rejection_reasons"]
+        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason for reason in report["rejection_reasons"]
     )
 
 
 def test_final_fault_wrapper_requires_complete_production_gate_before_cleanup() -> None:
     wrapper = (
-        Path(__file__).resolve().parents[2]
-        / "runs"
-        / "multitenant"
-        / "run-final-fault-gate.ps1"
+        Path(__file__).resolve().parents[2] / "runs" / "multitenant" / "run-final-fault-gate.ps1"
     )
     source = wrapper.read_text(encoding="utf-8")
 
@@ -489,6 +485,20 @@ def test_final_fault_wrapper_requires_complete_production_gate_before_cleanup() 
     cleanup_offset = source.index("docker compose @stageCompose down")
     assert guard_offset < cleanup_offset
     assert 'status -ne "not_run"' not in source
+
+
+def test_final_fault_wrapper_uses_normal_runtime_compose_ports() -> None:
+    wrapper = (
+        Path(__file__).resolve().parents[2] / "runs" / "multitenant" / "run-final-fault-gate.ps1"
+    )
+    lines = wrapper.read_text(encoding="utf-8").splitlines()
+    database_line = next(line for line in lines if "$env:TRPC_REAL_DATABASE_DSN =" in line)
+    redis_line = next(line for line in lines if "$env:TRPC_REAL_REDIS_URL =" in line)
+
+    assert "$runtimeDbPort" in database_line
+    assert ":15432/" not in database_line
+    assert "$runtimeRedisPort" in redis_line
+    assert ":16379/" not in redis_line
 
 
 def test_real_command_forwards_isolated_compose_and_toxiproxy_selectors(tmp_path) -> None:
@@ -1335,14 +1345,10 @@ def test_fault_stage_child_preserves_completed_case_when_later_case_is_not_run(
             "scheduler_version": env["TRPC_FAULT_SCHEDULER_VERSION"],
             "redis_stream": env["TRPC_FAULT_REDIS_STREAM"],
             "redis_group": env["TRPC_FAULT_REDIS_GROUP"],
-            "nonce_sha256": hashlib.sha256(
-                env["TRPC_FAULT_EVIDENCE_NONCE"].encode()
-            ).hexdigest(),
+            "nonce_sha256": hashlib.sha256(env["TRPC_FAULT_EVIDENCE_NONCE"].encode()).hexdigest(),
             "pid": 1234,
         }
-        child = _fault_stage_child(
-            env["TRPC_FAULT_RUN_ID"], gate="not_run", provenance=provenance
-        )
+        child = _fault_stage_child(env["TRPC_FAULT_RUN_ID"], gate="not_run", provenance=provenance)
         child["cases"][0]["status"] = "pass"
         child["cases"][0]["markers"] = [
             {"name": marker, "status": "pass", "observed_at": "now"}
@@ -1364,9 +1370,7 @@ def test_fault_stage_child_preserves_completed_case_when_later_case_is_not_run(
     assert "lease takeover" in result["worker_tool"]["reason"]
 
 
-def test_fault_stage_acceptance_attaches_current_image_attestation(
-    monkeypatch, tmp_path
-) -> None:
+def test_fault_stage_acceptance_attaches_current_image_attestation(monkeypatch, tmp_path) -> None:
     output = tmp_path / "fault-injection.json"
     args = _fault_stage_args(output, scenario="worker_enqueue")
     source = "a" * 64
@@ -1425,9 +1429,7 @@ def test_fault_stage_acceptance_attaches_current_image_attestation(
         expected_source_fingerprint={"value": source},
     )
 
-    assert attestation_calls == [
-        ("trpc-fault-test-run", "worker-container-verified", source)
-    ]
+    assert attestation_calls == [("trpc-fault-test-run", "worker-container-verified", source)]
     preflight = result["worker_enqueue"]["worker_preflight"]
     assert preflight["image_id"] == image
     assert preflight["source_fingerprint"] == source

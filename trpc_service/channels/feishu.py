@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, unquote
 
 import httpx
@@ -614,9 +614,7 @@ class FeishuAdapter:
                     f"token_{code}",
                     retryable=retryable,
                     retry_after_seconds=(
-                        _retry_after_seconds(response, payload=payload)
-                        if retryable
-                        else None
+                        _retry_after_seconds(response, payload=payload) if retryable else None
                     ),
                 )
             if not isinstance(token, str) or not token or expires <= 0:
@@ -868,7 +866,7 @@ def _coerce_retry_after(raw: object, *, now: float | None = None) -> float | Non
     if raw is None or isinstance(raw, bool):
         return None
     try:
-        seconds = float(raw)
+        seconds = float(cast(Any, raw))
     except (TypeError, ValueError, OverflowError):
         if not isinstance(raw, str):
             return None

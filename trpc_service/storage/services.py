@@ -305,7 +305,7 @@ class PostgresArtifactStore:
                     ) VALUES ($1,$2,$3,$4,$5,'staged')
                     ON CONFLICT (tenant_id,artifact_id) DO UPDATE
                        SET object_key=excluded.object_key,size_bytes=excluded.size_bytes,
-                           status='staged'
+                           status='staged',created_at=clock_timestamp()
                      WHERE artifacts.status='staged'
                        AND artifacts.checksum=excluded.checksum
                     """,
@@ -495,6 +495,56 @@ class PostgresKnowledgeStore(_PostgresTenantStore):
                 vector,
                 _dump(metadata),
             )
+
+    async def search(
+        self,
+        tenant_id: str,
+        embedding: list[float],
+        *,
+        limit: int = 5,
+    ) -> tuple[JsonObject, ...]:
+        """Return nearest tenant-owned knowledge chunks.
+
+        The tenant predicate is intentionally repeated on the embedding table
+        rather than relying only on the item foreign key.  This keeps the
+        method safe for both shared profiles and PostgreSQL RLS deployments.
+        ``embedding`` is supplied by an injected query provider; this store
+        never manufactures a vector from user text.
+        """
+
+        if len(embedding) != self._dimension:
+            raise ValueError(f"embedding dimension must be {self._dimension}")
+        if limit < 1 or limit > 100:
+            raise ValueError("knowledge result limit must be between 1 and 100")
+        vector = "[" + ",".join(format(value, ".9g") for value in embedding) + "]"
+        async with self._transaction(tenant_id) as connection:
+            rows = await connection.fetch(
+                """
+                SELECT embedding.item_id,embedding.chunk_id,embedding.metadata_json,
+                       1 - (embedding.embedding <=> $3::vector) AS score
+                  FROM knowledge_embeddings AS embedding
+                  JOIN knowledge_items AS item
+                    ON item.tenant_id=embedding.tenant_id
+                   AND item.item_id=embedding.item_id
+                 WHERE embedding.tenant_id=$1
+                   AND item.profile_id=$2
+                 ORDER BY embedding.embedding <=> $3::vector
+                 LIMIT $4
+                """,
+                tenant_id,
+                self._profile_id,
+                vector,
+                limit,
+            )
+        return tuple(
+            {
+                "item_id": str(row["item_id"]),
+                "chunk_id": str(row["chunk_id"]),
+                "score": float(row["score"]),
+                "metadata": _decode(row["metadata_json"]),
+            }
+            for row in rows
+        )
 
 
 class PostgresAuditStore(_PostgresTenantStore):

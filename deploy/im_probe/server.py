@@ -18,17 +18,21 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
 import stat
 import subprocess
 import sys
-from collections.abc import Mapping
+import tempfile
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from typing import Any, cast
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -53,7 +57,10 @@ HEALTH_READY_PATH = "/health/ready"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RUNNER_OUTPUT_BYTES = 256 * 1024
+MAX_CONTROL_PROFILE_BYTES = 64 * 1024
 MAX_RUNNER_TIMEOUT_SECONDS = 15 * 60
+NONCE_CACHE_CAPACITY = 4096
+NONCE_CACHE_TTL = timedelta(hours=24)
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$")
 SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -70,6 +77,7 @@ REQUEST_FIELDS = frozenset(
         "credential_fingerprints",
         "probe_identity_sha256",
         "account_fingerprint",
+        "control_profile_sha256",
     }
 )
 
@@ -133,9 +141,8 @@ def _safe_id(value: object, *, label: str, pattern: re.Pattern[str] = SAFE_ID_RE
 
 
 def _safe_config_id(value: str, *, label: str) -> str:
-    if (
-        SAFE_CODE_RE.fullmatch(value) is None
-        or any(marker in value.lower() for marker in PLACEHOLDER_MARKERS)
+    if SAFE_CODE_RE.fullmatch(value) is None or any(
+        marker in value.lower() for marker in PLACEHOLDER_MARKERS
     ):
         raise ProbeConfigurationError(f"{label} is invalid")
     return value
@@ -164,11 +171,49 @@ def _safe_path(
             mode = resolved.stat().st_mode
         except OSError as error:
             raise ProbeConfigurationError(f"{label} is unavailable") from error
-        if not stat.S_ISREG(mode) or mode & 0o022:
+        if not stat.S_ISREG(mode) or (os.name != "nt" and mode & 0o022):
             raise ProbeConfigurationError(f"{label} must be a non-writable regular file")
-        if private and mode & 0o027:
+        if os.name != "nt" and private and mode & 0o027:
             raise ProbeConfigurationError(f"{label} must not be readable by other users")
     return resolved
+
+
+def _safe_control_socket_path(
+    value: str,
+    *,
+    label: str = "TRPC_IM_PROBE_CONTROL_SOCKET",
+) -> Path:
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or any(parent.is_symlink() for parent in path.parents)
+    ):
+        raise ProbeConfigurationError(f"{label} must be an absolute non-symlink path")
+    try:
+        resolved = path.resolve(strict=True)
+        mode = resolved.stat().st_mode
+    except (OSError, RuntimeError) as error:
+        raise ProbeConfigurationError(f"{label} is unavailable") from error
+    if os.name != "nt" and not stat.S_ISSOCK(mode):
+        raise ProbeConfigurationError(f"{label} must be a socket")
+    if os.name == "nt" and stat.S_ISDIR(mode):
+        raise ProbeConfigurationError(f"{label} must not be a directory")
+    return resolved
+
+
+def _control_profile_sha256(path: Path, *, label: str) -> str:
+    validated = _safe_path(str(path), label=label, private=True)
+    try:
+        with validated.open("rb") as profile:
+            raw = profile.read(MAX_CONTROL_PROFILE_BYTES + 1)
+    except OSError as error:
+        raise ProbeConfigurationError(f"{label} is unavailable") from error
+    if not raw:
+        raise ProbeConfigurationError(f"{label} is empty")
+    if len(raw) > MAX_CONTROL_PROFILE_BYTES:
+        raise ProbeConfigurationError(f"{label} is too large")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _read_private_seed(path: Path) -> Ed25519PrivateKey:
@@ -213,6 +258,7 @@ class ProbeConfig:
     port: int
     runner: Path | None
     runner_timeout_seconds: float
+    driver_timeout_seconds: float
     signing_key_path: Path
     key_id: str
     image_digest: str
@@ -220,6 +266,9 @@ class ProbeConfig:
     account_ids: Mapping[str, str]
     credential_paths: Mapping[str, Mapping[str, Path]]
     runner_secret_paths: Mapping[str, Mapping[str, Path]]
+    driver_paths: Mapping[str, Path]
+    control_profile_paths: Mapping[str, Path]
+    control_socket: Path | None
 
     @classmethod
     def from_environment(cls) -> ProbeConfig:
@@ -246,6 +295,16 @@ class ProbeConfig:
             raise ProbeConfigurationError(
                 "TRPC_IM_PROBE_RUNNER_TIMEOUT_SECONDS is outside the safe range"
             )
+        try:
+            driver_timeout = float(os.getenv("TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS", str(timeout)))
+        except ValueError as error:
+            raise ProbeConfigurationError(
+                "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS is invalid"
+            ) from error
+        if not 0.001 <= driver_timeout <= MAX_RUNNER_TIMEOUT_SECONDS:
+            raise ProbeConfigurationError(
+                "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS is outside the safe range"
+            )
 
         key_path = _safe_path(
             os.getenv("TRPC_IM_PROBE_SIGNING_KEY_FILE", ""),
@@ -265,14 +324,12 @@ class ProbeConfig:
             "feishu": os.getenv("TRPC_IM_PROBE_FEISHU_APP_ID", "").strip(),
             "wecom": os.getenv("TRPC_IM_PROBE_WECOM_BOT_ID", "").strip(),
         }
-        if (
-            re.fullmatch(r"cli_[A-Za-z0-9]+", account_ids["feishu"]) is None
-            or any(marker in account_ids["feishu"].lower() for marker in PLACEHOLDER_MARKERS)
+        if re.fullmatch(r"cli_[A-Za-z0-9]+", account_ids["feishu"]) is None or any(
+            marker in account_ids["feishu"].lower() for marker in PLACEHOLDER_MARKERS
         ):
             raise ProbeConfigurationError("TRPC_IM_PROBE_FEISHU_APP_ID is invalid")
-        if (
-            SAFE_ID_RE.fullmatch(account_ids["wecom"]) is None
-            or any(marker in account_ids["wecom"].lower() for marker in PLACEHOLDER_MARKERS)
+        if SAFE_ID_RE.fullmatch(account_ids["wecom"]) is None or any(
+            marker in account_ids["wecom"].lower() for marker in PLACEHOLDER_MARKERS
         ):
             raise ProbeConfigurationError("TRPC_IM_PROBE_WECOM_BOT_ID is invalid")
 
@@ -287,21 +344,48 @@ class ProbeConfig:
         credential_paths: dict[str, dict[str, Path]] = {}
         for channel, variables in required_paths.items():
             credential_paths[channel] = {
-                variable: _safe_path(
-                    os.getenv(env_name, ""), label=env_name, private=True
-                )
+                variable: _safe_path(os.getenv(env_name, ""), label=env_name, private=True)
                 for variable, env_name in variables.items()
             }
 
+        control_profile_paths: dict[str, Path] = {}
+        for channel in ("feishu", "wecom"):
+            env_name = f"TRPC_IM_PROBE_{channel.upper()}_CONTROL_PROFILE_FILE"
+            profile = _safe_path(os.getenv(env_name, ""), label=env_name, private=True)
+            _control_profile_sha256(profile, label=env_name)
+            control_profile_paths[channel] = profile
+
         runner_text = os.getenv("TRPC_IM_PROBE_RUNNER", "").strip()
         runner = None
+        driver_paths: dict[str, Path] = {}
+        control_socket = None
         if runner_text:
             runner = _safe_path(runner_text, label="TRPC_IM_PROBE_RUNNER")
+            try:
+                runner.relative_to(ROOT.resolve())
+            except ValueError:
+                pass
+            else:
+                raise ProbeConfigurationError(
+                    "TRPC_IM_PROBE_RUNNER must be installed outside the application checkout"
+                )
             try:
                 if not os.access(runner, os.X_OK):
                     raise ProbeConfigurationError("TRPC_IM_PROBE_RUNNER is not executable")
             except OSError as error:
                 raise ProbeConfigurationError("TRPC_IM_PROBE_RUNNER is unavailable") from error
+            for channel in ("feishu", "wecom"):
+                env_name = f"TRPC_IM_PROBE_{channel.upper()}_DRIVER"
+                driver = _safe_path(os.getenv(env_name, ""), label=env_name)
+                try:
+                    if not os.access(driver, os.X_OK):
+                        raise ProbeConfigurationError(f"{env_name} is not executable")
+                except OSError as error:
+                    raise ProbeConfigurationError(f"{env_name} is unavailable") from error
+                driver_paths[channel] = driver
+            control_socket = _safe_control_socket_path(
+                os.getenv("TRPC_IM_PROBE_CONTROL_SOCKET", "")
+            )
 
         runner_secret_paths: dict[str, dict[str, Path]] = {"feishu": {}, "wecom": {}}
         optional_paths = {
@@ -327,6 +411,7 @@ class ProbeConfig:
             port=port,
             runner=runner,
             runner_timeout_seconds=timeout,
+            driver_timeout_seconds=driver_timeout,
             signing_key_path=key_path,
             key_id=key_id,
             image_digest=image_digest,
@@ -334,6 +419,9 @@ class ProbeConfig:
             account_ids=account_ids,
             credential_paths=credential_paths,
             runner_secret_paths=runner_secret_paths,
+            driver_paths=driver_paths,
+            control_profile_paths=control_profile_paths,
+            control_socket=control_socket,
         )
 
 
@@ -378,12 +466,19 @@ def _validate_request(
     )
     if payload.get("account_fingerprint") != expected_account:
         raise ProbeRequestError("account fingerprint does not match this deployment")
+    control_profile_sha256 = _control_profile_sha256(
+        config.control_profile_paths[channel],
+        label=f"{channel} control profile",
+    )
+    if payload.get("control_profile_sha256") != control_profile_sha256:
+        raise ProbeRequestError("control profile does not match this deployment")
     return {
         "run_id": run_id,
         "channel": channel,
         "nonce": nonce,
         "expected_image_digest": config.image_digest,
         "probe_identity_sha256": config.identity_sha256,
+        "control_profile_sha256": control_profile_sha256,
     }, expected_fingerprints
 
 
@@ -391,27 +486,32 @@ def _runner_environment(
     config: ProbeConfig,
     request: Mapping[str, Any],
 ) -> dict[str, str]:
+    channel = str(request["channel"])
+    if config.control_socket is None:
+        raise ProbeConfigurationError("TRPC_IM_PROBE_CONTROL_SOCKET is not configured")
+    account_variable = CHANNEL_ACCOUNT_VARIABLE[channel]
     environment = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
         "LANG": "C.UTF-8",
-        "PYTHONPATH": str(ROOT),
-        "TRPC_IM_PROBE_CHANNEL": str(request["channel"]),
+        "TRPC_IM_PROBE_APPLICATION_ROOT": str(ROOT),
+        "TRPC_IM_PROBE_CHANNEL": channel,
         "TRPC_IM_PROBE_RUN_ID": str(request["run_id"]),
         "TRPC_IM_PROBE_RUN_NONCE": str(request["nonce"]),
         "TRPC_IM_PROBE_EXPECTED_IMAGE_DIGEST": str(request["expected_image_digest"]),
-        "TRPC_IM_PROBE_FEISHU_APP_ID": config.account_ids["feishu"],
-        "TRPC_IM_PROBE_WECOM_BOT_ID": config.account_ids["wecom"],
+        "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS": str(config.driver_timeout_seconds),
+        f"TRPC_IM_PROBE_{account_variable}": config.account_ids[channel],
+        f"TRPC_IM_PROBE_{channel.upper()}_DRIVER": str(config.driver_paths[channel]),
+        f"TRPC_IM_PROBE_{channel.upper()}_CONTROL_PROFILE_FILE": str(
+            config.control_profile_paths[channel]
+        ),
+        "TRPC_IM_PROBE_CONTROL_SOCKET": str(config.control_socket),
     }
-    for channel, paths in config.credential_paths.items():
-        for variable, path in paths.items():
-            variable_name = variable.removeprefix(channel.upper() + "_")
-            environment[
-                f"TRPC_IM_PROBE_{channel.upper()}_{variable_name}_FILE"
-            ] = str(path)
-    for _channel, paths in config.runner_secret_paths.items():
-        for runner_name, path in paths.items():
-            environment[f"TRPC_IM_PROBE_{runner_name}"] = str(path)
+    for variable, path in config.credential_paths[channel].items():
+        variable_name = variable.removeprefix(channel.upper() + "_")
+        environment[f"TRPC_IM_PROBE_{channel.upper()}_{variable_name}_FILE"] = str(path)
+    for runner_name, path in config.runner_secret_paths[channel].items():
+        environment[f"TRPC_IM_PROBE_{runner_name}"] = str(path)
     return environment
 
 
@@ -428,6 +528,7 @@ def _run_provider_runner(
             "run_id": request["run_id"],
             "run_nonce": request["nonce"],
             "expected_image_digest": request["expected_image_digest"],
+            "control_profile_sha256": request["control_profile_sha256"],
             "cases": list(REQUIRED_CASES),
         },
         ensure_ascii=True,
@@ -435,30 +536,73 @@ def _run_provider_runner(
         separators=(",", ":"),
         allow_nan=False,
     )
+    return _run_bounded_json_process(
+        [str(config.runner)],
+        input_bytes=runner_input.encode("utf-8"),
+        timeout=config.runner_timeout_seconds,
+        environment=_runner_environment(config, request),
+    )
+
+
+def _run_bounded_json_process(
+    command: Sequence[str],
+    *,
+    input_bytes: bytes | None,
+    timeout: float,
+    environment: Mapping[str, str],
+) -> dict[str, Any] | None:
     try:
-        completed = subprocess.run(  # noqa: S603 - fixed executable, no shell
-            [str(config.runner)],
-            check=False,
-            capture_output=True,
-            input=runner_input,
-            text=True,
-            timeout=config.runner_timeout_seconds,
-            env=_runner_environment(config, request),
-        )
-    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired):
+        with tempfile.TemporaryFile(mode="w+b") as runner_output:
+            process = subprocess.Popen(  # noqa: S603 - fixed executable, no shell
+                list(command),
+                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                stdout=runner_output,
+                stderr=subprocess.DEVNULL,
+                env=dict(environment),
+            )
+            try:
+                process.communicate(input=input_bytes, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                return None
+            runner_output.seek(0)
+            raw_output = runner_output.read(MAX_RUNNER_OUTPUT_BYTES + 1)
+    except OSError:
         return None
-    if not isinstance(completed.stdout, str):
-        return None
-    if completed.returncode != 0 or (
-        len(completed.stdout.encode("utf-8", errors="ignore"))
-        > MAX_RUNNER_OUTPUT_BYTES
-    ):
+    if process.returncode != 0 or len(raw_output) > MAX_RUNNER_OUTPUT_BYTES:
         return None
     try:
-        result = _strict_json(completed.stdout)
+        decoded = raw_output.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    try:
+        result = _strict_json(decoded)
     except (UnicodeError, ValueError, json.JSONDecodeError):
         return None
     return result if isinstance(result, dict) else None
+
+
+def _runner_ready(config: ProbeConfig, channel: str) -> bool:
+    if config.runner is None or channel not in config.driver_paths:
+        return False
+    request = {
+        "channel": channel,
+        "run_id": "probe-readiness-check",
+        "nonce": "probe_readiness_check_0001",
+        "expected_image_digest": config.image_digest,
+        "control_profile_sha256": _control_profile_sha256(
+            config.control_profile_paths[channel],
+            label=f"{channel} control profile",
+        ),
+    }
+    result = _run_bounded_json_process(
+        [str(config.runner), "--check", "--channel", channel],
+        input_bytes=None,
+        timeout=min(config.runner_timeout_seconds, 10.0),
+        environment=_runner_environment(config, request),
+    )
+    return result == {"status": "ready"}
 
 
 def _runtime_attestation(config: ProbeConfig, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -467,6 +611,7 @@ def _runtime_attestation(config: ProbeConfig, request: Mapping[str, Any]) -> dic
         "run_nonce": request["nonce"],
         "image_digest": request["expected_image_digest"],
         "identity_fingerprint": config.identity_sha256,
+        "control_profile_sha256": request["control_profile_sha256"],
     }
 
 
@@ -491,30 +636,48 @@ class ProbeService:
 
     def __init__(self, config: ProbeConfig) -> None:
         self.config = config
-        self._seen: set[tuple[str, str]] = set()
+        self._seen: OrderedDict[tuple[str, str], datetime] = OrderedDict()
+        self._seen_lock = Lock()
+        self._runner_lock = Lock()
 
-        # ``scripts.im_online_gate`` uses these names when validating the
-        # provider account fingerprint.  They are identifiers, not secrets;
-        # setting them once avoids duplicating the large provider-evidence
-        # validator or making it process-global per request.
-        os.environ["FEISHU_APP_ID"] = config.account_ids["feishu"]
-        os.environ["WECOM_BOT_ID"] = config.account_ids["wecom"]
+    def _consume_nonce(self, key: tuple[str, str]) -> None:
+        now = datetime.now(UTC)
+        cutoff = now - NONCE_CACHE_TTL
+        with self._seen_lock:
+            while self._seen:
+                oldest_key, oldest_at = next(iter(self._seen.items()))
+                if oldest_at >= cutoff:
+                    break
+                self._seen.pop(oldest_key)
+            if key in self._seen:
+                raise ProbeRequestError("probe nonce was already consumed for this channel")
+            self._seen[key] = now
+            while len(self._seen) > NONCE_CACHE_CAPACITY:
+                self._seen.popitem(last=False)
 
     def ready(self) -> bool:
-        if self.config.runner is None:
+        if self.config.runner is None or self.config.control_socket is None:
             return False
-        return all(
+        try:
+            _safe_control_socket_path(str(self.config.control_socket))
+            for channel, path in self.config.control_profile_paths.items():
+                _safe_path(str(path), label=f"{channel} control profile", private=True)
+                _control_profile_sha256(path, label=f"{channel} control profile")
+        except ProbeConfigurationError:
+            return False
+        paths_ready = len(self.config.driver_paths) == 2 and all(
             path.exists()
-            for paths in self.config.credential_paths.values()
+            for paths in (*self.config.credential_paths.values(), self.config.driver_paths)
             for path in paths.values()
+        )
+        return paths_ready and all(
+            _runner_ready(self.config, channel) for channel in ("feishu", "wecom")
         )
 
     def handle(self, payload: object) -> dict[str, Any]:
         request, credential_fingerprints = _validate_request(payload, self.config)
         key = (str(request["channel"]), str(request["nonce"]))
-        if key in self._seen:
-            raise ProbeRequestError("probe nonce was already consumed for this channel")
-        self._seen.add(key)
+        self._consume_nonce(key)
 
         started = datetime.now(UTC)
         response: dict[str, Any] = {
@@ -527,7 +690,8 @@ class ProbeService:
             },
             "cases": _failure_cases(),
         }
-        runner_result = _run_provider_runner(self.config, request)
+        with self._runner_lock:
+            runner_result = _run_provider_runner(self.config, request)
         provider_evidence = runner_result.get("provider_evidence") if runner_result else None
         if isinstance(provider_evidence, dict):
             candidate = {
@@ -543,9 +707,7 @@ class ProbeService:
             )
             if sanitized is not None and not errors:
                 response["provider_evidence"] = sanitized
-                response["cases"] = {
-                    case: {"status": "pass"} for case in REQUIRED_CASES
-                }
+                response["cases"] = {case: {"status": "pass"} for case in REQUIRED_CASES}
             else:
                 response["error_code"] = "provider_evidence_invalid"
         elif self.config.runner is None:
@@ -555,7 +717,9 @@ class ProbeService:
         return _signed_response(self.config, response)
 
 
-class _ProbeHTTPServer(HTTPServer):
+class _ProbeHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
     def __init__(self, address: tuple[str, int], service: ProbeService) -> None:
         super().__init__(address, _ProbeRequestHandler)
         self.service = service

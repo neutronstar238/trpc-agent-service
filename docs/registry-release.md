@@ -19,7 +19,8 @@ $repository = "ghcr.io/<owner>/trpc-agent-service"
 
 .venv\Scripts\python.exe scripts\registry_image.py publish `
   --repository $repository `
-  --output runs\multitenant\registry-image-binding.json
+  --output runs\multitenant\registry-image-binding.json `
+  --lock-output runs\multitenant\candidate-lock.json
 ```
 
 The Docker credential helper supplies authentication. The command only prints
@@ -30,7 +31,7 @@ After the command succeeds, load the binding report and pass the values to the
 production gates in the same PowerShell session:
 
 ```powershell
-$binding = Get-Content runs\multitenant\registry-image-binding.json -Raw | ConvertFrom-Json
+$binding = Get-Content runs\multitenant\candidate-lock.json -Raw | ConvertFrom-Json
 $env:TRPC_REAL_IMAGE_DIGEST = [string]$binding.image_digest
 $env:TRPC_MIGRATION_IMAGE_DIGEST = [string]$binding.image_digest
 $env:TRPC_K8S_RUNTIME_IMAGE = [string]$binding.images.initial.reference
@@ -43,6 +44,15 @@ Kubernetes runtime evidence must then be produced with the same release ID,
 release nonce, source fingerprint, and initial image digest. A local Docker
 image ID or a tag-only reference is not a registry digest and cannot satisfy
 the production release gate.
+
+发布命令在两次 push 后重新计算 checkout 指纹，并生成 `candidate-lock.json`。后续 runtime gate 的
+`release.image_binding` 必须指向这个 lock，而不是重新读取可被替换的 tag；lock 同时固定原始 binding
+内容哈希、release ID/nonce 哈希、源码指纹和两条 `repository@sha256:...` 引用。可在每个生产演练前
+再次执行以下只读校验：
+
+```powershell
+.venv\Scripts\python.exe scripts\candidate_lock.py verify
+```
 
 The repository's production Kustomize overlay keeps a placeholder registry and
 digest on purpose. Replace it only in the reviewed deployment input or pass

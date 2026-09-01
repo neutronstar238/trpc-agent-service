@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,7 +35,12 @@ from trpc_service.channels.wecom import (
     parse_wecom_frame,
 )
 from trpc_service.config.secrets import LocalSecretProvider, SecretRef
-from trpc_service.storage.models import BindingRoute, DeliveryAttempt, OutboxRecord
+from trpc_service.storage.models import (
+    BindingRoute,
+    DeliveryAttempt,
+    OutboxRecord,
+    WeComBindingLeaseGrant,
+)
 from trpc_service.storage.protocols import DeliveryInProgress, FencingConflict
 from trpc_service.tenant.models import Channel, ChannelBinding, ConversationKind
 
@@ -772,11 +778,30 @@ class ConnectorLease:
         self.allowed = allowed
         self.released: list[tuple[str, str]] = []
 
-    async def acquire_binding(self, binding_id: str, owner_id: str) -> bool:
-        return self.allowed
+    async def acquire_binding(self, binding: Any, _owner_id: str) -> WeComBindingLeaseGrant | None:
+        if not self.allowed:
+            return None
+        return WeComBindingLeaseGrant(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.binding_id,
+            owner_hash="a" * 64,
+            epoch=1,
+            acquired_at=datetime.now(UTC),
+        )
 
-    async def release_binding(self, binding_id: str, owner_id: str) -> None:
-        self.released.append((binding_id, owner_id))
+    async def mark_authenticated(self, _grant: WeComBindingLeaseGrant) -> bool:
+        return True
+
+    async def record_provider_event(
+        self, _grant: WeComBindingLeaseGrant, _provider_event_id: str
+    ) -> bool:
+        return True
+
+    async def mark_disconnected(self, _grant: WeComBindingLeaseGrant) -> bool:
+        return True
+
+    async def release_binding(self, grant: WeComBindingLeaseGrant) -> None:
+        self.released.append((grant.binding_id, grant.owner_hash))
 
 
 class ConnectorClient:
@@ -840,6 +865,7 @@ async def test_wecom_connector_accepts_video_emergency_and_send_mappings() -> No
     assert accepted and emergency and lease.released
 
     connector._clients["binding-a"] = client
+    connector._fenced_bindings.add("binding-a")
     for response, code in (
         ({"status_code": 429, "retry_after": 2}, "rate_limited"),
         ({"status_code": 500}, "http_500"),
@@ -904,7 +930,7 @@ def test_wecom_response_retry_after_and_client_ready_helpers() -> None:
     assert not wecom_module._client_ready(
         SimpleNamespace(is_connected=True, is_authenticated=False)
     )
-    assert wecom_module._client_ready(SimpleNamespace(is_connected=True))
+    assert not wecom_module._client_ready(SimpleNamespace(is_connected=True))
 
 
 def feishu_binding(*, encrypted: bool = True) -> ChannelBinding:

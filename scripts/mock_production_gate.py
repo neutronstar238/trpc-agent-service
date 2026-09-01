@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from scripts.performance_gate import MAX_CONCURRENCY
 from scripts.report_io import atomic_write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +109,7 @@ def _performance(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             "--turns",
             "200",
             "--concurrency",
-            "100",
+            str(MAX_CONCURRENCY),
             "--output",
             str(output),
         ],

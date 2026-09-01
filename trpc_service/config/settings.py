@@ -8,6 +8,7 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -39,6 +40,7 @@ class Role(StrEnum):
     POST_TURN_PROJECTOR = "post-turn-projector"
     WECOM_CONNECTOR = "wecom-connector"
     SESSION_RECOVERY = "session-recovery"
+    ARTIFACT_GC = "artifact-gc"
 
 
 # These names are part of the deployment contract.  They are deliberately
@@ -100,6 +102,9 @@ class ServiceSettings(BaseSettings):
     # bounded cooldown.  Rolling replay repairs repeated Redis loss while
     # preventing a healthy dispatcher from being reset on every recovery pass.
     recovery_ready_replay_cooldown_seconds: int = Field(default=30, ge=5, le=86_400)
+    artifact_gc_batch_size: int = Field(default=100, ge=1, le=1_000)
+    artifact_gc_poll_seconds: float = Field(default=60.0, ge=1.0, le=3_600)
+    artifact_staging_ttl_seconds: int = Field(default=86_400, ge=60, le=31_536_000)
     runtime_state_dir: Path = Field(
         default_factory=lambda: Path(tempfile.gettempdir()) / "trpc-agent-service"
     )
@@ -134,6 +139,7 @@ class ServiceSettings(BaseSettings):
     )
     media_download_timeout_seconds: float = Field(default=30, ge=1, le=300)
     online_tests_enabled: bool = False
+    feishu_send_api_root: str = "https://open.feishu.cn"
     offline_agent_delay_seconds: float = Field(default=0.0, ge=0, le=5)
     fault_injection_enabled: bool = False
     fault_injection_run_id: str | None = None
@@ -210,6 +216,30 @@ class ServiceSettings(BaseSettings):
             self.redis_stream == v1_stream or self.redis_consumer_group == v1_group
         ):
             raise ValueError("v2 scheduler cannot use the v1 Redis stream or consumer group")
+        return self
+
+    @model_validator(mode="after")
+    def validate_feishu_send_api_root(self) -> ServiceSettings:
+        try:
+            parsed = urlsplit(self.feishu_send_api_root)
+            port = parsed.port
+        except ValueError:
+            raise ValueError("Feishu send API root is invalid") from None
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path.endswith("/")
+            or "//" in parsed.path
+            or any(part in {".", ".."} for part in parsed.path.split("/"))
+            or port is not None
+        ):
+            raise ValueError("Feishu send API root must be a canonical HTTPS origin or path")
+        if self.feishu_send_api_root != "https://open.feishu.cn" and not self.online_tests_enabled:
+            raise ValueError("custom Feishu send API root requires online tests")
         return self
 
     @model_validator(mode="after")

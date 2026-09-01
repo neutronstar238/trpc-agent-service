@@ -6,18 +6,24 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import logging
 import re
 from collections.abc import Awaitable, Mapping
 from datetime import timedelta
 from enum import StrEnum
 from typing import Any, Protocol
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from trpc_agent_sdk.agents import BaseAgent
 
 from trpc_service.agent.media import MediaExtractor, MediaLimits
 from trpc_service.agent.registry import RevisionRegistry
-from trpc_service.agent.runner import AgentLoader, PreparedMedia, TenantRunner
+from trpc_service.agent.runner import (
+    AgentLoader,
+    PreparedMedia,
+    QueryEmbeddingProvider,
+    TenantRunner,
+)
 from trpc_service.channels.envelopes import MediaReference, OutboundEnvelope, PayloadKind
 from trpc_service.metrics.privacy import inject_trace_headers
 from trpc_service.metrics.prometheus import LEASE_CONFLICTS, TENANT_COST, TOKENS, TURN_LATENCY
@@ -30,9 +36,11 @@ from trpc_service.storage.models import (
     TurnCommit,
 )
 from trpc_service.storage.protocols import FencingConflict, RuntimeRepository
-from trpc_service.storage.services import TenantServiceFactory
+from trpc_service.storage.services import TenantDataServices, TenantServiceFactory
 from trpc_service.tenant.models import Channel, ChannelBinding, TenantConfig
 from trpc_service.workspace import WorkspaceManager
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DownloadedMedia(Protocol):
@@ -84,6 +92,7 @@ class AgentWorker:
         media_downloaders: Mapping[Channel, MediaDownloader] | None = None,
         media_extractor: MediaExtractor | None = None,
         workspace_manager: WorkspaceManager | None = None,
+        query_embedding_provider: QueryEmbeddingProvider | None = None,
         max_turn_attempts: int = 3,
     ) -> None:
         if max_turn_attempts < 1:
@@ -97,6 +106,7 @@ class AgentWorker:
         self._media_downloaders = dict(media_downloaders or {})
         self._media_extractor = media_extractor or MediaExtractor()
         self._workspace_manager = workspace_manager
+        self._query_embedding_provider = query_embedding_provider
         self._max_turn_attempts = max_turn_attempts
 
     async def process(self, acceptance: Acceptance) -> WorkerResult:
@@ -228,7 +238,7 @@ class AgentWorker:
                 heartbeat_error = exc
 
         heartbeat_task = asyncio.create_task(heartbeat())
-        turn_task: asyncio.Task[tuple[TenantRunner, str]] | None = None
+        turn_task: asyncio.Task[tuple[TenantRunner, str, TenantDataServices | None]] | None = None
         heartbeat_shutdown_attempted = False
 
         async def stop_heartbeat_task() -> bool:
@@ -251,7 +261,7 @@ class AgentWorker:
 
         try:
 
-            async def run_turn() -> tuple[TenantRunner, str]:
+            async def run_turn() -> tuple[TenantRunner, str, TenantDataServices | None]:
                 nonlocal current
                 if mailbox_runtime and not current.snapshot_hydrated:
                     anchor = current.snapshot
@@ -297,6 +307,7 @@ class AgentWorker:
                     registry=self._registry,
                     agent_loader=self._agent_loader,
                     services=services,
+                    query_embedding_provider=self._query_embedding_provider,
                     workspace=(
                         self._workspace_manager.for_context(acceptance.context)
                         if self._workspace_manager is not None
@@ -313,7 +324,7 @@ class AgentWorker:
                     _record_usage(event, acceptance.context.tenant_id)
                     if event.visible and event.is_final_response() and event.get_text():
                         final_text = event.get_text()
-                return runner, final_text
+                return runner, final_text, services
 
             turn_task = asyncio.create_task(run_turn())
             done, _ = await asyncio.wait(
@@ -321,11 +332,11 @@ class AgentWorker:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if turn_task in done:
-                runner, final_text = await turn_task
+                runner, final_text, services = await turn_task
             else:
                 if turn_task.done():
                     # If both tasks finished together, preserve the turn error.
-                    runner, final_text = await turn_task
+                    runner, final_text, services = await turn_task
                 else:
                     turn_task.cancel()
                     await asyncio.gather(turn_task, return_exceptions=True)
@@ -361,6 +372,13 @@ class AgentWorker:
                 if mailbox_runtime
                 else await self._repository.commit(turn_commit)
             )
+            await self._post_commit_context(
+                acceptance,
+                current,
+                result,
+                final_text,
+                services,
+            )
             return WorkerResult(ProcessStatus.COMMITTED, commit=result)
         except BaseException as error:
             if turn_task is not None and not turn_task.done():
@@ -372,6 +390,82 @@ class AgentWorker:
             else:
                 await self._repository.fail(current, error_type="agent_turn_failed")
             raise
+
+    async def _post_commit_context(
+        self,
+        acceptance: Acceptance,
+        lease: SessionLease,
+        result: CommitResult,
+        final_text: str,
+        services: TenantDataServices | None,
+    ) -> None:
+        """Persist derived context only after the fenced turn commit succeeds.
+
+        These writes are intentionally best-effort and independently guarded:
+        a broken memory or summary backend must never turn an already committed
+        session turn into a failed turn.  Stable IDs and source sequence make
+        retries idempotent and prevent an older projection from winning.
+        """
+
+        if services is None:
+            return
+        sequence = result.last_sequence
+        if sequence is None:
+            sequence = max(0, lease.snapshot.next_sequence - 1)
+        tenant_id = acceptance.context.tenant_id
+        principal_id = acceptance.context.principal_id
+        session_id = acceptance.context.session_id
+        memory_put = getattr(services.memory, "put", None)
+        if callable(memory_put):
+            try:
+                memory_id = str(uuid5(NAMESPACE_URL, f"trpc-agent-turn:{lease.turn_id}"))
+                await _maybe_await(
+                    memory_put(
+                        tenant_id,
+                        principal_id,
+                        {
+                            "turn_id": lease.turn_id,
+                            "session_id": session_id,
+                            "user_message": _bounded_text(acceptance.envelope.text),
+                            "agent_response": _bounded_text(final_text),
+                        },
+                        memory_id=memory_id,
+                        session_id=session_id,
+                        source_sequence=sequence,
+                    )
+                )
+            except BaseException as error:
+                _LOGGER.warning("memory post-turn write skipped: %s", type(error).__name__)
+
+        summary_get = getattr(services.summary, "get", None)
+        summary_put = getattr(services.summary, "put", None)
+        if not callable(summary_put):
+            return
+        previous = None
+        if callable(summary_get):
+            try:
+                previous = await _maybe_await(summary_get(tenant_id, session_id))
+            except BaseException as error:
+                _LOGGER.warning("summary post-turn read skipped: %s", type(error).__name__)
+        if previous is not None and getattr(previous, "up_to_sequence", -1) >= sequence:
+            return
+        expected_version = getattr(previous, "version", None)
+        try:
+            await _maybe_await(
+                summary_put(
+                    tenant_id,
+                    session_id,
+                    up_to_sequence=sequence,
+                    summary={
+                        "turn_id": lease.turn_id,
+                        "last_user_message": _bounded_text(acceptance.envelope.text),
+                        "last_agent_response": _bounded_text(final_text),
+                    },
+                    expected_version=expected_version,
+                )
+            )
+        except BaseException as error:
+            _LOGGER.warning("summary post-turn write skipped: %s", type(error).__name__)
 
     async def _release_mailbox_failure(
         self,
@@ -573,6 +667,19 @@ def _target_id(acceptance: Acceptance) -> str:
             raise ValueError("group message has no target conversation")
         return envelope.external_conversation_id
     return envelope.external_user_id
+
+
+async def _maybe_await(value: object) -> object:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _bounded_text(value: str | None, limit: int = 2_000) -> str:
+    text = value or ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
 
 
 def _trace_headers() -> dict[str, str]:

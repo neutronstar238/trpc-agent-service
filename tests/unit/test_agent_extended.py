@@ -11,6 +11,7 @@ from trpc_agent_sdk.models import LLMModel, LlmRequest, LlmResponse
 from trpc_agent_sdk.tools import FunctionTool
 from trpc_agent_sdk.types import Blob, Content, Part
 
+import trpc_service.agent.wecom_manager as wecom_manager_module
 import trpc_service.agent.worker as worker_module
 from tests.conftest import binding, envelope, repository, tenant_config
 from trpc_service.agent.factory import DevelopmentAgentLoader, FallbackModel, ProductionAgentLoader
@@ -21,6 +22,7 @@ from trpc_service.agent.session import TurnBufferSessionService
 from trpc_service.agent.wecom_manager import WeComConnectionManager
 from trpc_service.agent.worker import AgentWorker, ProcessStatus, _record_usage, _target_id
 from trpc_service.channels.envelopes import MediaReference, PayloadKind
+from trpc_service.channels.wecom import WeComBindingLeaseUnavailable
 from trpc_service.config.secrets import LocalSecretProvider, SecretRef
 from trpc_service.runtime import TenantRuntime
 from trpc_service.storage.artifacts import InMemoryArtifactStore
@@ -1054,3 +1056,71 @@ async def test_wecom_manager_add_remove_failed_and_shutdown(monkeypatch) -> None
     with pytest.raises(asyncio.CancelledError):
         await manager.run(refresh_seconds=0)
     assert not [task for task in manager._tasks.values() if not task.done()]
+
+
+@pytest.mark.asyncio
+async def test_wecom_standby_retries_lease_contention_without_exponential_backoff(
+    monkeypatch,
+) -> None:
+    value = binding(channel="wecom_ai_bot")
+    attempts = 0
+    waits: list[float] = []
+
+    class StandbyConnector:
+        async def run(self, _binding, _sink) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise WeComBindingLeaseUnavailable("another connector owns this channel binding")
+            manager._stop_event.set()
+
+    async def record_wait(awaitable, **kwargs):
+        waits.append(kwargs["timeout"])
+        awaitable.close()
+        raise TimeoutError
+
+    manager = WeComConnectionManager(
+        Bindings((value,)),
+        StandbyConnector(),
+        object(),
+        reconnect_jitter_ratio=0,
+    )
+    monkeypatch.setattr(wecom_manager_module.asyncio, "wait_for", record_wait)
+
+    await manager._run_binding(value)
+
+    assert attempts == 4
+    assert waits == [0.5, 0.5, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_wecom_connection_errors_keep_exponential_backoff(monkeypatch) -> None:
+    value = binding(channel="wecom_ai_bot")
+    attempts = 0
+    waits: list[float] = []
+
+    class FailingConnector:
+        async def run(self, _binding, _sink) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise ConnectionError("provider unavailable")
+            manager._stop_event.set()
+
+    async def record_wait(awaitable, **kwargs):
+        waits.append(kwargs["timeout"])
+        awaitable.close()
+        raise TimeoutError
+
+    manager = WeComConnectionManager(
+        Bindings((value,)),
+        FailingConnector(),
+        object(),
+        reconnect_jitter_ratio=0,
+    )
+    monkeypatch.setattr(wecom_manager_module.asyncio, "wait_for", record_wait)
+
+    await manager._run_binding(value)
+
+    assert attempts == 4
+    assert waits == [0.5, 1.0, 2.0]

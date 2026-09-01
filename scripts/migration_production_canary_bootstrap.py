@@ -24,7 +24,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote, urlsplit
 
 import asyncpg
@@ -559,7 +559,7 @@ async def provision() -> dict[str, Any]:
         await _assert_redis_empty(redis, scope.tenant_id)
         await _assert_database_scope_empty(pool, scope, expected_role)
         seeded = await _seed_redis(redis, scope)
-        source = RedisMigrationSource(redis, kinds=("session", "memory"))
+        source = RedisMigrationSource(cast(Any, redis), kinds=("session", "memory"))
         snapshot = await source.snapshot(scope.tenant_id)
         if seeded != _EXPECTED_RECORDS or snapshot.source_count != _EXPECTED_RECORDS:
             raise ValueError("production-canary Redis seed count is not exactly four")

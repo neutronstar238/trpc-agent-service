@@ -45,6 +45,7 @@ class ChannelDispatcher:
         batch_limit: int = 25,
         lease_seconds: float = 30.0,
         retry_jitter: Callable[[float], float] | None = None,
+        binding_ready: Callable[[ChannelBinding], bool] | None = None,
     ) -> None:
         self._repository = repository
         self._adapters = dict(adapters)
@@ -58,6 +59,7 @@ class ChannelDispatcher:
         self._batch_limit = batch_limit
         self._lease_seconds = lease_seconds
         self._retry_jitter = retry_jitter or _default_retry_jitter
+        self._binding_ready = binding_ready
 
     async def dispatch_once(self, stop_event: asyncio.Event | None = None) -> int:
         records = await self._repository.claim_outbox(
@@ -157,6 +159,22 @@ class ChannelDispatcher:
                         delay=timedelta(minutes=5),
                     )
                     DELIVERIES.labels(channel=channel, outcome="failed").inc()
+                    delivery_recorded = True
+                    return False
+                if self._binding_ready is not None and not self._binding_ready(route.binding):
+                    # A standby WeCom replica must not consume provider-attempt
+                    # budget while another replica owns the binding's WSS.
+                    # Release the durable record before begin_delivery/send;
+                    # the active owner (or this replica after takeover) will
+                    # claim it on a later dispatcher cycle.
+                    await self._repository.release_outbox(
+                        record.tenant_id,
+                        record.outbox_id,
+                        owner_id=self._owner_id,
+                        delay=timedelta(milliseconds=100),
+                        error_type="adapter_standby",
+                    )
+                    outcome = "standby"
                     delivery_recorded = True
                     return False
                 if self._supports_atomic_delivery():
@@ -325,11 +343,12 @@ class ChannelDispatcher:
         retrying = (
             receipt.status == DeliveryStatus.FAILED
             and receipt.retryable
-            and record.attempts < self._max_attempts
+            and attempt.attempt_number < self._max_attempts
         )
         if receipt.status == DeliveryStatus.FAILED and receipt.retryable and not retrying:
             receipt = receipt.model_copy(update={"retryable": False})
-        retry_delay = self._retry_delay(receipt, record, jitter=self._retry_jitter)
+        attempt_record = record.model_copy(update={"attempts": attempt.attempt_number})
+        retry_delay = self._retry_delay(receipt, attempt_record, jitter=self._retry_jitter)
         try:
             await self._repository.finish_delivery(
                 record,

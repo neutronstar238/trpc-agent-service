@@ -175,6 +175,74 @@ async def test_mixed_kind_target_checksum_uses_canonical_source_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enumerated_target_comparison_reuses_checksums_and_reports_extras() -> None:
+    class ShortSource:
+        records = (
+            MigrationRecord(kind="session", resource_id="session-0", payload={"value": 0}),
+            MigrationRecord(kind="session", resource_id="session-1", payload={"value": 1}),
+        )
+
+        async def fetch(self, tenant_id: str, *, cursor: str | None, limit: int):
+            del tenant_id
+            start = int(cursor or 0)
+            values = self.records[start : start + limit]
+            end = start + len(values)
+            return values, str(end) if end < len(self.records) else None
+
+    class ChecksumTarget(Target):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_calls = 0
+
+        async def read(self, tenant_id, kind, resource_id):
+            self.read_calls += 1
+            return await super().read(tenant_id, kind, resource_id)
+
+        async def list_records_page(
+            self,
+            tenant_id: str,
+            kind: str,
+            *,
+            cursor: str | None,
+            limit: int,
+        ):
+            del cursor, limit
+            values = [
+                record
+                for (record_tenant, record_kind, _), record in self.records.items()
+                if record_tenant == tenant_id and record_kind == kind
+            ]
+            return tuple(sorted(values, key=lambda record: record.resource_id)), None
+
+    source = ShortSource()
+    target = ChecksumTarget()
+    coordinator = MigrationCoordinator(
+        source,
+        target,
+        InMemoryMigrationCheckpointStore(),
+        batch_size=10,
+    )
+    await coordinator.run("tenant", "checksum-reuse", MigrationPhase.PREPARE)
+    await coordinator.run("tenant", "checksum-reuse", MigrationPhase.BACKFILL)
+    target.records["tenant", "session", "session-1"] = MigrationRecord(
+        kind="session", resource_id="session-1", payload={"changed": True}
+    )
+    target.records["tenant", "session", "session-extra"] = MigrationRecord(
+        kind="session", resource_id="session-extra", payload={"value": 3}
+    )
+
+    result = await coordinator.run("tenant", "checksum-reuse", MigrationPhase.SHADOW_READ)
+
+    assert result.gate == "fail"
+    assert result.case_deltas["target_count"] == 3
+    assert result.case_deltas["differences"] == [
+        "session/session-1",
+        "target-only:session/session-extra",
+    ]
+    assert target.read_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_manifest_rejects_cursor_complete_checksum_drift() -> None:
     expected = tuple(
         MigrationRecord(kind="session", resource_id=str(index), payload={"value": index})
@@ -458,6 +526,58 @@ class Redis:
         return self.values[key][1]
 
 
+class RecordingRedisPipeline:
+    def __init__(self, redis) -> None:
+        self.redis = redis
+        self.commands = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    def type(self, key):
+        self.commands.append(("type", key))
+        return self
+
+    def get(self, key):
+        self.commands.append(("get", key))
+        return self
+
+    def hget(self, key, field):
+        self.commands.append(("hget", key, field))
+        return self
+
+    def hgetall(self, key):
+        self.commands.append(("hgetall", key))
+        return self
+
+    async def execute(self):
+        commands = self.commands
+        self.commands = []
+        self.redis.execute_batches.append(commands)
+        results = []
+        for command in commands:
+            name, *args = command
+            results.append(await getattr(self.redis, name)(*args))
+        return results
+
+
+class PipelinedRedis(Redis):
+    def __init__(self) -> None:
+        super().__init__()
+        self.values["trpc:memory:tenant:memory-hash"] = (
+            "hash",
+            {"principal_id": "user-1", "memory": '{"fact":"green"}'},
+        )
+        self.execute_batches = []
+
+    def pipeline(self, *, transaction=True):
+        del transaction
+        return RecordingRedisPipeline(self)
+
+
 @pytest.mark.asyncio
 async def test_redis_migration_source_is_stable_and_canonical() -> None:
     source = RedisMigrationSource(Redis())
@@ -485,11 +605,36 @@ async def test_redis_migration_source_is_stable_and_canonical() -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_source_deduplicates_legacy_and_v2_session_keys() -> None:
-    payload = (
-        '{"app_id":"support","principal_id":"user-1",'
-        '"state":{},"events":[]}'
+async def test_redis_pipeline_reads_match_serial_and_bound_round_trips() -> None:
+    serial_redis = PipelinedRedis()
+    serial_redis.pipeline = None
+    serial_source = RedisMigrationSource(serial_redis)
+    pipelined_redis = PipelinedRedis()
+    pipelined_source = RedisMigrationSource(pipelined_redis)
+
+    serial_records, serial_cursor = await serial_source.fetch("tenant", cursor=None, limit=10)
+    pipelined_records, pipelined_cursor = await pipelined_source.fetch(
+        "tenant", cursor=None, limit=10
     )
+    assert pipelined_records == serial_records
+    assert pipelined_cursor == serial_cursor
+    assert [batch[0][0] for batch in pipelined_redis.execute_batches] == [
+        "type",
+        "hget",
+        "hgetall",
+    ]
+    assert all(len(batch) <= 3 for batch in pipelined_redis.execute_batches)
+
+    serial_snapshot = await serial_source.snapshot("tenant")
+    pipelined_snapshot = await pipelined_source.snapshot("tenant")
+    assert pipelined_snapshot == serial_snapshot
+    assert len(pipelined_redis.execute_batches) == 6
+    assert all(len(batch) <= 3 for batch in pipelined_redis.execute_batches)
+
+
+@pytest.mark.asyncio
+async def test_redis_source_deduplicates_legacy_and_v2_session_keys() -> None:
+    payload = '{"app_id":"support","principal_id":"user-1","state":{},"events":[]}'
     values = {
         "trpc:projection:session:tenant:session-1": ("hash", {"payload": payload}),
         "trpc:projection:session:v2:dGVuYW50.c2Vzc2lvbi0x": ("hash", {"payload": payload}),
@@ -786,6 +931,113 @@ class ScriptedConnection(Connection):
     async def fetchval(self, query, *args):
         self.executed.append((query, args))
         return self.values.pop(0) if self.values else None
+
+
+class PageConnection(Connection):
+    def __init__(self, fetches):
+        super().__init__()
+        self.fetches = list(fetches)
+        self.transaction_enters = 0
+        self.transaction_calls = 0
+
+    def transaction(self):
+        self.transaction_calls += 1
+        return self
+
+    async def __aenter__(self):
+        self.transaction_enters += 1
+        return self
+
+    async def fetch(self, query, *args):
+        self.executed.append((query, args))
+        return self.fetches.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_postgres_target_page_batches_session_events_and_memory_rows() -> None:
+    session_rows = [
+        {
+            "session_id": "session-1",
+            "app_id": "app",
+            "principal_id": "user-1",
+            "state_json": '{"seen":true}',
+            "version": 2,
+            "next_sequence": 2,
+        },
+        {
+            "session_id": "session-2",
+            "app_id": "app",
+            "principal_id": "user-2",
+            "state_json": {},
+            "version": 0,
+            "next_sequence": 1,
+        },
+        {
+            "session_id": "session-3",
+            "app_id": "app",
+            "principal_id": "user-3",
+            "state_json": {},
+            "version": 0,
+            "next_sequence": 1,
+        },
+    ]
+    session_events = [
+        {
+            "session_id": "session-1",
+            "sequence": 1,
+            "event_id": "event-1",
+            "author": "user",
+            "event_timestamp": 1.5,
+            "event_json": '{"text":"hello"}',
+            "state_delta": {},
+        }
+    ]
+    memory_id = "11111111-1111-4111-8111-111111111111"
+    memory_rows = [
+        {
+            "memory_id": memory_id,
+            "source_record_id": "memory-1",
+            "principal_id": "user-1",
+            "session_id": "session-1",
+            "source_sequence": 3,
+            "memory_json": '{"fact":"blue"}',
+            "projection_status": "projected",
+        },
+        {
+            "memory_id": "22222222-2222-4222-8222-222222222222",
+            "source_record_id": None,
+            "principal_id": "user-2",
+            "session_id": None,
+            "source_sequence": None,
+            "memory_json": {"fact": "green"},
+            "projection_status": "pending",
+        },
+    ]
+    connection = PageConnection([session_rows, session_events, memory_rows])
+    target = PostgresMigrationTarget(Pool(connection))
+
+    sessions, session_cursor = await target.list_records_page(
+        "tenant", "session", cursor=None, limit=2
+    )
+    memories, memory_cursor = await target.list_records_page(
+        "tenant", "memory", cursor=None, limit=1
+    )
+
+    assert [record.resource_id for record in sessions] == ["session-1", "session-2"]
+    assert sessions[0].payload["events"][0]["event_id"] == "event-1"
+    assert session_cursor == "session-2"
+    assert memories[0].resource_id == "memory-1"
+    assert memories[0].payload["memory"] == {"fact": "blue"}
+    assert memory_cursor == memory_id
+    assert connection.transaction_calls == 2
+    fetch_calls = [(query, args) for query, args in connection.executed if "FROM " in query]
+    assert len(fetch_calls) == 3
+    assert fetch_calls[0][1] == ("tenant", None, 3)
+    assert "FROM session_events" in fetch_calls[1][0]
+    assert fetch_calls[1][1] == ("tenant", ["session-1", "session-2"])
+    assert "source_record_id" in fetch_calls[2][0]
+    assert fetch_calls[2][1] == ("tenant", None, 2)
+    assert not any("SELECT session_id FROM" in query for query, _ in fetch_calls)
 
 
 @pytest.mark.asyncio

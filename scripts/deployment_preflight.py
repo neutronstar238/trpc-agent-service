@@ -24,7 +24,6 @@ if __package__ in {None, ""}:
 
 from scripts.deployment_config import (
     HPA_DRIVER_MAX_BYTES,
-    REQUIRED_SECRET_KEYS,
     DeploymentConfigError,
     RuntimeGateConfig,
     load_runtime_gate_config,
@@ -96,7 +95,7 @@ def _port_checks(ports: Mapping[str, int]) -> list[dict[str, Any]]:
 def _secret_check(config: RuntimeGateConfig) -> dict[str, Any]:
     metadata = secret_manifest_contract(config.secret_manifest)
     missing: dict[str, list[str]] = {}
-    for name, required_keys in REQUIRED_SECRET_KEYS.items():
+    for name, required_keys in config.required_secret_keys().items():
         entry = metadata.get(name, {})
         absent = sorted(required_keys - entry.get("keys", set()))
         if absent:
@@ -105,9 +104,7 @@ def _secret_check(config: RuntimeGateConfig) -> dict[str, Any]:
     pull_keys = pull_entry.get("keys", set())
     if ".dockerconfigjson" not in pull_keys:
         missing[config.image_pull_secret] = [".dockerconfigjson"]
-    namespaced = sorted(
-        name for name, entry in metadata.items() if entry.get("namespace")
-    )
+    namespaced = sorted(name for name, entry in metadata.items() if entry.get("namespace"))
     pull_type_ok = pull_entry.get("type") == "kubernetes.io/dockerconfigjson"
     return {
         "name": "secret_manifest_contract",
@@ -406,8 +403,7 @@ def build_preflight(
         if check["status"] != "pass":
             detail = check.get("reason")
             reasons.append(
-                f"preflight check failed: {check['name']}"
-                + (f": {detail}" if detail else "")
+                f"preflight check failed: {check['name']}" + (f": {detail}" if detail else "")
             )
     if failed:
         projected = None
@@ -418,9 +414,7 @@ def build_preflight(
         "run_id": f"{PRODUCER}-{uuid4().hex}",
         "config_path_sha256": hashlib.sha256(str(config_path.resolve()).encode()).hexdigest(),
         "config_content_sha256": (
-            hashlib.sha256(config_path.read_bytes()).hexdigest()
-            if config_path.is_file()
-            else None
+            hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path.is_file() else None
         ),
         "checks": checks,
         "gate": "pass" if not reasons else "fail",

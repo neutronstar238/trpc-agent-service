@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from trpc_service.storage.migration import (
+    MigrationGuardError,
     MigrationLeaseLost,
     MigrationManifestConflict,
     MigrationScopeManifest,
@@ -41,6 +42,8 @@ class FakeConnection:
             "audit_logs": 0,
             "session_mailboxes": 0,
             "session_mailbox_items": 0,
+            "wecom_connection_state": 0,
+            "im_acceptance_evidence_events": 0,
             "migration_checkpoints": 0,
             "migration_scope_manifests": 0,
             "migration_leases": 0,
@@ -369,13 +372,42 @@ async def test_single_active_tenant_and_target_empty_preflight() -> None:
         "audit_logs",
         "session_mailboxes",
         "session_mailbox_items",
+        "wecom_connection_state",
+        "im_acceptance_evidence_events",
         "migration_checkpoints",
         "migration_scope_manifests",
         "migration_leases",
     )
+    target_query = next(
+        query for query, _args in connection.history if "migration_protected_target_counts" in query
+    )
+    assert "public.migration_protected_target_counts($1)" in target_query
+    assert "FROM public.wecom_connection_state" not in target_query
+    assert "FROM public.im_acceptance_evidence_events" not in target_query
     connection.target_counts["memories"] = 1
     with pytest.raises(MigrationTargetNotEmpty, match="memories"):
         await guard.target_empty_preflight("tenant-1")
+    connection.target_counts["memories"] = 0
+    connection.target_counts["im_acceptance_evidence_events"] = 1
+    with pytest.raises(MigrationTargetNotEmpty, match="im_acceptance_evidence_events"):
+        await guard.target_empty_preflight("tenant-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_row", [("sessions", 0), ("unexpected_table", 0)])
+async def test_target_empty_preflight_rejects_non_exact_table_sets(
+    invalid_row: tuple[str, int],
+) -> None:
+    class InvalidTargetCountConnection(FakeConnection):
+        async def fetch(self, query: str, *args: object):
+            rows = await super().fetch(query, *args)
+            rows.append({"table_name": invalid_row[0], "row_count": invalid_row[1]})
+            return rows
+
+    guard = PostgresMigrationGuard(FakePool(InvalidTargetCountConnection()))
+
+    with pytest.raises(MigrationGuardError, match="exact guarded table set"):
+        await guard.preflight_target_empty("tenant-1")
 
 
 @pytest.mark.asyncio

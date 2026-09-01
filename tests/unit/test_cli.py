@@ -60,3 +60,4 @@ def test_runtime_role_dependency_matrix() -> None:
     # PostgreSQL is temporarily unavailable after callback authentication.
     assert _role_uses_redis(Role.WECOM_CONNECTOR)
     assert not _role_uses_redis(Role.SESSION_RECOVERY)
+    assert not _role_uses_redis(Role.ARTIFACT_GC)

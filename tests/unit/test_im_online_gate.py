@@ -113,10 +113,17 @@ def _credentials(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, str]]:
     return result
 
 
+def _control_profiles(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    profiles = {"feishu": "d" * 64, "wecom": "e" * 64}
+    monkeypatch.setenv("TRPC_IM_ONLINE_FEISHU_CONTROL_PROFILE_SHA256", profiles["feishu"])
+    monkeypatch.setenv("TRPC_IM_ONLINE_WECOM_CONTROL_PROFILE_SHA256", profiles["wecom"])
+    return profiles
+
+
 def _observations(channel: str, nonce: str) -> dict[str, dict[str, object]]:
     timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     common = {"status": "pass", "run_nonce": nonce, "observed_at": timestamp}
-    return {
+    observations = {
         "round_trip": {
             **common,
             "provider_event_id": f"{channel}-round-trip",
@@ -130,6 +137,18 @@ def _observations(channel: str, nonce: str) -> dict[str, dict[str, object]]:
             "duplicate_event_id": f"{channel}-duplicate-event",
             "unique_inbound_id": f"{channel}-inbound",
             "duplicate_count": 1,
+            **(
+                {
+                    "original_event_id": f"{channel}-duplicate-event",
+                    "provider_delivery_count": 2,
+                }
+                if channel == "feishu"
+                else {
+                    "duplicate_source": "service_replay_of_provider_event",
+                    "original_event_id": f"{channel}-original-processing",
+                    "replayed_event_id": f"{channel}-replayed-processing",
+                }
+            ),
         },
         "media": {
             **common,
@@ -138,17 +157,7 @@ def _observations(channel: str, nonce: str) -> dict[str, dict[str, object]]:
             "sha256": "b" * 64,
             "bytes": 16,
         },
-        "reconnect": {
-            **common,
-            "provider_event_id": f"{channel}-reconnect-event",
-            "disconnect_event_id": f"{channel}-disconnect",
-            "reconnect_event_id": f"{channel}-reconnect",
-            "received_after_reconnect_event_id": f"{channel}-after-reconnect",
-            "lock_takeover_event_id": f"{channel}-lock-takeover",
-            "old_lock_owner_released": True,
-            "new_lock_owner_acquired": True,
-            "lock_epoch": 2,
-        },
+        "reconnect": {},
         "rate_limit_retry_after": {
             **common,
             "provider_event_id": f"{channel}-rate-event",
@@ -182,6 +191,56 @@ def _observations(channel: str, nonce: str) -> dict[str, dict[str, object]]:
             "auto_replay_count": 0,
         },
     }
+    if channel == "feishu":
+        observations["reconnect"].update(
+            {
+                **common,
+                "provider_event_id": "feishu-failover-event",
+                "failed_endpoint_id": "feishu-gateway-old",
+                "replacement_endpoint_id": "feishu-gateway-new",
+                "endpoint_set_observed": True,
+                "received_after_failover_event_id": "feishu-after-failover",
+                "outbound_request_id": "feishu-failover-request",
+                "acknowledged_request_id": "feishu-failover-request",
+                "ready_endpoint_count": 4,
+                "unready_endpoint_count": 0,
+                "terminating_endpoint_count": 0,
+            }
+        )
+    else:
+        observations["reconnect"].update(
+            {
+                **common,
+                "provider_event_id": "wecom-reconnect-event",
+                "disconnect_event_id": "wecom-disconnect",
+                "reconnect_event_id": "wecom-reconnect",
+                "received_after_reconnect_event_id": "wecom-after-reconnect",
+                "lock_takeover_event_id": "wecom-lock-takeover",
+                "old_lock_owner_released": True,
+                "new_lock_owner_acquired": True,
+                "lock_epoch": 2,
+            }
+        )
+    if channel == "wecom":
+        observations["prolonged_outage"].update(
+            {
+                "outage_mode": "service_failover",
+                "failed_instance_id": "wecom-primary",
+                "takeover_instance_id": "wecom-standby",
+                "old_lock_owner_released": True,
+                "new_lock_owner_acquired": True,
+                "connection_epoch": 3,
+                "event_during_outage_id": "wecom-outage-inbound",
+                "reply_for_event_id": "wecom-outage-inbound",
+                "outbound_request_id": "wecom-outbound-request",
+                "acknowledged_request_id": "wecom-outbound-request",
+                "reply_count": 1,
+                "ack_count": 1,
+                "pending_count": 0,
+                "dlq_count": 0,
+            }
+        )
+    return observations
 
 
 def test_online_gate_default_is_fail_closed_and_expanded() -> None:
@@ -267,6 +326,7 @@ def test_provider_evidence_is_sanitized_and_keeps_required_case_identity(
             "message_body": "must never be copied",
         },
     }
+    monkeypatch.setenv("FEISHU_APP_ID", "unrelated-process-account")
     evidence, errors = _validate_provider_evidence(
         "feishu",
         response,
@@ -287,8 +347,215 @@ def test_provider_evidence_is_sanitized_and_keeps_required_case_identity(
     assert "message_body" not in json.dumps(evidence)
     assert evidence["observations"]["ambiguous"]["auto_replay_count"] == 0
     assert evidence["observations"]["ambiguous"]["drop_response_observed"] is True
-    assert evidence["observations"]["reconnect"]["lock_epoch"] == 2
+    reconnect = evidence["observations"]["reconnect"]
+    assert reconnect["endpoint_set_observed"] is True
+    assert reconnect["ready_endpoint_count"] == 4
+    assert reconnect["unready_endpoint_count"] == reconnect["terminating_endpoint_count"] == 0
+    assert reconnect["outbound_request_id_hash"] == reconnect["acknowledged_request_id_hash"]
+    assert "failed_endpoint_id_hash" in reconnect
+    assert "replacement_endpoint_id_hash" in reconnect
+    assert "received_after_failover_event_id_hash" in reconnect
+    assert "lock_epoch" not in reconnect
     assert evidence["observations"]["rate_limit_retry_after"]["retry_attempts"] == 2
+    idempotency = evidence["observations"]["idempotency"]
+    assert idempotency["provider_delivery_count"] == 2
+    assert idempotency["duplicate_count"] == 1
+    assert idempotency["duplicate_event_id_hash"] == idempotency["original_event_id_hash"]
+    assert "duplicate_source" not in idempotency
+    assert "replayed_event_id_hash" not in idempotency
+
+
+@pytest.mark.parametrize("value", [True, 0, 1, 1.5, "2"])
+def test_feishu_idempotency_requires_real_provider_redelivery_count(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["feishu"]
+    observations = _observations("feishu", "nonce")
+    observations["idempotency"]["provider_delivery_count"] = value
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "feishu_api_and_webhook",
+            "independent_paths": ["provider_callback", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": fingerprints["FEISHU_APP_ID"],
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "feishu",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("provider_delivery_count" in error for error in errors)
+
+
+def test_feishu_idempotency_requires_original_and_duplicate_provider_ids_to_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["feishu"]
+    observations = _observations("feishu", "nonce")
+    observations["idempotency"]["original_event_id"] = "feishu-other-provider-event"
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "feishu_api_and_webhook",
+            "independent_paths": ["provider_callback", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": fingerprints["FEISHU_APP_ID"],
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "feishu",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("must match original_event_id" in error for error in errors)
+
+
+def test_wecom_idempotency_is_strictly_service_replay_and_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    observations = _observations("wecom", "nonce")
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "wecom_ws_and_send_ack",
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": fingerprints["WECOM_BOT_ID"],
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert not errors
+    assert evidence is not None
+    idempotency = evidence["observations"]["idempotency"]
+    assert idempotency["duplicate_source"] == "service_replay_of_provider_event"
+    assert idempotency["duplicate_count"] == 1
+    assert idempotency["original_event_id_hash"] != idempotency["replayed_event_id_hash"]
+    assert "provider_delivery_count" not in idempotency
+
+
+@pytest.mark.parametrize(
+    ("channel", "mutation"),
+    [
+        ("feishu", {"duplicate_source": "service_replay_of_provider_event"}),
+        ("feishu", {"replayed_event_id": "feishu-service-replay"}),
+        ("wecom", {"provider_delivery_count": 2}),
+    ],
+)
+def test_idempotency_channel_schemas_reject_mixed_contract_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    mutation: dict[str, object],
+) -> None:
+    fingerprints = _credentials(monkeypatch)[channel]
+    observations = _observations(channel, "nonce")
+    observations["idempotency"].update(mutation)
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "feishu_api_and_webhook" if channel == "feishu" else "wecom_ws_and_send_ack",
+            "independent_paths": (
+                ["provider_callback", "provider_send_ack"]
+                if channel == "feishu"
+                else ["provider_ws_event", "provider_send_ack"]
+            ),
+            "run_nonce": "nonce",
+            "account_fingerprint": fingerprints[
+                "FEISHU_APP_ID" if channel == "feishu" else "WECOM_BOT_ID"
+            ],
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        channel,
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("idempotency" in error and "schema" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duplicate_source", "provider_redelivery"),
+        ("duplicate_source", "service_replay"),
+        ("replayed_event_id", "wecom-original-processing"),
+        ("original_event_id", "unsafe event id"),
+    ],
+)
+def test_wecom_idempotency_rejects_false_provider_duplicate_or_invalid_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    observations = _observations("wecom", "nonce")
+    observations["idempotency"][field] = value
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "wecom_ws_and_send_ack",
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": fingerprints["WECOM_BOT_ID"],
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("idempotency" in error for error in errors)
 
 
 def test_provider_evidence_rejects_events_outside_run_window(
@@ -362,7 +629,9 @@ def test_provider_evidence_rejects_non_rate_limit_platform_codes(
             "independent_paths": [
                 "provider_callback",
                 "provider_send_ack",
-            ] if channel == "feishu" else ["provider_ws_event", "provider_send_ack"],
+            ]
+            if channel == "feishu"
+            else ["provider_ws_event", "provider_send_ack"],
             "run_nonce": "nonce",
             "account_fingerprint": _fingerprint(
                 os.environ[CHANNEL_ACCOUNT_VARIABLE[channel]],
@@ -421,6 +690,266 @@ def test_provider_evidence_rejects_short_retry_timing_and_outage(
     assert evidence is None
     assert any("did not honor Retry-After" in error for error in errors)
     assert any("outage_seconds" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("replacement_endpoint_id", "feishu-gateway-old", "must differ"),
+        ("endpoint_set_observed", False, "endpoint_set_observed must be true"),
+        ("acknowledged_request_id", "feishu-other-request", "must match outbound_request_id"),
+        ("ready_endpoint_count", 0, "ready_endpoint_count must be positive"),
+        ("ready_endpoint_count", True, "ready_endpoint_count must be positive"),
+        ("unready_endpoint_count", 1, "unready_endpoint_count must be 0"),
+        ("terminating_endpoint_count", 1, "terminating_endpoint_count must be 0"),
+    ],
+)
+def test_feishu_endpoint_failover_rejects_invalid_readiness_or_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["feishu"]
+    from scripts.im_online_gate import (
+        PROVIDER_EVIDENCE_SOURCE,
+        _fingerprint,
+    )
+
+    observations = _observations("feishu", "nonce")
+    observations["reconnect"][field] = value
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": PROVIDER_EVIDENCE_SOURCE["feishu"],
+            "independent_paths": ["provider_callback", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": _fingerprint(
+                "offline-feishu-account",
+                label="FEISHU_APP_ID",
+            ),
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "feishu",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any(message in error for error in errors)
+
+
+def test_wecom_reconnect_keeps_connector_lock_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    from scripts.im_online_gate import (
+        PROVIDER_EVIDENCE_SOURCE,
+        _fingerprint,
+    )
+
+    observations = _observations("wecom", "nonce")
+    observations["reconnect"].pop("lock_epoch")
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": PROVIDER_EVIDENCE_SOURCE["wecom"],
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": _fingerprint(
+                "offline-wecom-account",
+                label="WECOM_BOT_ID",
+            ),
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("reconnect.lock_epoch is missing" in error for error in errors)
+
+
+def test_wecom_service_failover_requires_complete_handoff_and_exactly_once_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    from scripts.im_online_gate import (
+        CHANNEL_ACCOUNT_VARIABLE,
+        PROVIDER_EVIDENCE_SOURCE,
+        _fingerprint,
+    )
+
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": PROVIDER_EVIDENCE_SOURCE["wecom"],
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": _fingerprint(
+                "offline-wecom-account",
+                label=CHANNEL_ACCOUNT_VARIABLE["wecom"],
+            ),
+            "observations": _observations("wecom", "nonce"),
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert errors == []
+    assert evidence is not None
+    outage = evidence["observations"]["prolonged_outage"]
+    assert outage["outage_mode"] == "service_failover"
+    assert outage["old_lock_owner_released"] is True
+    assert outage["new_lock_owner_acquired"] is True
+    assert outage["connection_epoch"] == 3
+    assert outage["reply_count"] == outage["ack_count"] == 1
+    assert outage["pending_count"] == outage["dlq_count"] == 0
+    assert "event_during_outage_id_hash" in outage
+    assert "reply_for_event_id_hash" in outage
+    assert "outbound_request_id_hash" in outage
+    assert "acknowledged_request_id_hash" in outage
+    assert outage["event_during_outage_id_hash"] == outage["reply_for_event_id_hash"]
+    assert outage["outbound_request_id_hash"] == outage["acknowledged_request_id_hash"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("takeover_instance_id", "wecom-primary", "must differ"),
+        ("reply_for_event_id", "wecom-new-marker", "reply_for_event_id must match"),
+        ("acknowledged_request_id", "wecom-other-request", "acknowledged_request_id must match"),
+        ("ack_count", 2, "ack_count must be 1"),
+        ("pending_count", 1, "pending_count must be 0"),
+        ("dlq_count", 1, "dlq_count must be 0"),
+    ],
+)
+def test_wecom_service_failover_rejects_identity_or_delivery_invariants(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    from scripts.im_online_gate import (
+        CHANNEL_ACCOUNT_VARIABLE,
+        PROVIDER_EVIDENCE_SOURCE,
+        _fingerprint,
+    )
+
+    observations = _observations("wecom", "nonce")
+    observations["prolonged_outage"][field] = value
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": PROVIDER_EVIDENCE_SOURCE["wecom"],
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": _fingerprint(
+                "offline-wecom-account",
+                label=CHANNEL_ACCOUNT_VARIABLE["wecom"],
+            ),
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any(message in error for error in errors)
+
+
+def test_wecom_provider_delivery_gap_never_passes_without_contract_v1_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints = _credentials(monkeypatch)["wecom"]
+    from scripts.im_online_gate import (
+        CHANNEL_ACCOUNT_VARIABLE,
+        PROVIDER_EVIDENCE_SOURCE,
+        _fingerprint,
+    )
+
+    observation = _observations("wecom", "nonce")["prolonged_outage"]
+    observation.pop("failed_instance_id")
+    observation.pop("takeover_instance_id")
+    observation.pop("old_lock_owner_released")
+    observation.pop("new_lock_owner_acquired")
+    observation.pop("connection_epoch")
+    observation.pop("event_during_outage_id")
+    observation.pop("reply_for_event_id")
+    observation.pop("reply_count")
+    observation.pop("ack_count")
+    observation.pop("pending_count")
+    observation.pop("dlq_count")
+    observation.update(
+        {
+            "outage_mode": "provider_delivery_gap",
+        }
+    )
+    observations = _observations("wecom", "nonce")
+    observations["prolonged_outage"] = observation
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": "nonce",
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": PROVIDER_EVIDENCE_SOURCE["wecom"],
+            "independent_paths": ["provider_ws_event", "provider_send_ack"],
+            "run_nonce": "nonce",
+            "account_fingerprint": _fingerprint(
+                "offline-wecom-account",
+                label=CHANNEL_ACCOUNT_VARIABLE["wecom"],
+            ),
+            "observations": observations,
+        },
+    }
+
+    evidence, errors = _validate_provider_evidence(
+        "wecom",
+        response,
+        run_nonce="nonce",
+        credential_fingerprints=fingerprints,
+    )
+
+    assert evidence is None
+    assert any("not supported by contract v1" in error for error in errors)
 
 
 def test_provider_evidence_requires_real_drop_response_for_ambiguous_case(
@@ -525,11 +1054,13 @@ def test_probe_runtime_requires_nonce_image_and_fixed_identity() -> None:
                 "run_nonce": "nonce",
                 "image_digest": "sha256:" + "a" * 64,
                 "identity_fingerprint": "b" * 64,
+                "control_profile_sha256": "d" * 64,
             },
             run_nonce="nonce",
             image_digest="sha256:" + "a" * 64,
             configured_identity=None,
             identity_hash="c" * 64,
+            control_profile_sha256="d" * 64,
         )[0]
         is False
     )
@@ -543,14 +1074,40 @@ def test_probe_runtime_accepts_report_safe_identity_hash() -> None:
                 "run_nonce": "nonce",
                 "image_digest": "sha256:" + "a" * 64,
                 "identity_fingerprint": "b" * 64,
+                "control_profile_sha256": "d" * 64,
             },
             run_nonce="nonce",
             image_digest="sha256:" + "a" * 64,
             configured_identity=None,
             identity_hash="b" * 64,
+            control_profile_sha256="d" * 64,
         )[0]
         is True
     )
+
+
+@pytest.mark.parametrize("observed", [None, "e" * 64])
+def test_probe_runtime_requires_matching_control_profile_hash(observed: object) -> None:
+    runtime = {
+        "status": "pass",
+        "run_nonce": "nonce",
+        "image_digest": "sha256:" + "a" * 64,
+        "identity_fingerprint": "b" * 64,
+    }
+    if observed is not None:
+        runtime["control_profile_sha256"] = observed
+
+    valid, reason = _validate_probe_runtime(
+        runtime,
+        run_nonce="nonce",
+        image_digest="sha256:" + "a" * 64,
+        configured_identity=None,
+        identity_hash="b" * 64,
+        control_profile_sha256="d" * 64,
+    )
+
+    assert valid is False
+    assert reason == "probe runtime control profile did not match candidate"
 
 
 def test_wecom_group_mention_is_removed_only_when_bot_is_explicitly_mentioned() -> None:
@@ -635,6 +1192,7 @@ def test_online_probe_pass_without_provider_originated_evidence_stays_not_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _credentials(monkeypatch)
+    profiles = _control_profiles(monkeypatch)
     monkeypatch.setenv("TRPC_IM_ONLINE_TESTS_ENABLED", "true")
     monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_URL", "https://probe.example.test")
     monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST", "https://probe.example.test")
@@ -647,6 +1205,19 @@ def test_online_probe_pass_without_provider_originated_evidence_stays_not_run(
     def fake_probe(_url: str, payload: dict[str, object], _timeout: float) -> dict[str, object]:
         from scripts.im_online_gate import _fingerprint
 
+        channel = str(payload["channel"])
+        assert set(payload) == {
+            "run_id",
+            "channel",
+            "nonce",
+            "cases",
+            "expected_image_digest",
+            "credential_fingerprints",
+            "probe_identity_sha256",
+            "account_fingerprint",
+            "control_profile_sha256",
+        }
+        assert payload["control_profile_sha256"] == profiles[channel]
         return _sign_probe_response(
             {
                 "runtime": {
@@ -657,6 +1228,7 @@ def test_online_probe_pass_without_provider_originated_evidence_stays_not_run(
                         "offline-probe-1",
                         label="TRPC_IM_ONLINE_PROBE_IDENTITY",
                     ),
+                    "control_profile_sha256": profiles[channel],
                 },
                 "cases": {case: {"status": "pass"} for case in REQUIRED_CASES},
             },
@@ -672,6 +1244,41 @@ def test_online_probe_pass_without_provider_originated_evidence_stays_not_run(
     assert report["gate"] == "not_run"
     assert report["production_gate"] == "not_run"
     assert any("provider_evidence" in reason for reason in report["rejection_reasons"])
+    for channel, profile_hash in profiles.items():
+        assert report["candidate"]["channels"][channel]["control_profile_sha256"] == profile_hash
+    assert "profile" not in json.dumps(report["candidate"]).replace("control_profile_sha256", "")
+
+
+@pytest.mark.parametrize("value", [None, "0" * 64, "not-a-sha256"])
+def test_online_probe_requires_nonzero_channel_control_profile_hashes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+) -> None:
+    _credentials(monkeypatch)
+    _control_profiles(monkeypatch)
+    monkeypatch.setenv("TRPC_IM_ONLINE_TESTS_ENABLED", "true")
+    monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_URL", "https://probe.example.test")
+    monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST", "https://probe.example.test")
+    monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_IDENTITY", "offline-probe-1")
+    monkeypatch.setenv("TRPC_IM_ONLINE_IMAGE_DIGEST", "sha256:" + "a" * 64)
+    monkeypatch.setenv("TRPC_RELEASE_ID", "release-offline-test")
+    monkeypatch.setenv("TRPC_RELEASE_NONCE", "r" * 32)
+    if value is None:
+        monkeypatch.delenv("TRPC_IM_ONLINE_FEISHU_CONTROL_PROFILE_SHA256", raising=False)
+    else:
+        monkeypatch.setenv("TRPC_IM_ONLINE_FEISHU_CONTROL_PROFILE_SHA256", value)
+    _install_probe_trust(tmp_path, monkeypatch)
+
+    output = tmp_path / "im-online.json"
+    assert _run(output, timeout=1.0, require_production=True) == 1
+    report = json.loads(output.read_text(encoding="utf-8"))
+
+    assert report["gate"] == "not_run"
+    assert any(
+        "TRPC_IM_ONLINE_FEISHU_CONTROL_PROFILE_SHA256" in reason
+        for reason in report["rejection_reasons"]
+    )
 
 
 def test_online_probe_requires_current_release_binding(
@@ -704,6 +1311,7 @@ def test_online_report_rejects_release_binding_changed_during_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _credentials(monkeypatch)
+    profiles = _control_profiles(monkeypatch)
     monkeypatch.setenv("TRPC_IM_ONLINE_TESTS_ENABLED", "true")
     monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_URL", "https://probe.example.test")
     monkeypatch.setenv("TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST", "https://probe.example.test")
@@ -717,6 +1325,7 @@ def test_online_report_rejects_release_binding_changed_during_probe(
 
     def fake_probe(_url: str, payload: dict[str, object], _timeout: float) -> dict[str, object]:
         monkeypatch.delenv("TRPC_RELEASE_NONCE", raising=False)
+        channel = str(payload["channel"])
         return _sign_probe_response(
             {
                 "runtime": {
@@ -727,6 +1336,7 @@ def test_online_report_rejects_release_binding_changed_during_probe(
                         "offline-probe-1",
                         label="TRPC_IM_ONLINE_PROBE_IDENTITY",
                     ),
+                    "control_profile_sha256": profiles[channel],
                 },
                 "cases": {case: {"status": "pass"} for case in REQUIRED_CASES},
             },
@@ -873,6 +1483,7 @@ def test_normalized_signed_response_digest_excludes_signature_and_body(
                 "run_nonce": "nonce-for-digest",
                 "image_digest": "sha256:" + "a" * 64,
                 "identity_fingerprint": "b" * 64,
+                "control_profile_sha256": "d" * 64,
             },
             "cases": {case: {"status": "pass"} for case in REQUIRED_CASES},
             "message_body": "must not enter release evidence",
@@ -888,6 +1499,27 @@ def test_normalized_signed_response_digest_excludes_signature_and_body(
     response["message_body"] = "different secret body"
     response["signature_attestation"]["signature"] = "not part of the digest"
     second = online_gate._normalized_probe_response_sha256("feishu", response, provider_evidence)
+    response["runtime"]["control_profile_sha256"] = "e" * 64
+    third = online_gate._normalized_probe_response_sha256("feishu", response, provider_evidence)
 
     assert first == second
+    assert third != second
     assert len(first) == 64
+
+    first_binding = online_gate._probe_response_digest_binding(
+        channel="feishu",
+        run_id="run-for-binding",
+        run_nonce="nonce-for-binding",
+        response_sha256=first,
+        control_profile_sha256="d" * 64,
+        trust=trust,
+    )
+    second_binding = online_gate._probe_response_digest_binding(
+        channel="feishu",
+        run_id="run-for-binding",
+        run_nonce="nonce-for-binding",
+        response_sha256=first,
+        control_profile_sha256="e" * 64,
+        trust=trust,
+    )
+    assert first_binding != second_binding

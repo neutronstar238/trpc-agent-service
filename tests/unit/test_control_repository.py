@@ -14,6 +14,7 @@ from trpc_service.tenant.control import (
     _decode_cursor,
     _encode_cursor,
     _record_json,
+    _safe_provider_code,
 )
 
 
@@ -212,6 +213,263 @@ async def test_audit_cursor_dead_letters_and_helpers() -> None:
     assert dead[0]["dead_letter_id"] == str(ids[0])
     converted = _record_json({"when": timestamp, "id": ids[0], "value": 1})
     assert converted["when"].endswith("+00:00") and converted["id"] == str(ids[0])
+
+
+@pytest.mark.asyncio
+async def test_wecom_acceptance_snapshot_is_tenant_scoped_bounded_and_hash_only() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    event_id = uuid4()
+    state = {
+        "owner_hash": "a" * 64,
+        "epoch": 7,
+        "phase": "authenticated",
+        "acquired_at": timestamp,
+        "authenticated_at": timestamp,
+        "disconnected_at": None,
+        "released_at": None,
+        "last_provider_event_hash": "b" * 64,
+        "last_provider_event_at": timestamp,
+        "updated_at": timestamp,
+        "owner_id": "must-not-leak",
+        "secret": "must-not-leak",
+    }
+    events = [
+        {
+            "event_id": event_id,
+            "connection_epoch": 7,
+            "event_type": "provider_event",
+            "owner_hash": "a" * 64,
+            "provider_event_hash": "b" * 64,
+            "occurred_at": timestamp,
+            "provider_event_id": "must-not-leak",
+            "body": "must-not-leak",
+        }
+    ]
+    connection = Connection(fetchrows=[state], fetches=[events], fetchvals=[1])
+    result = await control(connection).wecom_acceptance_snapshot("tenant-a", "binding-a", limit=999)
+
+    assert result is not None
+    assert set(result) == {"state", "events"}
+    assert set(result["state"]) == {
+        "owner_hash",
+        "epoch",
+        "phase",
+        "acquired_at",
+        "authenticated_at",
+        "disconnected_at",
+        "released_at",
+        "last_provider_event_hash",
+        "last_provider_event_at",
+        "updated_at",
+    }
+    assert set(result["events"][0]) == {
+        "event_id",
+        "connection_epoch",
+        "event_type",
+        "owner_hash",
+        "provider_event_hash",
+        "occurred_at",
+    }
+    assert result["events"][0]["event_id"] == str(event_id)
+    calls = connection.calls
+    assert calls[0][0] == "execute" and "app.tenant_id" in calls[0][1][0]
+    event_query = next(call for call in calls if call[0] == "fetch")
+    assert "ORDER BY occurred_at DESC,event_id DESC" in event_query[1][0]
+    assert event_query[1][-1] == 200
+    assert "must-not-leak" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_wecom_acceptance_snapshot_hides_unknown_or_wrong_channel_binding() -> None:
+    connection = Connection(fetchvals=[None])
+    assert (
+        await control(connection).wecom_acceptance_snapshot(
+            "tenant-a", "missing-or-wrong-channel", limit=0
+        )
+        is None
+    )
+    assert not any(call[0] in {"fetch", "fetchrow"} for call in connection.calls)
+    validation = next(call for call in connection.calls if call[0] == "fetchval")
+    assert "tenant_id=$1" in validation[1][0]
+    assert "channel='wecom_ai_bot'" in validation[1][0]
+
+
+@pytest.mark.asyncio
+async def test_wecom_acceptance_snapshot_clamps_the_repository_lower_limit() -> None:
+    connection = Connection(fetchrows=[None], fetches=[[]], fetchvals=[1])
+    result = await control(connection).wecom_acceptance_snapshot("tenant-a", "binding-a", limit=0)
+
+    assert result == {"state": None, "events": []}
+    event_query = next(call for call in connection.calls if call[0] == "fetch")
+    assert event_query[1][-1] == 1
+
+
+@pytest.mark.asyncio
+async def test_im_acceptance_outbound_evidence_is_scoped_hash_only_and_bounded() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    outbound_id = uuid4()
+    outbound = {
+        "status": "delivered",
+        "provider_message_id": "raw-provider-message",
+        "pending_count": 0,
+        "dlq_count": 0,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "payload_json": {"secret": "must-not-leak"},
+        "target_id": "must-not-leak",
+    }
+    attempts = [
+        {
+            "attempt_number": 1,
+            "status": "failed",
+            "provider_code": "429",
+            "started_at": timestamp,
+            "completed_at": timestamp,
+            "total_count": 2,
+        },
+        {
+            "attempt_number": 2,
+            "status": "delivered",
+            "provider_code": "sk-live-ABC123",
+            "started_at": timestamp,
+            "completed_at": timestamp,
+            "total_count": 2,
+        },
+    ]
+    connection = Connection(fetchrows=[outbound], fetches=[attempts], fetchvals=[1])
+
+    result = await control(connection).im_acceptance_outbound_evidence(
+        "tenant-a",
+        "binding-a",
+        run_id="im-run-123",
+        outbound_id=outbound_id,
+    )
+
+    assert result is not None
+    assert result["schema_version"] == 1
+    assert result["run_correlation"] == {
+        "availability": "unavailable",
+        "reason": "run_id_not_persisted_on_outbound_records",
+    }
+    assert result["artifact"] == {
+        "availability": "unavailable",
+        "reason": "artifact_not_correlated_to_run_or_binding",
+    }
+    evidence = result["outbound"]
+    assert evidence["availability"] == "available"
+    assert evidence["delivery_status"] == "delivered"
+    assert evidence["attempt_count"] == 2
+    assert evidence["attempts_truncated"] is False
+    assert evidence["attempts"][0]["provider_code"] == "429"
+    assert evidence["attempts"][1]["provider_code"] is None
+    assert evidence["pending_count"] == 0
+    assert evidence["dlq_count"] == 0
+    assert evidence["provider_message_id_sha256"] is not None
+    assert len(evidence["provider_message_id_sha256"]) == 64
+    rendered = repr(result)
+    assert "im-run-123" not in rendered
+    assert str(outbound_id) not in rendered
+    assert "raw-provider-message" not in rendered
+    assert "must-not-leak" not in rendered
+
+    binding_query = next(call for call in connection.calls if call[0] == "fetchval")
+    assert "tenant_id=$1 AND binding_id=$2" in binding_query[1][0]
+    assert binding_query[1][1:] == ("tenant-a", "binding-a")
+    outbound_query = next(call for call in connection.calls if call[0] == "fetchrow")
+    assert "message.tenant_id=$1 AND message.binding_id=$2" in outbound_query[1][0]
+    assert "payload_json" not in outbound_query[1][0]
+    assert "target_id" not in outbound_query[1][0]
+    assert "trace_headers" not in outbound_query[1][0]
+    assert "source_type" not in outbound_query[1][0]
+    assert outbound_query[1][1:] == ("tenant-a", "binding-a", outbound_id)
+    attempt_query = next(call for call in connection.calls if call[0] == "fetch")
+    assert "count(*) OVER ()" in attempt_query[1][0]
+    assert "ORDER BY attempt_number DESC" in attempt_query[1][0]
+    assert "LIMIT 100" in attempt_query[1][0]
+    assert attempt_query[1][0].rfind("ORDER BY attempt_number") > attempt_query[1][0].find(
+        "LIMIT 100"
+    )
+
+
+@pytest.mark.parametrize(
+    "provider_code",
+    ["0", "200", "429", "45009", "45011", "99991400", "99991401", "99991402", "99991672"],
+)
+def test_im_acceptance_provider_code_allowlist(provider_code: str) -> None:
+    assert _safe_provider_code(provider_code) == provider_code
+
+
+@pytest.mark.parametrize("provider_code", [None, "201", "transport_error", "sk-live-ABC123"])
+def test_im_acceptance_provider_code_rejects_unapproved_values(provider_code: object) -> None:
+    assert _safe_provider_code(provider_code) is None
+
+
+@pytest.mark.asyncio
+async def test_im_acceptance_outbound_evidence_keeps_latest_attempts_in_order() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    outbound_id = uuid4()
+    outbound = {
+        "status": "delivered",
+        "provider_message_id": None,
+        "pending_count": 0,
+        "dlq_count": 0,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    attempts = [
+        {
+            "attempt_number": attempt_number,
+            "status": "delivered" if attempt_number == 101 else "failed",
+            "provider_code": "0" if attempt_number == 101 else "429",
+            "started_at": timestamp,
+            "completed_at": timestamp,
+            "total_count": 101,
+        }
+        for attempt_number in range(2, 102)
+    ]
+    connection = Connection(fetchrows=[outbound], fetches=[attempts], fetchvals=[1])
+
+    result = await control(connection).im_acceptance_outbound_evidence(
+        "tenant-a",
+        "binding-a",
+        run_id="im-run-123",
+        outbound_id=outbound_id,
+    )
+
+    assert result is not None
+    evidence = result["outbound"]
+    assert evidence["attempt_count"] == 101
+    assert evidence["attempts_truncated"] is True
+    assert len(evidence["attempts"]) == 100
+    assert [attempt["attempt_number"] for attempt in evidence["attempts"]] == list(range(2, 102))
+    assert evidence["attempts"][-1]["status"] == "delivered"
+    assert evidence["attempts"][-1]["provider_code"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_im_acceptance_outbound_evidence_handles_missing_binding_or_outbound() -> None:
+    missing_binding = Connection(fetchvals=[None])
+    assert (
+        await control(missing_binding).im_acceptance_outbound_evidence(
+            "tenant-a",
+            "missing",
+            run_id="im-run-123",
+            outbound_id=uuid4(),
+        )
+        is None
+    )
+    assert not any(call[0] in {"fetchrow", "fetch"} for call in missing_binding.calls)
+
+    missing_outbound = Connection(fetchrows=[None], fetchvals=[1])
+    result = await control(missing_outbound).im_acceptance_outbound_evidence(
+        "tenant-a",
+        "binding-a",
+        run_id="im-run-123",
+        outbound_id=uuid4(),
+    )
+    assert result is not None
+    assert result["outbound"] == {"availability": "not_found"}
+    assert not any(call[0] == "fetch" for call in missing_outbound.calls)
 
 
 @pytest.mark.asyncio

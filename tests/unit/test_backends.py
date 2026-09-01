@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -27,6 +28,7 @@ class FakeS3:
         self.fail_delete = False
         self.head_errors: dict[str, BaseException] = {}
         self.get_response: dict[str, Any] | None = None
+        self.list_response: dict[str, Any] = {"Contents": []}
 
     def put_object(self, *, Bucket, Key, Body, Metadata):
         self.put_calls += 1
@@ -58,6 +60,9 @@ class FakeS3:
         if self.get_response is not None:
             return self.get_response
         return {"Body": _Body(self.objects[Key][0])}
+
+    def list_objects_v2(self, **_kwargs: object) -> dict[str, Any]:
+        return self.list_response
 
 
 class _Body:
@@ -131,6 +136,30 @@ async def test_artifact_staging_checks_checksum_and_tenant_scope() -> None:
         await store.commit("tenant-b", "artifact", committed)
     with pytest.raises(ValueError, match="checksum"):
         await store.stage("tenant-a", "artifact", content, checksum="wrong")
+
+
+@pytest.mark.asyncio
+async def test_s3_staging_scan_is_bounded_by_age_and_key_shape() -> None:
+    client = FakeS3()
+    valid = "tenants/" + "a" * 64 + "/staging/11111111-1111-1111-1111-111111111111"
+    now = datetime.now(UTC)
+    client.list_response = {
+        "Contents": [
+            {"Key": valid, "LastModified": now - timedelta(hours=2)},
+            {"Key": valid.replace("/staging/", "/artifacts/"), "LastModified": now},
+            {"Key": "tenants/bad/staging/value", "LastModified": now - timedelta(days=2)},
+        ],
+        "NextContinuationToken": "next-page",
+    }
+    store = S3ArtifactStore(client, bucket="bucket")
+
+    keys, token = await store.list_staged(older_than=now - timedelta(hours=1), limit=100)
+
+    assert keys == (valid,)
+    assert token == "next-page"
+    await store.discard_unreferenced_staged(valid)
+    with pytest.raises(ValueError, match="valid staged"):
+        await store.discard_unreferenced_staged("tenants/bad/staging/value")
 
 
 @pytest.mark.asyncio

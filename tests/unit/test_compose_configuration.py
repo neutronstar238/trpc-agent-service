@@ -22,6 +22,7 @@ _NON_HTTP_PROBE_ROLES = (
     "post-turn-projector",
     "wecom-connector",
     "session-recovery",
+    "artifact-gc",
 )
 
 _HTTP_HEALTHCHECKS = {
@@ -173,6 +174,7 @@ def test_compose_forwards_worker_queue_and_database_pool_settings() -> None:
         "post-turn-projector",
         "wecom-connector",
         "session-recovery",
+        "artifact-gc",
     ):
         role_environment = compose["services"][role]["environment"]
         assert role_environment["TRPC_SERVICE_WORKER_DATABASE_DSN_REF"] == (
@@ -245,6 +247,16 @@ def test_compose_postgres_initialization_receives_worker_password() -> None:
     assert "worker_database_password" in compose["services"]["postgres"]["secrets"]
 
 
+def test_compose_postgres_initialization_receives_metrics_password() -> None:
+    compose_path = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+
+    assert "metrics_database_password" in compose["services"]["postgres"]["secrets"]
+    assert compose["secrets"]["metrics_database_password"] == {
+        "environment": "METRICS_DATABASE_PASSWORD"
+    }
+
+
 def test_acceptance_override_is_opt_in_and_bounds_every_compose_service() -> None:
     root = Path(__file__).resolve().parents[2]
     base = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
@@ -293,9 +305,7 @@ def test_acceptance_compose_combinations_have_no_pid_conflict(
         (root / scenario_override).read_text(encoding="utf-8").replace("!override", "")
     ).get("services", {})
     profile_only = {
-        service
-        for service, definition in scenario_services.items()
-        if definition.get("profiles")
+        service for service, definition in scenario_services.items() if definition.get("profiles")
     }
     expected_pids = {
         service: _ACCEPTANCE_PIDS.get(service, 256)
@@ -360,9 +370,7 @@ def test_fault_runtime_routes_and_attests_session_recovery() -> None:
     assert "session-recovery" in PARTICIPATING_SERVICES
     recovery_environment = override["services"]["session-recovery"]["environment"]
     assert "@toxiproxy:15432/" in recovery_environment["TRPC_SERVICE_DATABASE_DSN"]
-    assert "TRPC_WORKER_USER" in recovery_environment[
-        "TRPC_SERVICE_WORKER_DATABASE_DSN"
-    ]
+    assert "TRPC_WORKER_USER" in recovery_environment["TRPC_SERVICE_WORKER_DATABASE_DSN"]
     assert recovery_environment["TRPC_SERVICE_REDIS_URL"] == "redis://toxiproxy:16379/0"
     assert compose["services"]["toxiproxy"]["healthcheck"]["test"] == [
         "CMD",
@@ -403,12 +411,12 @@ def test_kustomize_session_recovery_uses_only_database_secret() -> None:
     } == {"trpc-worker-secrets"}
     assert "TRPC_SERVICE_DATABASE_DSN" not in env
     worker_secret = yaml.safe_load_all(
-        (Path(__file__).resolve().parents[2] / "deploy/kustomize/base/secrets.example.yaml")
-        .read_text(encoding="utf-8")
+        (
+            Path(__file__).resolve().parents[2] / "deploy/kustomize/base/secrets.example.yaml"
+        ).read_text(encoding="utf-8")
     )
     assert any(
-        item.get("metadata", {}).get("name") == "trpc-worker-secrets"
-        for item in worker_secret
+        item.get("metadata", {}).get("name") == "trpc-worker-secrets" for item in worker_secret
     )
     assert all("REDIS" not in item["name"] for item in container["env"])
     assert container["readinessProbe"]["exec"]["command"][-1] == "session-recovery"
@@ -416,6 +424,23 @@ def test_kustomize_session_recovery_uses_only_database_secret() -> None:
         "requests": {"cpu": "100m", "memory": "256Mi"},
         "limits": {"cpu": "1000m", "memory": "1Gi"},
     }
+
+
+def test_kustomize_artifact_gc_receives_database_and_s3_secrets() -> None:
+    deployments_path = (
+        Path(__file__).resolve().parents[2] / "deploy" / "kustomize" / "base" / "deployments.yaml"
+    )
+    documents = list(yaml.safe_load_all(deployments_path.read_text(encoding="utf-8")))
+    deployment = next(
+        item for item in documents if item.get("metadata", {}).get("name") == "trpc-artifact-gc"
+    )
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+
+    assert {item["secretRef"]["name"] for item in container["envFrom"] if "secretRef" in item} == {
+        "trpc-service-secrets",
+        "trpc-worker-secrets",
+    }
+    assert container["args"] == ["serve", "--role", "artifact-gc"]
 
 
 def test_kustomize_scheduler_defaults_are_v2_in_base_and_production() -> None:

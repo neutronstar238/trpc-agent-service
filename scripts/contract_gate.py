@@ -248,9 +248,9 @@ def _write_history_report(path: Path, value: object) -> None:
         if component.exists() and component.is_symlink():
             raise ValueError(f"diagnostic history path must not contain a symlink: {component}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = (
-        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    ).encode("utf-8")
+    rendered = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode(
+        "utf-8"
+    )
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -377,9 +377,7 @@ def main() -> int:
         "run_id": evidence["run_id"],
         "evidence": evidence,
     }
-    history_path = (
-        output.parent / "history" / f"{output.stem}-{evidence['run_id']}.json"
-    )
+    history_path = output.parent / "history" / f"{output.stem}-{evidence['run_id']}.json"
     candidate["diagnostic_history"] = {
         "status": "written",
         "path": history_path.relative_to(output.parent).as_posix(),

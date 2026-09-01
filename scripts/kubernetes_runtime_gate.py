@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import yaml
@@ -81,14 +82,13 @@ OVERLAY_ROOT = ROOT / "deploy" / "kustomize" / "overlays" / "production"
 BASE_ROOT = ROOT / "deploy" / "kustomize" / "base"
 PRODUCER = "scripts.kubernetes_runtime_gate"
 IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-fA-F]{64}")
-_IMAGE_REFERENCE_RE = re.compile(
-    r"^(?P<name>[^@\s]+)@(?P<digest>sha256:[0-9a-fA-F]{64})$"
-)
+_IMAGE_REFERENCE_RE = re.compile(r"^(?P<name>[^@\s]+)@(?P<digest>sha256:[0-9a-fA-F]{64})$")
 # Kubernetes/CRI implementations expose ``imageID`` in more than one
 # equivalent form (for example ``docker-pullable://repo@sha256:...`` or
 # ``containerd://sha256:...``).  The release evidence deliberately retains
 # only the immutable digest, after validating one of these API shapes.
 IMAGE_ID_DIGEST_RE = re.compile(r"(?:^|@|://)(sha256:[0-9a-fA-F]{64})$")
+S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 _KUBERNETES_QUANTITY_RE = re.compile(
     r"^(?P<number>[+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
     r"(?P<suffix>m|Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$"
@@ -160,6 +160,8 @@ RUNTIME_NAMESPACE_TTL_SECONDS = 6 * 60 * 60
 DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-gateway", "gateway"),
     ("trpc-session-recovery", "session-recovery"),
+    ("trpc-artifact-gc", "artifact-gc"),
+    ("trpc-backlog-exporter", "backlog-exporter"),
     ("trpc-admin", "admin"),
     ("trpc-worker", "worker"),
     ("trpc-outbox-dispatcher", "outbox-dispatcher"),
@@ -181,6 +183,8 @@ _PDB_PROTECTED_DEPLOYMENTS = frozenset(
 _EXPECTED_SCHEDULER_VERSION = "v2"
 _EXPECTED_REDIS_STREAM = "trpc:session-ready:v2"
 _EXPECTED_REDIS_GROUP = "trpc-session-ready-v2"
+_HPA_BACKLOG_METRIC = "trpc_session_ready_backlog"
+_EXTERNAL_METRICS_API_VERSION = "v1beta1"
 _MIN_PRODUCTION_TURN_CAPACITY = 200
 _WORKER_EVICTION_REPLICAS = 4
 _NODE_DRAIN_CONFIRMATION = "I_UNDERSTAND_ISOLATED_NODE_DRAIN"
@@ -500,11 +504,7 @@ def _registry_digest_reference(image: str) -> tuple[str, str] | None:
         host, port = first_component.rsplit(":", 1)
         if not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
             return None
-    if not (
-        host == "localhost"
-        or "." in host
-        or has_port
-    ):
+    if not (host == "localhost" or "." in host or has_port):
         return None
     return name, match.group("digest").lower()
 
@@ -558,10 +558,20 @@ def _hpa_status_contract(
     if not isinstance(metrics, list) or not metrics:
         reasons.append("worker HPA has no current metric samples")
     configured = spec.get("metrics")
-    if not isinstance(configured, list) or not any(
-        isinstance(item, Mapping) and item.get("type") == "External" for item in configured
-    ):
-        reasons.append("worker HPA has no backlog external metric")
+    configured_names = (
+        {
+            item.get("external", {}).get("metric", {}).get("name")
+            for item in configured
+            if isinstance(item, Mapping)
+            and item.get("type") == "External"
+            and isinstance(item.get("external"), Mapping)
+            and isinstance(item["external"].get("metric"), Mapping)
+        }
+        if isinstance(configured, list)
+        else set()
+    )
+    if _HPA_BACKLOG_METRIC not in configured_names:
+        reasons.append("worker HPA does not configure the exact backlog external metric")
     for key in ("currentReplicas", "desiredReplicas"):
         value = status.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -767,10 +777,7 @@ def _prepare_worker_eviction_capacity(
         return (
             CommandResult(
                 status="fail",
-                reason=(
-                    "local-kind PDB eviction capacity is insufficient: "
-                    + ", ".join(failed)
-                ),
+                reason=("local-kind PDB eviction capacity is insufficient: " + ", ".join(failed)),
             ),
             details,
         )
@@ -787,10 +794,10 @@ def _finite_nonnegative_number(value: object) -> float | None:
         if match is None:
             return None
         try:
-            number = Decimal(match.group("number")) * _KUBERNETES_QUANTITY_FACTORS.get(
+            parsed_number = Decimal(match.group("number")) * _KUBERNETES_QUANTITY_FACTORS.get(
                 match.group("suffix") or "", Decimal(1)
             )
-            number = float(number)
+            number = float(parsed_number)
         except (InvalidOperation, OverflowError, ValueError):
             return None
     else:
@@ -819,20 +826,134 @@ def _hpa_metric_value(hpa: Mapping[str, Any]) -> float | None:
         metric_spec = external.get("metric")
         if not isinstance(metric_spec, Mapping):
             continue
-        if metric_spec.get("name") != "trpc_session_ready_backlog":
+        if metric_spec.get("name") != _HPA_BACKLOG_METRIC:
             continue
         current = external.get("current")
         if not isinstance(current, Mapping):
             return None
         # External metrics can expose either value or averageValue.  The
-        # service HPA uses value; accepting averageValue keeps the observer
-        # compatible with API-server adapters without trusting driver output.
+        # service HPA uses AverageValue, so this status value is the
+        # controller's per-replica view and is not directly comparable with
+        # the namespace total returned by the external metrics API.
         for key in ("value", "averageValue"):
             parsed = _finite_nonnegative_number(current.get(key))
             if parsed is not None:
                 return parsed
         return None
     return None
+
+
+def _external_metric_from_api(
+    payload: Mapping[str, Any] | None, *, namespace: str
+) -> tuple[float | None, dict[str, Any], tuple[str, ...]]:
+    """Parse one namespace-scoped ExternalMetricValueList fail-closed."""
+
+    evidence: dict[str, Any] = {
+        "api_observed": False,
+        "api_version": _EXTERNAL_METRICS_API_VERSION,
+        "metric_name": _HPA_BACKLOG_METRIC,
+        "namespace": namespace,
+    }
+    if not isinstance(payload, Mapping):
+        return None, evidence, ("external metrics API response is unavailable",)
+    expected_api_version = f"external.metrics.k8s.io/{_EXTERNAL_METRICS_API_VERSION}"
+    if payload.get("apiVersion") != expected_api_version:
+        return (
+            None,
+            {**evidence, "api_version": payload.get("apiVersion")},
+            ("external metrics API response version is invalid",),
+        )
+    if payload.get("kind") != "ExternalMetricValueList":
+        return (
+            None,
+            {**evidence, "api_version": expected_api_version},
+            ("external metrics API response kind is invalid",),
+        )
+    items = payload.get("items")
+    if not isinstance(items, list) or len(items) != 1:
+        return (
+            None,
+            {**evidence, "item_count": len(items) if isinstance(items, list) else None},
+            ("external metrics API must return exactly one backlog value",),
+        )
+    item = items[0]
+    if not isinstance(item, Mapping):
+        return None, {**evidence, "item_count": 1}, ("external metrics API value is invalid",)
+    if item.get("metricName") != _HPA_BACKLOG_METRIC:
+        return (
+            None,
+            {**evidence, "item_count": 1},
+            ("external metrics API returned an unexpected metric name",),
+        )
+    labels = item.get("metricLabels")
+    if not isinstance(labels, Mapping) or labels.get("namespace") != namespace:
+        return (
+            None,
+            {
+                **evidence,
+                "item_count": 1,
+                "label_namespace": labels.get("namespace") if isinstance(labels, Mapping) else None,
+            },
+            ("external metrics API value is not namespace-bound",),
+        )
+    value = _finite_nonnegative_number(item.get("value"))
+    if value is None:
+        return (
+            None,
+            {**evidence, "item_count": 1, "label_namespace": namespace},
+            ("external metrics API value is not finite and nonnegative",),
+        )
+    return (
+        value,
+        {
+            **evidence,
+            "api_observed": True,
+            "item_count": 1,
+            "label_namespace": namespace,
+            "value": value,
+        },
+        (),
+    )
+
+
+def _observe_external_metric(
+    *, namespace: str, context: str | None, timeout_seconds: float
+) -> tuple[CommandResult, float | None]:
+    """Read the external metrics API directly, never a driver-supplied file."""
+
+    path = (
+        f"/apis/external.metrics.k8s.io/{_EXTERNAL_METRICS_API_VERSION}/namespaces/"
+        f"{namespace}/{_HPA_BACKLOG_METRIC}"
+    )
+    result, payload = _json_command(
+        ["get", "--raw", path],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    base_evidence = {"api_path": path}
+    if result.status != "pass":
+        return (
+            CommandResult(
+                status=result.status,
+                exit_code=result.exit_code,
+                reason="external metrics API read failed",
+                stderr=result.stderr,
+                evidence=base_evidence,
+            ),
+            None,
+        )
+    value, evidence, reasons = _external_metric_from_api(payload, namespace=namespace)
+    evidence = {**base_evidence, **evidence}
+    if reasons:
+        return (
+            CommandResult(
+                status="fail",
+                reason="; ".join(reasons),
+                evidence=evidence,
+            ),
+            None,
+        )
+    return CommandResult(status="pass", evidence=evidence), value
 
 
 def _hpa_observation_from_api(
@@ -883,7 +1004,7 @@ def _hpa_observation_from_api(
 def _observe_hpa_state(
     *, namespace: str, context: str | None, timeout_seconds: float
 ) -> tuple[CommandResult, dict[str, Any] | None]:
-    """Read one HPA phase from the live API server, never from a driver file."""
+    """Read one HPA phase and its direct external metric from the API server."""
 
     timeout_seconds = _validate_timeout_seconds(timeout_seconds)
     hpa_result, hpa = _json_command(
@@ -903,6 +1024,29 @@ def _observe_hpa_state(
     observation, reasons = _hpa_observation_from_api(hpa, deployment)
     if observation is None:
         return CommandResult(status="fail", reason="; ".join(reasons)), None
+    external_result, external_value = _observe_external_metric(
+        namespace=namespace,
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    if external_result.status != "pass" or external_value is None:
+        return (
+            CommandResult(
+                status=external_result.status,
+                reason=external_result.reason or "external metrics API observation failed",
+                stderr=external_result.stderr,
+                evidence=external_result.evidence,
+            ),
+            None,
+        )
+    # The HPA status reports ``averageValue`` for an AverageValue target,
+    # while the namespace-scoped external metrics API reports the aggregate
+    # backlog.  Preserve the controller's view for diagnostics, but use the
+    # direct API aggregate as the load-transition signal.  Requiring equality
+    # here would discard every healthy scaled observation once replicas > 1.
+    observation["hpa_metric_value"] = observation["metric_value"]
+    observation["metric_value"] = external_value
+    observation["external_metric"] = external_result.evidence or {}
     return CommandResult(status="pass"), observation
 
 
@@ -936,9 +1080,7 @@ def _hpa_phase_transition_contract(
         candidate_ready = number(candidate.get("ready_replicas"), "during.ready_replicas")
 
         replicas_increased = any(
-            baseline is not None
-            and observed is not None
-            and observed > baseline
+            baseline is not None and observed is not None and observed > baseline
             for baseline, observed in (
                 (before_desired, candidate_desired),
                 (before_current, candidate_current),
@@ -969,9 +1111,7 @@ def _hpa_phase_transition_contract(
             # pre-load bound while still requiring the Deployment readiness
             # check below.
             if max(candidate_current, candidate_ready) < before_desired:
-                reasons.append(
-                    "HPA current replicas did not reach the pre-load desired bound"
-                )
+                reasons.append("HPA current replicas did not reach the pre-load desired bound")
         if candidate_ready is not None and candidate_desired is not None:
             if candidate_ready < candidate_desired:
                 reasons.append("HPA scaled replicas did not become ready")
@@ -1197,6 +1337,36 @@ def _hpa_load_observation_contract(
         else:
             observations[phase] = value
 
+    expected_namespace = namespace or evidence.get("namespace")
+    for phase, observation in observations.items():
+        external = observation.get("external_metric")
+        if not isinstance(external, Mapping):
+            reasons.append(f"HPA {phase} observation lacks direct external metric API evidence")
+            continue
+        if external.get("api_observed") is not True:
+            reasons.append(f"HPA {phase} external metric API was not observed")
+        if external.get("metric_name") != _HPA_BACKLOG_METRIC:
+            reasons.append(f"HPA {phase} external metric name is not bound")
+        if expected_namespace is not None:
+            if external.get("namespace") != expected_namespace:
+                reasons.append(f"HPA {phase} external metric namespace is not bound")
+            if external.get("label_namespace") != expected_namespace:
+                reasons.append(f"HPA {phase} external metric label namespace is not bound")
+            expected_path = (
+                f"/apis/external.metrics.k8s.io/{_EXTERNAL_METRICS_API_VERSION}/namespaces/"
+                f"{expected_namespace}/{_HPA_BACKLOG_METRIC}"
+            )
+            if external.get("api_path") != expected_path:
+                reasons.append(f"HPA {phase} external metric API path is not namespace-bound")
+        if external.get("item_count") != 1:
+            reasons.append(f"HPA {phase} external metric API item count is invalid")
+        direct_value = _finite_nonnegative_number(external.get("value"))
+        observed_value = _finite_nonnegative_number(observation.get("metric_value"))
+        if direct_value is None:
+            reasons.append(f"HPA {phase} external metric value is not finite and nonnegative")
+        elif observed_value is not None and direct_value != observed_value:
+            reasons.append(f"HPA {phase} external metric value does not match observed metric")
+
     def number(phase: str, key: str) -> float | None:
         value = observations.get(phase, {}).get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1220,18 +1390,20 @@ def _hpa_load_observation_contract(
     after_current = number("after", "current_replicas")
     after_ready = number("after", "ready_replicas")
     replicas_increased = any(
-        baseline is not None
-        and observed is not None
-        and observed > baseline
+        baseline is not None and observed is not None and observed > baseline
         for baseline, observed in (
             (before_desired, during_desired),
             (before_current, during_current),
             (before_ready, during_ready),
         )
     )
-    if before_metric is not None and during_metric is not None and (
-        during_metric < before_metric
-        or (during_metric == before_metric and (during_metric <= 0 or not replicas_increased))
+    if (
+        before_metric is not None
+        and during_metric is not None
+        and (
+            during_metric < before_metric
+            or (during_metric == before_metric and (during_metric <= 0 or not replicas_increased))
+        )
     ):
         reasons.append("controlled backlog did not increase the observed HPA metric")
     if not replicas_increased:
@@ -1255,11 +1427,7 @@ def _hpa_load_observation_contract(
         after_current is not None
         and during_current is not None
         and after_current > during_current
-        and (
-            after_desired is None
-            or before_desired is None
-            or after_desired > before_desired
-        )
+        and (after_desired is None or before_desired is None or after_desired > before_desired)
     ):
         reasons.append("HPA current replicas increased after controlled load removal")
     if after_ready is not None and after_desired is not None and after_ready < after_desired:
@@ -1299,6 +1467,24 @@ def _hpa_load_report_payload(evidence: Mapping[str, Any] | None) -> dict[str, An
             for key in ("metric_value", "desired_replicas", "current_replicas", "ready_replicas")
             if isinstance(observation, Mapping) and key in observation
         }
+        if isinstance(observation, Mapping) and isinstance(
+            observation.get("external_metric"), Mapping
+        ):
+            external = observation["external_metric"]
+            result[phase]["external_metric"] = {
+                key: external.get(key)
+                for key in (
+                    "api_observed",
+                    "api_version",
+                    "api_path",
+                    "metric_name",
+                    "namespace",
+                    "label_namespace",
+                    "item_count",
+                    "value",
+                )
+                if key in external
+            }
     return result
 
 
@@ -1336,11 +1522,7 @@ def _write_overlay(
                     "apiVersion": "apps/v1",
                     "kind": "Deployment",
                     "metadata": {"name": deployment},
-                    "spec": {
-                        "replicas": 2
-                        if deployment in _PDB_PROTECTED_DEPLOYMENTS
-                        else 1
-                    },
+                    "spec": {"replicas": 2 if deployment in _PDB_PROTECTED_DEPLOYMENTS else 1},
                 }
             )
         replica_documents.extend(
@@ -1501,6 +1683,58 @@ def _split_migration_manifests(rendered: str) -> tuple[str, str]:
     )
 
 
+def _runtime_object_store_override(
+    rendered: str, *, endpoint: str, bucket: str
+) -> tuple[str, dict[str, Any]]:
+    """Apply one credential-free acceptance endpoint to the rendered ConfigMap."""
+
+    normalized_endpoint = endpoint.strip().rstrip("/")
+    normalized_bucket = bucket.strip()
+    try:
+        parsed = urlsplit(normalized_endpoint)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("runtime object-store endpoint is invalid") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise ValueError("runtime object-store endpoint must be a credential-free HTTP(S) origin")
+    if S3_BUCKET_RE.fullmatch(normalized_bucket) is None:
+        raise ValueError("runtime object-store bucket is invalid")
+    try:
+        documents = [document for document in yaml.safe_load_all(rendered) if document is not None]
+    except yaml.YAMLError as error:
+        raise ValueError("rendered manifest is not valid YAML") from error
+    configs = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "ConfigMap"
+        and isinstance(document.get("metadata"), dict)
+        and document["metadata"].get("name") == "trpc-service-config"
+    ]
+    if len(configs) != 1 or not isinstance(configs[0].get("data"), dict):
+        raise ValueError("rendered manifest must contain one trpc-service-config ConfigMap")
+    configs[0]["data"]["TRPC_SERVICE_S3_ENDPOINT"] = normalized_endpoint
+    configs[0]["data"]["TRPC_SERVICE_S3_BUCKET"] = normalized_bucket
+    return (
+        yaml.safe_dump_all(documents, sort_keys=False),
+        {
+            "status": "pass",
+            "endpoint_sha256": hashlib.sha256(normalized_endpoint.encode()).hexdigest(),
+            "bucket_sha256": hashlib.sha256(normalized_bucket.encode()).hexdigest(),
+            "credentials_recorded": False,
+        },
+    )
+
+
 def _rendered_manifest_contract(
     rendered: str, *, local_kind: bool = False
 ) -> tuple[bool, tuple[str, ...]]:
@@ -1554,11 +1788,19 @@ def _rendered_manifest_contract(
             reasons.append(f"{name} HPA replica bounds are invalid")
         if not isinstance(metrics, list) or not metrics:
             reasons.append(f"{name} HPA has no resource metrics")
-        if name == "trpc-worker" and not any(
-            isinstance(metric, Mapping) and metric.get("type") == "External"
-            for metric in metrics or ()
-        ):
-            reasons.append("trpc-worker HPA has no backlog external metric")
+        if name == "trpc-worker":
+            external_names = {
+                metric.get("external", {}).get("metric", {}).get("name")
+                for metric in metrics or ()
+                if isinstance(metric, Mapping)
+                and metric.get("type") == "External"
+                and isinstance(metric.get("external"), Mapping)
+                and isinstance(metric["external"].get("metric"), Mapping)
+            }
+            if _HPA_BACKLOG_METRIC not in external_names:
+                reasons.append(
+                    "trpc-worker HPA does not configure the exact backlog external metric"
+                )
 
     for kind, name in (
         ("PodDisruptionBudget", "trpc-worker"),
@@ -1633,7 +1875,7 @@ def _rendered_manifest_contract(
             prestop = lifecycle.get("preStop") if isinstance(lifecycle, Mapping) else None
             if not isinstance(prestop, Mapping):
                 reasons.append(f"{deployment_name}/{container_name} has no preStop hook")
-            else:
+            elif deployment_name != "trpc-backlog-exporter":
                 command = (
                     prestop.get("exec", {}).get("command", [])
                     if isinstance(prestop.get("exec"), Mapping)
@@ -1644,7 +1886,76 @@ def _rendered_manifest_contract(
                     reasons.append(
                         f"{deployment_name}/{container_name} preStop does not call its exact drain"
                     )
-            if deployment_name not in {"trpc-gateway", "trpc-admin"}:
+            if deployment_name == "trpc-backlog-exporter":
+                if container.get("command") != [
+                    "python",
+                    "scripts/session_ready_backlog_exporter.py",
+                ]:
+                    reasons.append(
+                        "trpc-backlog-exporter does not run the fixed backlog exporter command"
+                    )
+                env = container.get("env")
+                env_by_name = (
+                    {
+                        item.get("name"): item
+                        for item in env
+                        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+                    }
+                    if isinstance(env, list)
+                    else {}
+                )
+                dsn_ref = env_by_name.get("TRPC_SERVICE_METRICS_DATABASE_DSN")
+                dsn_source = dsn_ref.get("valueFrom") if isinstance(dsn_ref, Mapping) else None
+                dsn_secret = (
+                    dsn_source.get("secretKeyRef") if isinstance(dsn_source, Mapping) else None
+                )
+                if (
+                    not isinstance(dsn_secret, Mapping)
+                    or dsn_secret.get("name") != "trpc-metrics-secrets"
+                    or dsn_secret.get("key") != "TRPC_SERVICE_METRICS_DATABASE_DSN"
+                ):
+                    reasons.append(
+                        "trpc-backlog-exporter metrics DSN is not sourced from trpc-metrics-secrets"
+                    )
+                namespace_ref = env_by_name.get("TRPC_BACKLOG_NAMESPACE")
+                namespace_source = (
+                    namespace_ref.get("valueFrom") if isinstance(namespace_ref, Mapping) else None
+                )
+                field_ref = (
+                    namespace_source.get("fieldRef")
+                    if isinstance(namespace_source, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(field_ref, Mapping)
+                    or field_ref.get("fieldPath") != "metadata.namespace"
+                ):
+                    reasons.append(
+                        "trpc-backlog-exporter namespace is not sourced from metadata.namespace"
+                    )
+                ports = container.get("ports")
+                if not isinstance(ports, list) or not any(
+                    isinstance(port, Mapping)
+                    and port.get("name") == "metrics"
+                    and port.get("containerPort") == 9100
+                    for port in ports
+                ):
+                    reasons.append("trpc-backlog-exporter does not expose metrics port 9100")
+                for probe_name, expected_path in (
+                    ("readinessProbe", "/health/ready"),
+                    ("livenessProbe", "/health/live"),
+                ):
+                    probe = container.get(probe_name)
+                    http_get = probe.get("httpGet") if isinstance(probe, Mapping) else None
+                    if (
+                        not isinstance(http_get, Mapping)
+                        or http_get.get("path") != expected_path
+                        or http_get.get("port") != "metrics"
+                    ):
+                        reasons.append(
+                            f"trpc-backlog-exporter has no exact {probe_name} HTTP probe"
+                        )
+            elif deployment_name not in {"trpc-gateway", "trpc-admin"}:
                 readiness = container.get("readinessProbe")
                 liveness = container.get("livenessProbe")
                 for probe_name, probe in (("readiness", readiness), ("liveness", liveness)):
@@ -2523,9 +2834,7 @@ def _run_hpa_driver(
             "TRPC_K8S_HPA_DRIVER_JOB_IMAGE": os.getenv(
                 "TRPC_K8S_RUNTIME_HPA_JOB_IMAGE", os.getenv("TRPC_K8S_RUNTIME_IMAGE", "")
             ),
-            "TRPC_K8S_HPA_DRIVER_JOB_COMMAND": os.getenv(
-                "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND", ""
-            ),
+            "TRPC_K8S_HPA_DRIVER_JOB_COMMAND": os.getenv("TRPC_K8S_RUNTIME_HPA_JOB_COMMAND", ""),
         }
     )
     image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
@@ -2786,9 +3095,7 @@ def _driver_identity_and_scope(
                 timeout_seconds=timeout_seconds,
                 input_text=body,
             )
-            candidate_status = (
-                payload.get("status") if isinstance(payload, Mapping) else None
-            )
+            candidate_status = payload.get("status") if isinstance(payload, Mapping) else None
             if result.status == "pass" and isinstance(candidate_status, Mapping):
                 status_value = candidate_status
                 break
@@ -2831,8 +3138,10 @@ def _driver_identity_and_scope(
                 return None, None, False, "SelfSubjectRulesReview has an invalid non-resource rule"
             urls = rule.get("nonResourceURLs")
             verbs = rule.get("verbs")
-            if not isinstance(urls, list) or not urls or not all(
-                isinstance(url, str) and url for url in urls
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or not all(isinstance(url, str) and url for url in urls)
             ):
                 return None, None, False, "SelfSubjectRulesReview has an invalid non-resource rule"
             if not isinstance(verbs, list) or not verbs or any(verb != "get" for verb in verbs):
@@ -2937,9 +3246,7 @@ def _driver_identity_and_scope(
                 "role_name": _HPA_DRIVER_ROLE_NAME,
             }:
                 reasons.append("HPA driver RoleBinding is outside the declared target Role")
-        if clusterrolebinding_result.status == "pass" and isinstance(
-            clusterrolebindings, Mapping
-        ):
+        if clusterrolebinding_result.status == "pass" and isinstance(clusterrolebindings, Mapping):
             matching_clusterrolebindings = []
             for item in clusterrolebindings.get("items", []):
                 if not isinstance(item, Mapping):
@@ -2953,9 +3260,7 @@ def _driver_identity_and_scope(
                     for value in subjects
                 ):
                     matching_clusterrolebindings.append(item)
-            binding_audit["matching_clusterrolebinding_count"] = len(
-                matching_clusterrolebindings
-            )
+            binding_audit["matching_clusterrolebinding_count"] = len(matching_clusterrolebindings)
             if matching_clusterrolebindings:
                 reasons.append("HPA driver subject has a ClusterRoleBinding")
         if (
@@ -3149,9 +3454,7 @@ def _pdb_protected_system_pod(
         if not isinstance(pdb, Mapping):
             continue
         pdb_metadata_value = pdb.get("metadata")
-        pdb_metadata = (
-            pdb_metadata_value if isinstance(pdb_metadata_value, Mapping) else {}
-        )
+        pdb_metadata = pdb_metadata_value if isinstance(pdb_metadata_value, Mapping) else {}
         if pdb_metadata.get("namespace") != namespace:
             continue
         spec_value = pdb.get("spec")
@@ -3195,17 +3498,30 @@ def _node_drain_preflight(
     context: str | None,
     timeout_seconds: float,
     require_schedulable: bool = True,
+    require_cordoned: bool = False,
     require_gate_workload: bool = False,
+    node_read_attempt_limit: int = 1,
 ) -> tuple[CommandResult, dict[str, Any]]:
     """Prove the named node contains only gate or safely disruptable system pods."""
 
-    node_result, node = _json_command(
-        ["get", "node", node_name, "-o", "json"],
-        context=context,
-        timeout_seconds=timeout_seconds,
-    )
+    node_result = CommandResult(status="not_run", reason="node was not observed")
+    node: dict[str, Any] | None = None
+    node_read_attempts = 0
+    for node_read_attempts in range(1, node_read_attempt_limit + 1):
+        node_result, node = _json_command(
+            ["get", "node", node_name, "-o", "json"],
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        if node_result.status == "pass" and node is not None:
+            break
+        if node_read_attempts < node_read_attempt_limit:
+            time.sleep(0.25)
     if node_result.status != "pass" or node is None:
-        return node_result, {"node": _result_payload(node_result)}
+        return node_result, {
+            "node": _result_payload(node_result),
+            "node_read_attempts": node_read_attempts,
+        }
     metadata_value = node.get("metadata")
     metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
     labels = metadata.get("labels") if isinstance(metadata, Mapping) else {}
@@ -3311,6 +3627,8 @@ def _node_drain_preflight(
         reasons.append("controlled node is not Ready")
     if require_schedulable and not schedulable:
         reasons.append("controlled node is already cordoned")
+    if require_cordoned and schedulable:
+        reasons.append("controlled node was not observed cordoned")
     if pods_result.status != "pass":
         reasons.append("controlled node pod inventory could not be observed")
     if blockers:
@@ -3319,6 +3637,7 @@ def _node_drain_preflight(
         reasons.append("controlled node has no workload from the isolated gate namespace")
     details = {
         "node": _result_payload(node_result),
+        "node_read_attempts": node_read_attempts,
         "node_label_verified": label_ok,
         "node_ready": ready,
         "node_schedulable": schedulable,
@@ -3387,7 +3706,9 @@ def _controlled_node_drain(
             context=context,
             timeout_seconds=timeout_seconds,
             require_schedulable=False,
+            require_cordoned=True,
             require_gate_workload=True,
+            node_read_attempt_limit=3,
         )
         details["post_cordon_preflight"] = post_cordon_details
         if post_cordon_preflight.status != "pass":
@@ -3648,6 +3969,23 @@ def _missing_prerequisites(
         valid_images, image_reasons = _production_image_contract(image, upgrade_image)
         if not valid_images:
             missing.extend(image_reasons)
+    object_store_endpoint = os.getenv("TRPC_K8S_RUNTIME_S3_ENDPOINT", "").strip()
+    object_store_bucket = os.getenv("TRPC_K8S_RUNTIME_S3_BUCKET", "").strip()
+    if bool(object_store_endpoint) != bool(object_store_bucket):
+        missing.append("TRPC_K8S_RUNTIME_S3_ENDPOINT and TRPC_K8S_RUNTIME_S3_BUCKET must be paired")
+    elif object_store_endpoint:
+        try:
+            config_map = (
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n"
+                "  name: trpc-service-config\ndata: {}\n"
+            )
+            _runtime_object_store_override(
+                config_map,
+                endpoint=object_store_endpoint,
+                bucket=object_store_bucket,
+            )
+        except ValueError as error:
+            missing.append(str(error))
     return missing
 
 
@@ -3692,13 +4030,35 @@ def _first_worker_pod(
     items = payload.get("items")
     if not isinstance(items, list) or not items:
         return CommandResult(status="fail", reason="no worker pod was found"), None
-    first = items[0]
-    if not isinstance(first, dict):
-        return CommandResult(status="fail", reason="worker pod JSON was invalid"), None
-    metadata = first.get("metadata")
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
-        return CommandResult(status="fail", reason="worker pod has no name"), None
-    return result, metadata["name"]
+    ready_names: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        metadata = item.get("metadata")
+        status = item.get("status")
+        if not isinstance(metadata, Mapping) or not isinstance(status, Mapping):
+            continue
+        name = metadata.get("name")
+        conditions = status.get("conditions")
+        ready = isinstance(conditions, list) and any(
+            isinstance(condition, Mapping)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in conditions
+        )
+        if (
+            isinstance(name, str)
+            and name
+            and metadata.get("deletionTimestamp") is None
+            and status.get("phase") == "Running"
+            and ready
+        ):
+            ready_names.append(name)
+    if not ready_names:
+        return CommandResult(
+            status="fail", reason="no ready non-terminating worker pod was found"
+        ), None
+    return result, min(ready_names)
 
 
 def _deployment_ready(
@@ -3866,7 +4226,14 @@ def _deployment_image_ids(
                     (),
                 )
             image_id = container.get("imageID")
-            digest = IMAGE_ID_DIGEST_RE.search(image_id) if isinstance(image_id, str) else None
+            if not isinstance(image_id, str):
+                return (
+                    CommandResult(
+                        status="fail", reason=f"{deployment} container image ID is invalid"
+                    ),
+                    (),
+                )
+            digest = IMAGE_ID_DIGEST_RE.search(image_id)
             if digest is None or digest.end() != len(image_id):
                 return (
                     CommandResult(
@@ -4044,9 +4411,8 @@ def _failure_rollback(
     )
     details["rollback_image_poll_count"] = image_poll_count
     details["restored_image_ids"] = list(restored_image_ids)
-    details["readiness_recovered"] = (
-        image_result.status == "pass"
-        and restored_image_ids == tuple(sorted(set(known_good_image_ids)))
+    details["readiness_recovered"] = image_result.status == "pass" and restored_image_ids == tuple(
+        sorted(set(known_good_image_ids))
     )
     details["restored_image_read"] = _result_payload(image_result)
     if not details["readiness_recovered"]:
@@ -4073,7 +4439,8 @@ def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> d
         raise ValueError("schema head-check namespace is required")
     try:
         documents = [
-            document for document in yaml.safe_load_all(migration_manifest)
+            document
+            for document in yaml.safe_load_all(migration_manifest)
             if isinstance(document, Mapping)
         ]
     except yaml.YAMLError as error:
@@ -4099,6 +4466,7 @@ def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> d
     source_container = containers[0]
     if not isinstance(source_container, Mapping) or not source_container.get("image"):
         raise ValueError("migration Job container image is missing")
+    assert isinstance(source_container, Mapping)
     if not isinstance(migration_spec, Mapping) or not isinstance(template, Mapping):
         raise ValueError("migration Job pod template is missing")
     if not isinstance(pod_spec, Mapping):
@@ -4112,12 +4480,12 @@ def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> d
     head_container["args"] = ["migrate", "--check"]
     head_pod_spec["containers"] = [head_container]
     source_template_metadata = template.get("metadata")
-    template_labels = (
-        dict(source_template_metadata.get("labels"))
+    source_labels = (
+        source_template_metadata.get("labels")
         if isinstance(source_template_metadata, Mapping)
-        and isinstance(source_template_metadata.get("labels"), Mapping)
-        else {}
+        else None
     )
+    template_labels = dict(source_labels) if isinstance(source_labels, Mapping) else {}
     template_labels.update(
         {
             "app.kubernetes.io/name": SCHEMA_HEAD_CHECK_JOB_NAME,
@@ -4346,9 +4714,7 @@ def _migration_head_check(
     pod_name = selected_metadata.get("name") if isinstance(selected_metadata, Mapping) else None
     pod_uid = selected_metadata.get("uid") if isinstance(selected_metadata, Mapping) else None
     container_statuses = (
-        selected_status.get("containerStatuses")
-        if isinstance(selected_status, Mapping)
-        else None
+        selected_status.get("containerStatuses") if isinstance(selected_status, Mapping) else None
     )
     if not isinstance(pod_name, str) or not pod_name:
         return CommandResult(
@@ -4495,7 +4861,7 @@ def _run_live_once(
             timeout_seconds=timeout_seconds,
         )
         checks["node_eviction"] = {
-            "status": node_preflight.status,
+            "status": "not_run" if node_preflight.status == "pass" else node_preflight.status,
             "preflight": node_preflight_details,
         }
         if node_preflight.status != "pass":
@@ -4566,10 +4932,30 @@ def _run_live_once(
         if render.status != "pass":
             reasons.append("Kustomize render failed")
             return 1 if require_runtime else 0
-        rendered_manifest.write_text(render.stdout, encoding="utf-8")
+        rendered = render.stdout
+        object_store_endpoint = os.getenv("TRPC_K8S_RUNTIME_S3_ENDPOINT", "").strip()
+        object_store_bucket = os.getenv("TRPC_K8S_RUNTIME_S3_BUCKET", "").strip()
+        if object_store_endpoint and object_store_bucket:
+            try:
+                rendered, object_store_evidence = _runtime_object_store_override(
+                    rendered,
+                    endpoint=object_store_endpoint,
+                    bucket=object_store_bucket,
+                )
+            except ValueError as error:
+                checks["runtime_object_store_override"] = {
+                    "status": "fail",
+                    "reason": str(error),
+                }
+                reasons.append(str(error))
+                return 1 if require_runtime else 0
+            checks["runtime_object_store_override"] = object_store_evidence
+        else:
+            checks["runtime_object_store_override"] = {"status": "not_requested"}
+        rendered_manifest.write_text(rendered, encoding="utf-8")
 
         manifest_ok, manifest_reasons = _rendered_manifest_contract(
-            render.stdout, local_kind=allow_local_images
+            rendered, local_kind=allow_local_images
         )
         checks["manifest_contract"] = {
             "status": "pass" if manifest_ok else "fail",
@@ -4579,7 +4965,7 @@ def _run_live_once(
             reasons.extend(manifest_reasons)
             return 1 if require_runtime else 0
         production_manifest_ok, production_manifest_reasons = _production_render_contract(
-            render.stdout, allow_local_images=allow_local_images
+            rendered, allow_local_images=allow_local_images
         )
         checks["production_manifest_contract"] = {
             "status": "pass" if production_manifest_ok else "fail",
@@ -4675,7 +5061,7 @@ def _run_live_once(
             reasons.append("Secret manifest could not be applied")
             return 1 if require_runtime else 0
 
-        migration_manifest, runtime_manifest = _split_migration_manifests(render.stdout)
+        migration_manifest, runtime_manifest = _split_migration_manifests(rendered)
         migration_apply = _kubectl(
             [
                 "apply",

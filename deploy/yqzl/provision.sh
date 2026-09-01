@@ -11,6 +11,9 @@ readonly DATABASE_NAME=trpc_agent_service
 readonly MIGRATION_ROLE=trpc_migration
 readonly RUNTIME_ROLE=trpc_runtime
 readonly WORKER_ROLE=trpc_worker
+readonly METRICS_ROLE=trpc_metrics
+readonly METRICS_SECRET_NAME=trpc-metrics-secrets
+readonly METRICS_SECRET_KEY=TRPC_SERVICE_METRICS_DATABASE_DSN
 readonly MINIO_BUCKET=trpc-artifacts
 readonly MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
 readonly MINIO_MC_IMAGE=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
@@ -18,12 +21,14 @@ declare -a secret_temp_paths=()
 
 cleanup_sensitive_values() {
   local path
-  unset runtime_password migration_password redis_password worker_password \
+  unset runtime_password migration_password redis_password worker_password metrics_password \
+    metrics_password_uri metrics_database_dsn \
     TRPC_PROVISION_RUNTIME_PASSWORD TRPC_PROVISION_MIGRATION_PASSWORD \
-    TRPC_PROVISION_WORKER_PASSWORD
+    TRPC_PROVISION_WORKER_PASSWORD TRPC_PROVISION_METRICS_PASSWORD
   for path in "${secret_temp_paths[@]}"; do
     case "$path" in
-      "$SITE_ROOT"/secrets/.secret.*|"$SITE_ROOT"/secrets/.minio-env.*)
+      "$SITE_ROOT"/secrets/.secret.*|"$SITE_ROOT"/secrets/.minio-env.*|\
+      "$SITE_ROOT"/secrets/.metrics-dsn.*)
         rm -f -- "$path"
         ;;
     esac
@@ -110,6 +115,7 @@ make_secret() {
 make_secret "$SITE_ROOT/secrets/migration_database_password" password
 make_secret "$SITE_ROOT/secrets/runtime_database_password" password
 make_secret "$SITE_ROOT/secrets/worker_database_password" password
+make_secret "$SITE_ROOT/secrets/metrics_database_password" password
 make_secret "$SITE_ROOT/secrets/redis_password" password
 make_secret "$SITE_ROOT/secrets/session_hmac_key" session
 make_secret "$SITE_ROOT/secrets/emergency_queue_key" exact32
@@ -122,6 +128,8 @@ chown root:root "$SITE_ROOT/secrets/migration_database_password"
 chmod 0600 "$SITE_ROOT/secrets/migration_database_password"
 chown root:root "$SITE_ROOT/secrets/worker_database_password"
 chmod 0600 "$SITE_ROOT/secrets/worker_database_password"
+chown root:root "$SITE_ROOT/secrets/metrics_database_password"
+chmod 0600 "$SITE_ROOT/secrets/metrics_database_password"
 chown root:"$SERVICE_GROUP" "$SITE_ROOT/secrets/minio_root_user" \
   "$SITE_ROOT/secrets/minio_root_password"
 chmod 0640 "$SITE_ROOT/secrets/minio_root_user" "$SITE_ROOT/secrets/minio_root_password"
@@ -182,15 +190,18 @@ fi
 runtime_password=$(<"$SITE_ROOT/secrets/runtime_database_password")
 migration_password=$(<"$SITE_ROOT/secrets/migration_database_password")
 worker_password=$(<"$SITE_ROOT/secrets/worker_database_password")
+metrics_password=$(<"$SITE_ROOT/secrets/metrics_database_password")
 export TRPC_PROVISION_RUNTIME_PASSWORD="$runtime_password"
 export TRPC_PROVISION_MIGRATION_PASSWORD="$migration_password"
 export TRPC_PROVISION_WORKER_PASSWORD="$worker_password"
+export TRPC_PROVISION_METRICS_PASSWORD="$metrics_password"
 
 {
   printf '%s\n' \
     '\getenv runtime_password TRPC_PROVISION_RUNTIME_PASSWORD' \
     '\getenv migration_password TRPC_PROVISION_MIGRATION_PASSWORD' \
-    '\getenv worker_password TRPC_PROVISION_WORKER_PASSWORD'
+    '\getenv worker_password TRPC_PROVISION_WORKER_PASSWORD' \
+    '\getenv metrics_password TRPC_PROVISION_METRICS_PASSWORD'
   cat <<'SQL'
 SELECT format('CREATE ROLE trpc_migration LOGIN NOINHERIT PASSWORD %L', :'migration_password')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_migration') \gexec
@@ -203,6 +214,11 @@ SELECT format('CREATE ROLE trpc_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_worker') \gexec
 ALTER ROLE trpc_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
 SELECT format('ALTER ROLE trpc_worker PASSWORD %L', :'worker_password') \gexec
+SELECT format('CREATE ROLE trpc_metrics LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD %L', :'metrics_password')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_metrics') \gexec
+ALTER ROLE trpc_metrics LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+SELECT format('ALTER ROLE trpc_metrics PASSWORD %L', :'metrics_password') \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), 'trpc_metrics') \gexec
 SQL
 } | runuser --preserve-environment -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1
 
@@ -215,6 +231,35 @@ runuser -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1 \
   --dbname="$DATABASE_NAME" -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto' \
   -c 'CREATE EXTENSION IF NOT EXISTS vector'
 
+# The role bootstrap above runs against PostgreSQL's maintenance database.
+# Grant access to the application database as well; this is the database used
+# by the exporter DSN and is created after the global roles.
+runuser -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1 \
+  --dbname="$DATABASE_NAME" <<'SQL'
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), 'trpc_metrics') \gexec
+SQL
+
+_url_encode_uri_component() {
+  local value=$1
+  local encoded=""
+  local character
+  local index
+  local byte
+
+  LC_ALL=C
+  for ((index = 0; index < ${#value}; index++)); do
+    character=${value:index:1}
+    case "$character" in
+      [a-zA-Z0-9.~_-]) encoded+="$character" ;;
+      *)
+        printf -v byte '%%%02X' "'${character}"
+        encoded+="$byte"
+        ;;
+    esac
+  done
+  printf '%s' "$encoded"
+}
+
 {
   printf '%s\n' \
     '\getenv runtime_password TRPC_PROVISION_RUNTIME_PASSWORD' \
@@ -223,6 +268,52 @@ runuser -u postgres -- "$PG_BIN/psql" --set=ON_ERROR_STOP=1 \
   cat "$APP_ROOT/deploy/postgres/bootstrap.sql"
 } | runuser --preserve-environment -u postgres -- "$PG_BIN/psql" \
   --set=ON_ERROR_STOP=1 --dbname="$DATABASE_NAME"
+
+publish_metrics_kubernetes_secret() {
+  # Bare-metal installs leave the namespace unset.  ACK deployments opt in by
+  # supplying it, so ordinary yqzl provisioning never depends on kubectl.
+  local namespace="${TRPC_YQZL_KUBERNETES_NAMESPACE:-}"
+  local metrics_database_host="${TRPC_YQZL_METRICS_DATABASE_HOST:-127.0.0.1}"
+  local metrics_database_port="${TRPC_YQZL_METRICS_DATABASE_PORT:-5432}"
+  local metrics_password_uri
+  local temporary
+  local -a kubectl_args=()
+
+  [[ -z "$namespace" ]] && return 0
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "kubectl is required when TRPC_YQZL_KUBERNETES_NAMESPACE is set" >&2
+    return 1
+  }
+  [[ "$metrics_database_host" != *[[:space:]/@]* ]] || {
+    echo "TRPC_YQZL_METRICS_DATABASE_HOST is invalid" >&2
+    return 1
+  }
+  [[ "$metrics_database_port" =~ ^[0-9]+$ ]] || {
+    echo "TRPC_YQZL_METRICS_DATABASE_PORT is invalid" >&2
+    return 1
+  }
+
+  metrics_password_uri=$(_url_encode_uri_component "$metrics_password")
+  metrics_database_dsn="postgresql://${METRICS_ROLE}:${metrics_password_uri}@${metrics_database_host}:${metrics_database_port}/${DATABASE_NAME}"
+  temporary=$(mktemp "$SITE_ROOT/secrets/.metrics-dsn.XXXXXX")
+  secret_temp_paths+=("$temporary")
+  chmod 0600 "$temporary"
+  printf '%s' "$metrics_database_dsn" >"$temporary"
+  if [[ -n "${TRPC_YQZL_KUBECONFIG:-}" ]]; then
+    kubectl_args+=(--kubeconfig "$TRPC_YQZL_KUBECONFIG")
+  fi
+  if [[ -n "${TRPC_YQZL_KUBE_CONTEXT:-}" ]]; then
+    kubectl_args+=(--context "$TRPC_YQZL_KUBE_CONTEXT")
+  fi
+  kubectl "${kubectl_args[@]}" create secret generic "$METRICS_SECRET_NAME" \
+    --namespace "$namespace" \
+    --from-file="$METRICS_SECRET_KEY=$temporary" \
+    --dry-run=client -o yaml |
+    kubectl "${kubectl_args[@]}" apply --server-side \
+      --field-manager=trpc-yqzl-provision --namespace "$namespace" -f - >/dev/null
+}
+
+publish_metrics_kubernetes_secret
 
 redis_password=$(<"$SITE_ROOT/secrets/redis_password")
 printf 'user default on >%s ~* &* +@all\n' "$redis_password" >"$SITE_ROOT/secrets/redis.acl"
@@ -235,6 +326,11 @@ install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/admin.env" "$
 install -m 0640 -o root -g "$SERVICE_GROUP" "$APP_ROOT/deploy/yqzl/redis.conf" "$SITE_ROOT/config/redis.conf"
 install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent-redis.service" /etc/systemd/system/trpc-agent-redis.service
 install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent@.service" /etc/systemd/system/trpc-agent@.service
+install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent-wecom-standby.service" \
+  /etc/systemd/system/trpc-agent-wecom-standby.service
+install -d -m 0755 /etc/systemd/system/trpc-agent@wecom-connector.service.d
+install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent-wecom-primary.conf" \
+  /etc/systemd/system/trpc-agent@wecom-connector.service.d/10-app-pythonpath.conf
 install -m 0644 "$APP_ROOT/deploy/yqzl/trpc-agent-minio.service" /etc/systemd/system/trpc-agent-minio.service
 install -d -m 0755 /etc/systemd/system/trpc-agent@worker.service.d
 printf '%s\n' '[Service]' 'MemoryHigh=1536M' 'MemoryMax=2G' \

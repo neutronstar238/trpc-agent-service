@@ -278,6 +278,7 @@ async def test_top_level_role_dispatch_and_cleanup(monkeypatch) -> None:
         Role.POST_TURN_PROJECTOR: "_serve_projector",
         Role.WECOM_CONNECTOR: "_serve_wecom",
         Role.SESSION_RECOVERY: "_serve_session_recovery",
+        Role.ARTIFACT_GC: "_serve_artifact_gc",
     }
     for name in mapping.values():
         monkeypatch.setattr(cli, name, handler(name))
@@ -320,6 +321,9 @@ class RunObject:
 
     async def accept(self, *args):
         return None
+
+    def ready_for_delivery(self, _binding):
+        return True
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,18 @@ def test_postgres_init_separates_runtime_and_global_worker_roles() -> None:
     assert "/run/secrets/worker_database_password" in script
 
 
+def test_postgres_init_provisions_a_non_bypass_metrics_role_from_secret() -> None:
+    script = INIT_SCRIPT.read_text(encoding="utf-8")
+
+    assert "/run/secrets/metrics_database_password" in script
+    assert 'export TRPC_INIT_METRICS_PASSWORD="$metrics_password"' in script
+    assert r"\getenv metrics_password TRPC_INIT_METRICS_PASSWORD" in script
+    assert "CREATE ROLE trpc_metrics LOGIN NOSUPERUSER" in script
+    assert "NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS" in script
+    assert "GRANT CONNECT ON DATABASE %I TO trpc_metrics" in script
+    assert "ALTER ROLE trpc_metrics PASSWORD %L" in script
+
+
 def test_yqzl_provision_keeps_database_passwords_out_of_psql_argv() -> None:
     script = PROVISION_SCRIPT.read_text(encoding="utf-8")
 
@@ -57,6 +69,24 @@ def test_yqzl_provision_creates_a_dedicated_worker_login() -> None:
     assert "NOINHERIT BYPASSRLS" in script
 
 
+def test_yqzl_provision_creates_a_dedicated_metrics_login_and_secret() -> None:
+    script = PROVISION_SCRIPT.read_text(encoding="utf-8")
+
+    assert "readonly METRICS_ROLE=trpc_metrics" in script
+    assert 'make_secret "$SITE_ROOT/secrets/metrics_database_password" password' in script
+    assert "TRPC_PROVISION_METRICS_PASSWORD" in script
+    assert "CREATE ROLE trpc_metrics LOGIN NOSUPERUSER" in script
+    assert "NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS" in script
+    assert "readonly METRICS_SECRET_NAME=trpc-metrics-secrets" in script
+    assert "readonly METRICS_SECRET_KEY=TRPC_SERVICE_METRICS_DATABASE_DSN" in script
+    assert "kubectl" in script
+    assert '--from-file="$METRICS_SECRET_KEY=$temporary"' in script
+    assert '_url_encode_uri_component "$metrics_password"' in script
+    assert "postgresql://${METRICS_ROLE}:${metrics_password_uri}" in script
+    assert "${DATABASE_NAME}" in script
+    assert "GRANT CONNECT ON DATABASE %I TO %I', current_database(), 'trpc_metrics" in script
+
+
 def test_yqzl_provision_protects_and_cleans_secret_temp_files() -> None:
     script = PROVISION_SCRIPT.read_text(encoding="utf-8")
 
@@ -66,4 +96,5 @@ def test_yqzl_provision_protects_and_cleans_secret_temp_files() -> None:
     assert 'rm -f -- "$path"' in script
     assert '"$SITE_ROOT"/secrets/.secret.*' in script
     assert '"$SITE_ROOT"/secrets/.minio-env.*' in script
+    assert '"$SITE_ROOT"/secrets/.metrics-dsn.*' in script
     assert "unset runtime_password migration_password redis_password" in script

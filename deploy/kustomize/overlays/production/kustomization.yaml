@@ -6,6 +6,7 @@ namespace: trpc-service
 resources:
   - namespace.yaml
   - ../../base
+  - ../../im-external-egress
 
 images:
   - name: trpc-agent-service
@@ -17,3 +18,4 @@ images:
 patches:
   - path: replicas-patch.yaml
   - path: production-config-patch.yaml
+  - path: wecom-ha-patch.yaml

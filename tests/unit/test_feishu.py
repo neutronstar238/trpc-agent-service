@@ -806,9 +806,9 @@ async def test_send_token_rate_limit_code_preserves_json_retry_after() -> None:
         json={"code": 99991400, "retry_after": 7},
     )
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response))
-    receipt = await FeishuAdapter(
-        LocalSecretProvider(allow_literal=True), http_client=client
-    ).send(outbound(), feishu_binding())
+    receipt = await FeishuAdapter(LocalSecretProvider(allow_literal=True), http_client=client).send(
+        outbound(), feishu_binding()
+    )
 
     assert receipt.status == DeliveryStatus.FAILED
     assert receipt.provider_code == "token_99991400"

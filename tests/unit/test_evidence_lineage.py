@@ -255,9 +255,7 @@ def test_release_binding_is_required_and_compared_without_exposing_nonce(
         source_roots=(),
     )
 
-    assert validate_release_binding(evidence) == [
-        "production evidence release_binding is missing"
-    ]
+    assert validate_release_binding(evidence) == ["production evidence release_binding is missing"]
     with pytest.raises(ValueError, match="TRPC_RELEASE_ID and TRPC_RELEASE_NONCE"):
         current_release_binding(required=True)
 

@@ -41,6 +41,12 @@ projector, connector, and recovery pods mount this Secret. The dedicated
 grants on the cross-tenant SECURITY DEFINER functions; the normal tenant
 runtime role must not receive that Secret.
 
+The backlog exporter uses a third Secret named `trpc-metrics-secrets` with
+only `TRPC_SERVICE_METRICS_DATABASE_DSN`.  It must connect as the dedicated
+`trpc_metrics` login created before migration `0016`; that login is
+`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS` and can execute
+only `public.count_session_ready_backlog()`.  Do not reuse the worker DSN.
+
 The ConfigMap also sets an explicit tenant-secret policy: file references are
 confined to `/run/secrets`, the environment allowlist is empty by default, and
 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` must be replaced with the reviewed model
@@ -61,12 +67,20 @@ The worker capacity envelope is explicit: the production overlay sets
 `TRPC_SERVICE_WORKER_CONCURRENCY=10` and the HPA allows 20 worker replicas,
 which is a maximum 200 concurrent-turn envelope. A Prometheus Adapter (or
 KEDA implementation) must expose `trpc_session_ready_backlog`; CPU-only HPA
-evidence is insufficient and keeps the runtime gate `not_run`.
+evidence is insufficient and keeps the runtime gate `not_run`.  The supplied
+exporter derives this value from runnable PostgreSQL `session_mailboxes`;
+Redis stream length is not authoritative because its wake-up entries are
+reconstructable.
 
-The base NetworkPolicy intentionally does not grant arbitrary `0.0.0.0/0:443`
-egress. Add a reviewed production overlay policy for the exact private
-endpoints/provider CIDRs required by the deployment; otherwise outbound model
-and IM calls remain fail-closed.
+The base NetworkPolicy intentionally does not grant arbitrary external HTTPS
+egress. Both production and performance overlays include the shared
+`im-external-egress` policy, which selects only `trpc-channel-dispatcher` and
+`trpc-wecom-connector` and permits only IPv4 TCP/443. Standard Kubernetes
+NetworkPolicy cannot express FQDN destinations, so the portable fallback uses
+`0.0.0.0/0:443`; it does not grant this access to Gateway, Worker, or other
+runtime roles. Where the cluster CNI supports FQDN-aware policies, replace this
+fallback with reviewed Feishu, WeCom, and probe hostnames and remove the
+IPv4-wide destination.
 
 Render and inspect the manifests before applying:
 

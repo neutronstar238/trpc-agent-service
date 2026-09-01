@@ -23,6 +23,11 @@ data:
   TRPC_SERVICE_TENANT_SECRET_ENV_NAMES: "[]"
   TRPC_SERVICE_MODEL_ENDPOINT_HOSTS: '["api.openai.com"]'
   TRPC_SERVICE_FEISHU_ALLOW_STALE_BINDING_CACHE: "false"
+  # The official origin is the only value allowed unless an explicitly
+  # enabled online-acceptance overlay routes Channel Dispatcher traffic
+  # through the independent Feishu OpenAPI witness.
+  TRPC_SERVICE_FEISHU_SEND_API_ROOT: https://open.feishu.cn
+  TRPC_SERVICE_ONLINE_TESTS_ENABLED: "false"
   TRPC_SERVICE_S3_ENDPOINT: https://s3.example.internal
   TRPC_SERVICE_S3_BUCKET: trpc-artifacts
   TRPC_SERVICE_S3_SECRET_KEY_REF: env://TRPC_SERVICE_S3_SECRET_KEY
@@ -32,6 +37,9 @@ data:
   TRPC_SERVICE_CAPTURE_CONTENT: "false"
   TRPC_SERVICE_RECOVERY_BATCH_SIZE: "25"
   TRPC_SERVICE_RECOVERY_POLL_SECONDS: "5"
+  TRPC_SERVICE_ARTIFACT_GC_BATCH_SIZE: "100"
+  TRPC_SERVICE_ARTIFACT_GC_POLL_SECONDS: "60"
+  TRPC_SERVICE_ARTIFACT_STAGING_TTL_SECONDS: "86400"
   # The base production-shaped manifest must be capable of the 200-turn gate:
   # HPA maxReplicas (20) x this concurrency (10) = 200.
   TRPC_SERVICE_WORKER_CONCURRENCY: "10"

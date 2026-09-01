@@ -91,6 +91,7 @@ def report_image_digest(report_name: str, report: Mapping[str, Any]) -> str | No
         "fault-injection.json",
         "migration-live.json",
         "kubernetes-runtime.json",
+        "disaster-recovery.json",
     }:
         value = _mapping(candidate.get("lineage")).get("image_digest")
     elif report_name == "im-online.json":
@@ -345,10 +346,10 @@ def validate_manifest(
                 "SDK postgres-worker attachment cannot substitute service runtime evidence"
             )
         try:
-            filename = attachment.get("filename")
-            if not isinstance(filename, str):
+            sdk_filename = attachment.get("filename")
+            if not isinstance(sdk_filename, str):
                 raise ValueError("SDK postgres-worker attachment filename is invalid")
-            sdk_report = _read_report(directory / filename)
+            sdk_report = _read_report(directory / sdk_filename)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             reasons.append("SDK postgres-worker attachment cannot be validated")
         else:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from scripts import migration_acceptance_bootstrap as bootstrap
+from trpc_service.storage.migration import _TARGET_EMPTY_TABLES
 
 
 def _env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,3 +48,54 @@ async def test_bootstrap_is_opt_in_before_opening_connections(
     monkeypatch.delenv("TRPC_MIGRATION_BOOTSTRAP", raising=False)
     result = await bootstrap.bootstrap()
     assert result == {"status": "not_run", "reason": "both live migration opt-ins are required"}
+
+
+@pytest.mark.asyncio
+async def test_database_scope_empty_reuses_one_connection_for_target_preflight() -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.fetchval_calls = 0
+
+        def transaction(self) -> Connection:
+            return self
+
+        async def __aenter__(self) -> Connection:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def execute(self, query: str, *args: object) -> None:
+            del query, args
+
+        async def fetchval(self, query: str, *args: object) -> bool:
+            del query, args
+            self.fetchval_calls += 1
+            return False
+
+        async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
+            del query, args
+            return [{"table_name": table, "row_count": 0} for table in _TARGET_EMPTY_TABLES]
+
+    class Pool:
+        def __init__(self, connection: Connection) -> None:
+            self.connection = connection
+            self.acquire_calls = 0
+
+        def acquire(self) -> Connection:
+            self.acquire_calls += 1
+            return self.connection
+
+    connection = Connection()
+    pool = Pool(connection)
+    scope = bootstrap.BootstrapScope(
+        tenant_id="migration-acceptance-empty",
+        migration_id="migration-acceptance-empty-run",
+        app_id="migration-acceptance-empty-app",
+        binding_id="migration-acceptance-empty-binding",
+    )
+
+    await bootstrap._assert_database_scope_empty(pool, scope)  # type: ignore[arg-type]
+
+    assert pool.acquire_calls == 1
+    assert connection.fetchval_calls == 2

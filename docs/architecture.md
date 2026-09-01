@@ -31,7 +31,9 @@ flowchart LR
     accTitle: Session mailbox architecture
     accDescr: PostgreSQL owns inbound state, mailbox state, leases, events, and outbox records. Redis only wakes stateless workers, which claim a session before acknowledging the notice.
 
-    im["飞书 / 企业微信"] -->|HTTPS callback| gateway["Gateway / connector"]
+    feishu["飞书"] -->|HTTPS callback| gateway["Gateway"]
+    wecom["企业微信"] <-->|WSS authenticated frames| connector["WeCom connector"]
+    connector -->|verified inbound| gateway
     gateway -->|短事务| pg_inbox[("PostgreSQL")]
 
     subgraph pg_authority["PostgreSQL authority"]
@@ -61,7 +63,8 @@ flowchart LR
 
     pg_turns --> outbound_outbox["Outbound outbox"]
     outbound_outbox --> dispatcher["Outbound dispatcher"]
-    dispatcher -->|provider API| im
+    dispatcher -->|Feishu OpenAPI| feishu
+    dispatcher -->|aibot_send_msg over WSS| connector
 ```
 
 `Gateway / connector` 只完成通道验签、解密、binding 路由、配置 revision 固定和短事务。

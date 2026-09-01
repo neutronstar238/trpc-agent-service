@@ -11,6 +11,8 @@
 - PostgreSQL Inbox/Outbox、幂等键、Session lease 与 fencing token；Redis Streams 只作可重建传输。
 - 同一 Session 串行提交、不同 Session 并行；一次 turn 的 event/state/outbound 原子可见。
 - 企业微信 AI Bot WebSocket 长连接，以及飞书加密 HTTP 事件回调、URL 校验和 OpenAPI 异步回复。
+- 企业微信 fenced connection epoch/租约证据，以及独立签名 IM 探针；真实在线门禁按通道核验回调或
+  WSS 入站、发送 ACK、幂等、媒体、故障接管、限流、凭证轮换和 ambiguous 共 8 个 case。
 - OIDC/JWKS、RBAC、ETag 乐观并发、Admin 幂等、审计、DLQ 查询和人工 outbound 重放。
 - 工具白名单、预算预留、SDK Tool Safety、一次性确认令牌和非幂等工具歧义状态。
 - PostgreSQL/RLS、Redis 单调投影、S3/MinIO staged artifact、pgvector 与外部 Memory 扩展口。
@@ -68,6 +70,14 @@ kubectl kustomize deploy/kustomize/overlays/production >/dev/null
 
 默认测试完全离线。真实 IM、性能、故障注入和部署门禁需要显式凭证或本地基础设施；没有完成
 这些门禁时只能称为“开发候选”，不能称为生产候选。
+
+项目“功能完成”以本地静态/单元/契约门禁、零成本功能灾备、不可变镜像和当前候选在真实
+Feishu/WeCom 上的基础双向收发证据均闭环为准；每个通道必须证明唯一入站、唯一出站和供应商回执。
+这份基础证据不能冒充 `online_im` 生产 8-case，也不能将其升级为生产 `pass`。“生产发布完成”还要求
+完整 `online_im` 8-case、显式启用的破坏性生产灾备演练及最终 release manifest；任一项缺失必须保留
+`production_gate=not_run`。选择跳过破坏性演练时不能用功能灾备报告替代。在线 IM 的独立探针、
+control broker、driver、callback/OpenAPI witness 安装步骤见
+[探针部署说明](deploy/im_probe/README.md)。
 
 ## 文档
 

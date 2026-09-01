@@ -330,6 +330,14 @@ class KnowledgeStore(Protocol):
         metadata: dict[str, Any],
     ) -> None: ...
 
+    async def search(
+        self,
+        tenant_id: str,
+        embedding: list[float],
+        *,
+        limit: int = 5,
+    ) -> tuple[dict[str, object], ...]: ...
+
 
 class AuditStore(Protocol):
     """Structured, redacted audit sink.  Content is intentionally absent."""

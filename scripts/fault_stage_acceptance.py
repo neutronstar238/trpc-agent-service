@@ -2274,59 +2274,38 @@ class PostgresRuntimeStageBackend:
         ):
             raise StageAcceptanceError("refusing cleanup for an unowned fault-stage case")
 
-        redis_cleanup_error: Exception | None = None
         try:
             await self._cleanup_redis_delivery(state)
         except Exception as error:
-            # Continue with tenant-scoped SQL cleanup, but surface the Redis
-            # failure so the report cannot claim that all resources were
-            # released.  No broad stream deletion is attempted.
-            redis_cleanup_error = error
-        tables = (
-            "delivery_attempts",
-            "outbound_messages",
-            "turn_intents",
-            "tool_executions",
-            "tenant_budget_usage",
-            "session_mailbox_items",
-            "session_mailboxes",
-            "session_events",
-            "session_summaries",
-            "session_turns",
-            "sessions",
-            "inbound_messages",
-            "channel_identities",
-            "channel_bindings",
-            "knowledge_embeddings",
-            "knowledge_items",
-            "memories",
-            "artifacts",
-            "dead_letters",
-            "confirmation_challenges",
-            "audit_logs",
-            "outbox_events",
-            "fault_stage_controls",
-            "migration_checkpoints",
-            "tenant_policies",
-            "config_revisions",
-            "agent_apps",
-            "storage_profiles",
-            "admin_idempotency",
-            "tenants",
-        )
+            # SQL cleanup must not run until the exact Redis delivery has been
+            # removed.  Retain the in-memory authority so the bounded caller
+            # can retry this same case without broadening either scope.
+            raise StageAcceptanceError("exact Redis fault delivery cleanup failed") from error
         async with self._tenant_transaction(case.tenant_id) as connection:
-            for table in tables:
-                await connection.execute(
-                    f"DELETE FROM {table} WHERE tenant_id=$1",  # noqa: S608 - fixed tuple
-                    case.tenant_id,
+            raw_counts = await connection.fetchval(
+                "SELECT public.cleanup_fault_stage_fixture($1, $2, $3)",
+                case.tenant_id,
+                case.run_id,
+                case.case_id,
+            )
+            if isinstance(raw_counts, str):
+                try:
+                    deleted_counts = json.loads(raw_counts)
+                except json.JSONDecodeError as error:
+                    raise StageAcceptanceError(
+                        "fault-stage fixture cleanup result is invalid"
+                    ) from error
+            else:
+                deleted_counts = raw_counts
+            if not isinstance(deleted_counts, Mapping):
+                raise StageAcceptanceError("fault-stage fixture cleanup result is invalid")
+            tenant_count = deleted_counts.get("tenants")
+            if isinstance(tenant_count, bool) or tenant_count != 1:
+                raise StageAcceptanceError(
+                    "fault-stage fixture cleanup did not delete exactly one tenant"
                 )
-        if redis_cleanup_error is not None:
-            raise StageAcceptanceError(
-                "exact Redis fault delivery cleanup failed"
-            ) from redis_cleanup_error
-        # Keep the in-memory state until both the tenant-scoped SQL deletes
-        # and the exact Redis cleanup have completed.  A Redis failure after
-        # SQL succeeds must remain retryable; the next SQL pass is idempotent.
+        # Keep the in-memory authority until both exact Redis cleanup and the
+        # database-owned atomic cleanup have completed and been acknowledged.
         self._cases.pop(case.case_id, None)
 
     async def _cleanup_redis_delivery(self, state: _RuntimeCaseState) -> None:

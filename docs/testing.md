@@ -11,12 +11,26 @@
   `TRPC_IM_ONLINE_IMAGE_DIGEST`；同时必须配置只含精确 HTTPS 基址的
   `TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST`（可用逗号或换行分隔多个固定地址）和固定的
   `TRPC_IM_ONLINE_PROBE_IDENTITY_SHA256`（或仅在 Secret 管理器内使用
-  `TRPC_IM_ONLINE_PROBE_IDENTITY`）。探针必须回传匹配 digest、运行 nonce 和身份指纹，并逐通道证明
-  往返、幂等、媒体、重连。探测器拒绝 userinfo/query/fragment，禁止 HTTP 重定向，也不会跟随重定向后
-  的最终 URL；探针响应严格使用有限 JSON，并且必须通过源码绑定的
+  `TRPC_IM_ONLINE_PROBE_IDENTITY`），以及飞书/企微各自不可变 control profile 的 SHA-256。探针必须
+  回传匹配 digest、运行 nonce、身份和 profile，并逐通道证明往返、幂等、媒体、重连、真实限流退避、
+  凭证轮换、至少 60 秒的单实例故障接管和供应商 ACK 后丢响应的 ambiguous 共 8 个 case。探测器拒绝
+  userinfo/query/fragment，禁止 HTTP 重定向，也不会跟随重定向后的最终 URL；探针响应严格使用有限
+  JSON，并且必须通过源码绑定的
   `deploy/im-probe-trust.json` Ed25519 公钥验证完整响应签名。缺少信任文件或签名时保持 `not_run`。
   `retry_after_seconds` 必须为有限的 0.001–3600 秒，
   `outage_seconds` 必须为有限的 0.001–604800 秒。
+- 在线 IM 的 `reconnect`/`prolonged_outage` 只按“单个 connector 进程不可用、冗余 owner 接管并继续
+  交付”验收：必须记录旧 owner 释放、新 owner 接管、重新订阅和接管后唯一 marker 的 provider 事件
+  与发送 ACK；`prolonged_outage` 的 connector 故障窗口至少 60 秒。两个 WSS 同时断开属于独立的
+  provider delivery gap，不能以恢复后新消息替代断线期间旧消息，也不能据此生成恢复 `pass`。
+- 在线 IM 的控制动作只能由 checkout 外的 host-only control broker 按固定 profile 调度。driver 不得
+  获得 Kubernetes、数据库、OIDC 或供应商管理凭据，也不得自行制造 observation。飞书入站必须与独立
+  callback observer 的哈希 receipt 核对，出站、限流与 ambiguous 必须与 OpenAPI witness 的真实 ACK
+  receipt 核对；企微不得建立第二条 WSS，只能把 broker 动作结果与当前 Connector 持久化的 connection
+  epoch、lease lifecycle 和 provider event 哈希快照核对。任一旁路证据缺失时该 case 必须非 `pass`。
+- “功能完成”的真实 IM 基础证据只要求当前候选在 Feishu/WeCom 各闭环唯一入站、唯一出站和供应商
+  回执。它不能冒充上述 `online_im` 生产 8-case；生产发布和 release manifest 仍要求两个通道的完整
+  8-case 与破坏性生产灾备全部通过，缺失任一项必须保持 `not_run`。
 - 性能：100 callback/s、200 turn，并生成机器可读 JSON。
 
 本地门禁：
@@ -36,7 +50,7 @@ python scripts/contract_gate.py fault
 python scripts/contract_gate.py migration
 python scripts/deployment_gate.py
 python scripts/kubernetes_runtime_gate.py
-python scripts/release_gate.py --output runs/multitenant/release-gate-final.json
+python scripts/release_gate.py --output runs/multitenant/release-gate-current-final.json
 ```
 
 `deployment_gate.py` 默认只做静态部署检查：静态清单通过时返回 0，但报告明确为
@@ -77,8 +91,8 @@ Secret 注入，命令和报告不能打印其值。
 
 `scripts/release_gate.py` 汇总所有 JSON 证据。默认允许开发门禁通过但保留生产 `not_run`；CI/CD
 发布阶段必须使用 `--require-production`，任何真实 IM、生产负载、故障注入、迁移或 Kubernetes 运行
-报告缺失都会返回非零状态。发布时应显式把结果写到
-`runs/multitenant/release-gate-final.json`；只有这次聚合生成、通过 current-candidate lineage、
+报告缺失都会返回非零状态。`run-current-final-acceptance.ps1` 的 Stage 8 实际把聚合结果写到
+`runs/multitenant/release-gate-current-final.json`；只有这次聚合生成、通过 current-candidate lineage、
 源码指纹和 24 小时 TTL 校验的最新 final 文件才是当前候选结论。历史组件 JSON 的顶层 `pass`、
 旧的 `release-gate.json` 或 `release-gate-current.json` 都只是输入/历史记录，不能单独升级候选状态。
 过期或来自其他 checkout 的生产 evidence 必须降级为 `not_run`。

@@ -177,9 +177,7 @@ def test_publish_rejects_checkout_changed_during_push(
                 "",
             )
         if command[1] == "push":
-            return subprocess.CompletedProcess(
-                command, 0, f"digest: {next(digest_values)}\n", ""
-            )
+            return subprocess.CompletedProcess(command, 0, f"digest: {next(digest_values)}\n", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(registry_image.shutil, "which", lambda _: "docker")
