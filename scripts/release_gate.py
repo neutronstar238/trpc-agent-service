@@ -5827,6 +5827,49 @@ def _validate_functional_disaster_recovery_semantics(
         return "not_run", "functional disaster recovery candidate lock content changed"
     if lock.get("image_digest") != image_digest:
         return "not_run", "functional disaster recovery candidate lock image digest changed"
+    runtime_attestation = candidate.get("runtime_attestation")
+    if not isinstance(runtime_attestation, Mapping):
+        return "not_run", "functional disaster recovery runtime attestation is missing"
+    cluster_uid = runtime_attestation.get("cluster_uid_sha256")
+    namespace_uid = runtime_attestation.get("namespace_uid_sha256")
+    jobs = runtime_attestation.get("jobs")
+    if (
+        not isinstance(cluster_uid, str)
+        or MIGRATION_SHA256_RE.fullmatch(cluster_uid) is None
+        or not isinstance(namespace_uid, str)
+        or MIGRATION_SHA256_RE.fullmatch(namespace_uid) is None
+        or not _is_json_sequence(jobs)
+    ):
+        return "not_run", "functional disaster recovery runtime attestation is invalid"
+    worker_identities = list(cast(Sequence[Any], jobs))
+    if len(worker_identities) != len(required):
+        return "not_run", "functional disaster recovery runtime Job evidence is incomplete"
+    for expected_component, worker in zip(required, worker_identities, strict=True):
+        if (
+            not isinstance(worker, Mapping)
+            or worker.get("component") != expected_component
+            or worker.get("image_digest") != image_digest
+            or not isinstance(worker.get("job_uid_sha256"), str)
+            or MIGRATION_SHA256_RE.fullmatch(str(worker.get("job_uid_sha256"))) is None
+            or not isinstance(worker.get("pod_uid_sha256"), str)
+            or MIGRATION_SHA256_RE.fullmatch(str(worker.get("pod_uid_sha256"))) is None
+        ):
+            return "not_run", "functional disaster recovery runtime Job evidence is invalid"
+    evidence = report.get("evidence")
+    parameters = {
+        "candidate_lock_binding_sha256": lock.get("binding_sha256"),
+        "components": list(required),
+        "image_digest": image_digest,
+    }
+    if not isinstance(evidence, Mapping) or not _runtime_fingerprint_matches(
+        evidence.get("runtime_fingerprint"),
+        mode="same_cluster_zero_cost_functional",
+        worker_identities=worker_identities,
+        stream=cluster_uid,
+        group=namespace_uid,
+        parameters=parameters,
+    ):
+        return "not_run", "functional disaster recovery runtime fingerprint is invalid"
     return None, None
 
 

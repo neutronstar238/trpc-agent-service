@@ -176,6 +176,26 @@ def test_functional_gate_passes_real_jobs_but_never_production(tmp_path: Path, m
 
     assert report["gate"] == "pass"
     assert report["production_gate"] == "not_run"
+    assert report["evidence"]["runtime_fingerprint"]["status"] == "available"
+    assert report["evidence"]["runtime_fingerprint"]["worker_count"] == len(gate.COMPONENTS)
+    assert report["candidate"]["runtime_attestation"] == {
+        "cluster_uid_sha256": "2" * 64,
+        "namespace_uid_sha256": "3" * 64,
+        "jobs": [
+            {
+                "component": component,
+                "image_digest": binding["image_digest"],
+                "job_uid_sha256": {
+                    "postgres_pitr": "7",
+                    "artifact_restore": "8",
+                    "key_restore": "9",
+                }[component]
+                * 64,
+                "pod_uid_sha256": "4" * 64,
+            }
+            for component in gate.COMPONENTS
+        ],
+    }
     assert "not WAL point-in-time recovery" in " ".join(report["production_rejection_reasons"])
 
 

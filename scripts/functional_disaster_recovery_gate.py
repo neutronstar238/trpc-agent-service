@@ -29,7 +29,7 @@ from scripts.disaster_recovery_gate import (
     _sha256,
     _validate_execution,
 )
-from scripts.evidence_lineage import build_evidence, new_run_id
+from scripts.evidence_lineage import build_evidence, new_run_id, runtime_fingerprint
 from scripts.report_io import atomic_write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -362,11 +362,45 @@ def build_report(
     if reasons and not failed_components:
         failed_components = list(COMPONENTS)
     image_digest = lock.get("image_digest")
+    runtime_attestation: dict[str, Any] | None = None
+    runtime = None
+    if not reasons:
+        executions = {
+            component: _mapping(_mapping(observations.get(component)).get("execution"))
+            for component in COMPONENTS
+        }
+        first_execution = executions[COMPONENTS[0]]
+        worker_identities = [
+            {
+                "component": component,
+                "image_digest": image_digest,
+                "job_uid_sha256": executions[component].get("job_uid_sha256"),
+                "pod_uid_sha256": executions[component].get("pod_uid_sha256"),
+            }
+            for component in COMPONENTS
+        ]
+        parameters = {
+            "candidate_lock_binding_sha256": lock.get("binding_sha256"),
+            "components": list(COMPONENTS),
+            "image_digest": image_digest,
+        }
+        runtime_attestation = {
+            "cluster_uid_sha256": first_execution.get("cluster_uid_sha256"),
+            "namespace_uid_sha256": first_execution.get("namespace_uid_sha256"),
+            "jobs": worker_identities,
+        }
+        runtime = runtime_fingerprint(
+            mode=MODE,
+            worker_identities=worker_identities,
+            stream=first_execution.get("cluster_uid_sha256"),
+            group=first_execution.get("namespace_uid_sha256"),
+            parameters=parameters,
+        )
     evidence = build_evidence(
         root=ROOT,
         producer=PRODUCER,
         run_id=new_run_id(PRODUCER),
-        runtime={"image_digest": image_digest, "mode": MODE},
+        runtime=runtime,
     )
     lock_hash = None
     if lock_path.is_file() and not lock_path.is_symlink():
@@ -387,6 +421,7 @@ def build_report(
             "lineage": {"image_digest": image_digest},
             "candidate_lock_sha256": lock_hash,
             "components": components,
+            "runtime_attestation": runtime_attestation,
         },
         "case_deltas": {"failed_components": failed_components},
         "evidence": evidence,

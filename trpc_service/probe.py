@@ -339,8 +339,9 @@ async def check(role: str) -> bool:
             )
             ping_result = redis.ping()
             if isinstance(ping_result, Awaitable):
-                ping_result = await ping_result
-            if not ping_result:
+                if not await ping_result:
+                    return False
+            elif not ping_result:
                 return False
         return True
     except Exception:

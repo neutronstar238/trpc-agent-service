@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from scripts.mock_production_gate import MAX_CONCURRENCY, _performance
 from scripts.performance_gate import _run, _validate_workload
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_mock_gate_readme_entrypoint_imports_from_repository_root() -> None:
+    completed = subprocess.run(  # noqa: S603
+        [sys.executable, str(ROOT / "scripts" / "mock_production_gate.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_offline_performance_workload_is_hard_bounded() -> None:

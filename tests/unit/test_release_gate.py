@@ -16,7 +16,7 @@ import scripts.kubernetes_runtime_gate as kubernetes_runtime_gate
 import scripts.real_runtime_gate as real_runtime_gate
 import scripts.release_gate as release_gate
 import trpc_service.storage.migration as migration_storage
-from scripts.evidence_lineage import canonical_sha256
+from scripts.evidence_lineage import canonical_sha256, runtime_fingerprint
 from scripts.release_gate import (
     FAULT_REQUIRED_MARKERS,
     FINGERPRINT_MAX_BYTES,
@@ -2078,6 +2078,31 @@ def _valid_functional_disaster_recovery_report(directory) -> dict[str, object]:
         }
         for name in ("postgres_pitr", "artifact_restore", "key_restore")
     }
+    required = ("postgres_pitr", "artifact_restore", "key_restore")
+    runtime_jobs = [
+        {
+            "component": name,
+            "image_digest": image_digest,
+            "job_uid_sha256": str(index) * 64,
+            "pod_uid_sha256": "4" * 64,
+        }
+        for index, name in enumerate(required, start=7)
+    ]
+    runtime_parameters = {
+        "candidate_lock_binding_sha256": json.loads(lock_path.read_text(encoding="utf-8"))[
+            "binding_sha256"
+        ],
+        "components": list(required),
+        "image_digest": image_digest,
+    }
+    evidence = _current_evidence("scripts.functional_disaster_recovery_gate")
+    evidence["runtime_fingerprint"] = runtime_fingerprint(
+        mode="same_cluster_zero_cost_functional",
+        worker_identities=runtime_jobs,
+        stream="3" * 64,
+        group="2" * 64,
+        parameters=runtime_parameters,
+    )
     return {
         "schema_version": 1,
         "baseline": {
@@ -2095,6 +2120,11 @@ def _valid_functional_disaster_recovery_report(directory) -> dict[str, object]:
             "lineage": {"image_digest": image_digest},
             "candidate_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
             "components": components,
+            "runtime_attestation": {
+                "cluster_uid_sha256": "3" * 64,
+                "namespace_uid_sha256": "2" * 64,
+                "jobs": runtime_jobs,
+            },
             "orchestration": {
                 "failure_stage": None,
                 "failure_code": None,
@@ -2106,7 +2136,7 @@ def _valid_functional_disaster_recovery_report(directory) -> dict[str, object]:
             },
         },
         "case_deltas": {"failed_components": []},
-        "evidence": _current_evidence("scripts.functional_disaster_recovery_gate"),
+        "evidence": evidence,
         "gate": "pass",
         "production_gate": "not_run",
         "rejection_reasons": [],
@@ -4298,7 +4328,9 @@ def test_explicit_functional_dr_waiver_does_not_reclassify_invalid_destructive_p
     assert result["gate"] != "pass"
 
 
-@pytest.mark.parametrize("mutation", ("missing", "component", "cleanup", "producer", "lineage"))
+@pytest.mark.parametrize(
+    "mutation", ("missing", "component", "cleanup", "producer", "lineage", "runtime")
+)
 def test_explicit_functional_dr_waiver_requires_valid_current_functional_evidence(
     tmp_path, monkeypatch, mutation: str
 ) -> None:
@@ -4315,6 +4347,8 @@ def test_explicit_functional_dr_waiver_requires_valid_current_functional_evidenc
             report["candidate"]["orchestration"]["cleanup_completed"] = False
         elif mutation == "producer":
             report["evidence"]["producer"] = "scripts.disaster_recovery_gate"
+        elif mutation == "runtime":
+            report["candidate"]["runtime_attestation"]["jobs"][0]["job_uid_sha256"] = "0" * 64
         else:
             report["candidate"]["lineage"]["image_digest"] = "sha256:" + "b" * 64
         atomic_write_json(path, report)

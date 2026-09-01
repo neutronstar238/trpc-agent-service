@@ -1,7 +1,24 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 from scripts import candidate_lock
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_candidate_lock_documented_direct_entrypoint_imports_repository() -> None:
+    completed = subprocess.run(  # noqa: S603
+        [sys.executable, str(ROOT / "scripts" / "candidate_lock.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _digest(letter: str) -> str:
