@@ -164,6 +164,7 @@ DECLARE
     runtime_oid oid := 'trpc_runtime'::regrole::oid;
     worker_oid oid := 'trpc_worker'::regrole::oid;
     metrics_oid oid := 'trpc_metrics'::regrole::oid;
+    database_owner_oid oid := 'pg_database_owner'::regrole::oid;
 BEGIN
     IF EXISTS (
         SELECT 1
@@ -176,7 +177,11 @@ BEGIN
     IF (SELECT datdba FROM pg_database WHERE datname = current_database()) <> migration_oid THEN
         RAISE EXCEPTION 'trpc_migration must own the application database';
     END IF;
-    IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'public') <> migration_oid THEN
+    IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'public') <> migration_oid
+       AND (
+           (SELECT nspowner FROM pg_namespace WHERE nspname = 'public') <> database_owner_oid
+           OR NOT pg_has_role(migration_oid, database_owner_oid, 'USAGE')
+       ) THEN
         RAISE EXCEPTION 'trpc_migration must own the public schema';
     END IF;
     IF EXISTS (

@@ -87,6 +87,8 @@ def test_yqzl_role_bootstrap_hardens_roles_and_fails_closed_on_trust_drift() -> 
     assert "FROM pg_auth_members" in script
     assert "trpc_migration must own the application database" in script
     assert "trpc_migration must own the public schema" in script
+    assert "'pg_database_owner'::regrole::oid" in script
+    assert "pg_has_role(migration_oid, database_owner_oid, 'USAGE')" in script
     assert "trpc_migration must own existing application objects" in script
     assert "runtime and worker roles must not own RLS tables" in script
     assert "trpc_metrics must not have table privileges" in script
