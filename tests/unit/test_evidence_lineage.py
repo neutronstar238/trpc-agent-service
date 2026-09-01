@@ -119,13 +119,22 @@ def test_source_fingerprint_ignores_local_runtime_config_but_tracks_source(
 ) -> None:
     deploy = tmp_path / "deploy"
     deploy.mkdir()
-    runtime_config = deploy / "runtime-gate.yaml"
-    runtime_config.write_text("release_id: first\n", encoding="utf-8")
+    yqzl = deploy / "yqzl"
+    yqzl.mkdir()
+    runtime_configs = (
+        deploy / "runtime-gate.yaml",
+        yqzl / "admin.env",
+        yqzl / "gateway.env",
+        yqzl / "runtime.env",
+    )
+    for runtime_config in runtime_configs:
+        runtime_config.write_text("release_id: first\n", encoding="utf-8")
     source = tmp_path / "source.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
 
     before = source_fingerprint(tmp_path, (".",))
-    runtime_config.write_text("release_id: second\n", encoding="utf-8")
+    for runtime_config in runtime_configs:
+        runtime_config.write_text("release_id: second\n", encoding="utf-8")
     after_config_change = source_fingerprint(tmp_path, (".",))
 
     assert after_config_change["value"] == before["value"]

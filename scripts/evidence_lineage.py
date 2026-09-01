@@ -52,10 +52,17 @@ FINGERPRINT_IGNORED_DIRS = frozenset(
     }
 )
 FINGERPRINT_IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
-# This file is operator-local runtime input rather than a candidate source
-# input.  Keep this list exact: broad deploy-directory exclusions would allow
+# These files are operator-local runtime inputs rather than candidate source
+# inputs.  Keep this list exact: broad deploy-directory exclusions would allow
 # release-relevant manifests to drift without changing the candidate binding.
-FINGERPRINT_IGNORED_FILES = frozenset({"deploy/runtime-gate.yaml"})
+FINGERPRINT_IGNORED_FILES = frozenset(
+    {
+        "deploy/runtime-gate.yaml",
+        "deploy/yqzl/admin.env",
+        "deploy/yqzl/gateway.env",
+        "deploy/yqzl/runtime.env",
+    }
+)
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_KIND = "current_candidate"
 DEFAULT_EVIDENCE_TTL_SECONDS = 24 * 60 * 60
