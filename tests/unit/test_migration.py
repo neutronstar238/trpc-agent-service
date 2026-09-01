@@ -437,6 +437,54 @@ async def test_guarded_batch_heartbeats_and_checks_fence_before_each_write() -> 
 
 
 @pytest.mark.asyncio
+async def test_guarded_comparison_checks_fence_once_per_source_page() -> None:
+    class Guard:
+        def __init__(self) -> None:
+            self.assert_calls = 0
+
+        async def renew(self, lease: MigrationLease, *, lease_for: timedelta) -> MigrationLease:
+            del lease_for
+            return lease
+
+        async def assert_active(self, lease: MigrationLease) -> None:
+            del lease
+            self.assert_calls += 1
+
+    source = Source()
+    target = Target()
+    for record in source.records:
+        target.records[("tenant", record.kind, record.resource_id)] = record
+    guard = Guard()
+    coordinator = MigrationCoordinator(
+        source,
+        target,
+        InMemoryMigrationCheckpointStore(),
+        batch_size=2,
+        guard=guard,  # type: ignore[arg-type]
+        lease=MigrationLease(
+            tenant_id="tenant",
+            migration_id="migration",
+            owner_id="worker",
+            owner_instance="run-1",
+            lease_epoch=1,
+            expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        ),
+    )
+
+    compared = await coordinator._compare_all(
+        migration_module.MigrationCheckpoint(
+            tenant_id="tenant",
+            migration_id="migration",
+            phase=MigrationPhase.SHADOW_READ,
+        ),
+        reject_differences=False,
+    )
+
+    assert compared.completed
+    assert guard.assert_calls == 3
+
+
+@pytest.mark.asyncio
 async def test_guarded_batch_stops_after_heartbeat_lease_loss() -> None:
     class LostGuard:
         def __init__(self) -> None:

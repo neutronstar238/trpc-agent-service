@@ -1652,6 +1652,10 @@ class MigrationCoordinator:
         source_resource_ids: dict[str, set[str]] = {}
         while True:
             previous_cursor = cursor
+            # Comparison is read-only.  Fence each bounded source page while
+            # the background heartbeat guards the whole phase; target writes
+            # in ``_copy_all`` still assert the lease before every record.
+            await self._assert_lease()
             records, next_cursor = await self._source.fetch(
                 checkpoint.tenant_id, cursor=cursor, limit=self._batch_size
             )
@@ -1662,7 +1666,6 @@ class MigrationCoordinator:
                 source_count += 1
                 source_resource_ids.setdefault(record.kind, set()).add(record.resource_id)
                 checksum = _rolling_checksum(checksum, record.checksum)
-                await self._assert_lease()
                 if target_enumerated:
                     target_checksum = target_checksums.get(record.kind, {}).get(record.resource_id)
                     if target_checksum != record.checksum:
