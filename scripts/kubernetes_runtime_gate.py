@@ -157,7 +157,7 @@ RUNTIME_NAMESPACE_CLUSTER_LABEL = "trpc.io/cluster-fingerprint"
 RUNTIME_NAMESPACE_MAX_CLEANUP = 10
 RUNTIME_NAMESPACE_TTL_SECONDS = 6 * 60 * 60
 
-DEPLOYMENTS: tuple[tuple[str, str], ...] = (
+PRODUCTION_DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-gateway", "gateway"),
     ("trpc-session-recovery", "session-recovery"),
     ("trpc-artifact-gc", "artifact-gc"),
@@ -169,6 +169,14 @@ DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-post-turn-projector", "post-turn-projector"),
     ("trpc-wecom-connector", "wecom-connector"),
 )
+ACK_RUNTIME_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
+ACK_RUNTIME_DEPLOYMENTS: tuple[tuple[str, str], ...] = tuple(
+    deployment
+    for deployment in PRODUCTION_DEPLOYMENTS
+    if deployment[0] not in ACK_RUNTIME_DISABLED_DEPLOYMENTS
+)
+ACK_RUNTIME_SCOPE = "ack_non_im"
+ACK_EXTERNAL_IM_HOST = "yqzl"
 _PDB_PROTECTED_DEPLOYMENTS = frozenset(
     {
         "trpc-worker",
@@ -176,7 +184,6 @@ _PDB_PROTECTED_DEPLOYMENTS = frozenset(
         "trpc-outbox-dispatcher",
         "trpc-channel-dispatcher",
         "trpc-post-turn-projector",
-        "trpc-wecom-connector",
     }
 )
 
@@ -1516,7 +1523,7 @@ def _write_overlay(
     if local_kind:
         replica_patch = directory / "kind-capacity-patch.yaml"
         replica_documents: list[dict[str, Any]] = []
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             replica_documents.append(
                 {
                     "apiVersion": "apps/v1",
@@ -1547,6 +1554,23 @@ def _write_overlay(
     else:
         replica_patch = OVERLAY_ROOT / "replicas-patch.yaml"
     relative_replica_patch = resource_path(replica_patch)
+    external_im_patch = directory / "ack-external-im-patch.yaml"
+    external_im_patch.write_text(
+        yaml.safe_dump_all(
+            [
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": deployment},
+                    "spec": {"replicas": 0},
+                }
+                for deployment in ACK_RUNTIME_DISABLED_DEPLOYMENTS
+            ],
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    relative_external_im_patch = resource_path(external_im_patch)
     relative_config_patch = resource_path(OVERLAY_ROOT / "production-config-patch.yaml")
     namespace_labels = {
         RUNTIME_NAMESPACE_OWNER_LABEL: RUNTIME_NAMESPACE_OWNER_VALUE,
@@ -1582,6 +1606,7 @@ def _write_overlay(
         *image_lines,
         "patches:",
         f"  - path: {relative_replica_patch}",
+        f"  - path: {relative_external_im_patch}",
         f"  - path: {relative_config_patch}",
     ]
     if node_label is not None:
@@ -1834,7 +1859,7 @@ def _rendered_manifest_contract(
     ):
         reasons.append("schema migration Job has no active deadline")
 
-    for deployment_name, _container_name in DEPLOYMENTS:
+    for deployment_name, _container_name in PRODUCTION_DEPLOYMENTS:
         deployment = resources.get(("Deployment", deployment_name))
         if not isinstance(deployment, Mapping):
             reasons.append(f"required deployment {deployment_name} is missing")
@@ -2381,6 +2406,19 @@ def _runtime_attestation_contract(
     """
 
     reasons: list[str] = []
+    topology = candidate.get("topology")
+    expected_runtime_deployments = [name for name, _container in ACK_RUNTIME_DEPLOYMENTS]
+    if not isinstance(topology, Mapping):
+        reasons.append("ACK non-IM runtime topology is missing")
+    else:
+        if topology.get("scope") != ACK_RUNTIME_SCOPE:
+            reasons.append("runtime topology scope is not ack_non_im")
+        if topology.get("external_im_host") != ACK_EXTERNAL_IM_HOST:
+            reasons.append("runtime topology does not bind IM to yqzl")
+        if topology.get("deployments") != expected_runtime_deployments:
+            reasons.append("runtime topology deployment set is invalid")
+        if topology.get("disabled_deployments") != list(ACK_RUNTIME_DISABLED_DEPLOYMENTS):
+            reasons.append("runtime topology disabled deployment set is invalid")
     checks = candidate.get("checks")
     if not isinstance(checks, Mapping):
         return False, ("runtime checks are unavailable",)
@@ -2460,7 +2498,7 @@ def _runtime_attestation_contract(
     if require_node_eviction and node_eviction_status != "pass":
         reasons.append("runtime_attestation node eviction status is not pass")
     image_ids = attestation.get("image_ids")
-    expected_deployments = {name for name, _container in DEPLOYMENTS}
+    expected_deployments = {name for name, _container in ACK_RUNTIME_DEPLOYMENTS}
     validated_image_ids: dict[str, dict[str, str]] = {}
     if (
         not isinstance(image_ids, Mapping)
@@ -4093,7 +4131,7 @@ def _rollout_all(
     timeout_seconds: float,
 ) -> dict[str, CommandResult]:
     checks: dict[str, CommandResult] = {}
-    for deployment, _container in DEPLOYMENTS:
+    for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
         checks[deployment] = _rollout_deployment(
             deployment,
             namespace=namespace,
@@ -4135,7 +4173,7 @@ def _rolling_upgrade_serial(
 
     image_updates: dict[str, CommandResult] = {}
     rollouts: dict[str, CommandResult] = {}
-    for deployment, container in DEPLOYMENTS:
+    for deployment, container in ACK_RUNTIME_DEPLOYMENTS:
         image_updates[deployment] = _kubectl(
             [
                 "set",
@@ -4770,6 +4808,12 @@ def _run_live_once(
     candidate: dict[str, Any] = {
         "mode": "live_kubernetes_control_plane",
         "enabled": True,
+        "topology": {
+            "scope": ACK_RUNTIME_SCOPE,
+            "external_im_host": ACK_EXTERNAL_IM_HOST,
+            "deployments": [name for name, _container in ACK_RUNTIME_DEPLOYMENTS],
+            "disabled_deployments": list(ACK_RUNTIME_DISABLED_DEPLOYMENTS),
+        },
         "checks": {},
     }
     reasons: list[str] = []
@@ -5132,7 +5176,7 @@ def _run_live_once(
             else "fail",
             "deployments": {name: _result_payload(item) for name, item in rollout_checks.items()},
         }
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             ready = _deployment_ready(
                 deployment,
                 namespace=namespace,
@@ -5377,7 +5421,7 @@ def _run_live_once(
 
         initial_image_ids: dict[str, tuple[str, ...]] = {}
         initial_image_polls: dict[str, int] = {}
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             image_result, image_ids, poll_count = _wait_for_deployment_image_ids(
                 deployment,
                 namespace=namespace,
@@ -5403,7 +5447,7 @@ def _run_live_once(
             context=context,
             timeout_seconds=timeout_seconds,
         )
-        upgrade_complete = len(rollouts) == len(DEPLOYMENTS)
+        upgrade_complete = len(rollouts) == len(ACK_RUNTIME_DEPLOYMENTS)
         checks["rolling_upgrade"] = {
             "status": "pass"
             if upgrade_complete
@@ -5421,7 +5465,7 @@ def _run_live_once(
         upgraded_image_ids: dict[str, tuple[str, ...]] = {}
         image_changes: dict[str, bool] = {}
         upgraded_image_polls: dict[str, int] = {}
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             image_result, image_ids, poll_count = _wait_for_deployment_image_ids(
                 deployment,
                 namespace=namespace,
@@ -5447,7 +5491,7 @@ def _run_live_once(
 
         rollback_result, rollback_details = _failure_rollback(
             _ROLLBACK_PROBE_DEPLOYMENT,
-            dict(DEPLOYMENTS)[_ROLLBACK_PROBE_DEPLOYMENT],
+            dict(ACK_RUNTIME_DEPLOYMENTS)[_ROLLBACK_PROBE_DEPLOYMENT],
             upgrade_image,
             upgraded_image_ids[_ROLLBACK_PROBE_DEPLOYMENT],
             namespace=namespace,

@@ -356,6 +356,18 @@ def test_generated_overlay_is_namespace_scoped(tmp_path) -> None:
     assert "newTag: test" in rendered
     assert "namespace.yaml" in rendered
     assert "replicas-patch.yaml" in rendered
+    assert "ack-external-im-patch.yaml" in rendered
+    external_im = list(
+        yaml.safe_load_all((tmp_path / "ack-external-im-patch.yaml").read_text(encoding="utf-8"))
+    )
+    assert external_im == [
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "trpc-wecom-connector"},
+            "spec": {"replicas": 0},
+        }
+    ]
 
 
 def test_generated_overlay_pins_runtime_pods_to_controlled_label(tmp_path) -> None:
@@ -533,11 +545,12 @@ def test_rolling_upgrade_sets_and_waits_for_each_deployment_serially(monkeypatch
     )
 
     expected: list[tuple[str, str]] = []
-    for deployment, _container in runtime_gate.DEPLOYMENTS:
+    for deployment, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS:
         expected.extend([("set", deployment), ("rollout", deployment)])
     assert calls == expected
-    assert set(image_updates) == {name for name, _container in runtime_gate.DEPLOYMENTS}
+    assert set(image_updates) == {name for name, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS}
     assert set(rollouts) == set(image_updates)
+    assert "trpc-wecom-connector" not in image_updates
 
 
 def test_live_gate_without_kubectl_is_not_run(tmp_path, monkeypatch) -> None:
@@ -879,10 +892,12 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
     checks = {name: {"status": "pass"} for name in _REQUIRED_RUNTIME_CHECKS}
     checks["hpa_load_observation"] = {"status": "pass", "observation": hpa_observation}
     initial_image_ids = {
-        deployment: ["sha256:" + "1" * 64] for deployment, _container in runtime_gate.DEPLOYMENTS
+        deployment: ["sha256:" + "1" * 64]
+        for deployment, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS
     }
     upgrade_image_ids = {
-        deployment: ["sha256:" + "2" * 64] for deployment, _container in runtime_gate.DEPLOYMENTS
+        deployment: ["sha256:" + "2" * 64]
+        for deployment, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS
     }
     checks["initial_image_ids"] = deepcopy(initial_image_ids)
     checks["rolling_upgrade"]["image_ids"] = {
@@ -902,6 +917,12 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
     candidate = {
         "namespace": "isolated",
         "run_nonce": "a" * 32,
+        "topology": {
+            "scope": "ack_non_im",
+            "external_im_host": "yqzl",
+            "deployments": [name for name, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS],
+            "disabled_deployments": ["trpc-wecom-connector"],
+        },
         "checks": checks,
         "runtime_attestation": {
             "status": "pass",
@@ -928,6 +949,12 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
     valid, reasons = _runtime_attestation_contract(candidate)
     assert valid
     assert reasons == ()
+
+    candidate_with_in_cluster_im = deepcopy(candidate)
+    candidate_with_in_cluster_im["topology"]["disabled_deployments"] = []
+    valid, reasons = _runtime_attestation_contract(candidate_with_in_cluster_im)
+    assert not valid
+    assert any("disabled deployment set" in reason for reason in reasons)
 
     candidate_without_rollback = deepcopy(candidate)
     candidate_without_rollback["checks"]["rolling_upgrade"].pop("rollback")

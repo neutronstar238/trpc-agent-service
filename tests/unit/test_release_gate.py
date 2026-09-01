@@ -1926,6 +1926,12 @@ def _valid_kubernetes_report() -> dict[str, object]:
     candidate = {
         "mode": "live_kubernetes_control_plane",
         "enabled": True,
+        "topology": {
+            "scope": "ack_non_im",
+            "external_im_host": "yqzl",
+            "deployments": list(release_gate.K8S_REQUIRED_DEPLOYMENTS),
+            "disabled_deployments": ["trpc-wecom-connector"],
+        },
         "namespace": namespace,
         "run_nonce": nonce,
         "controlled_node": {"fingerprint_sha256": "d" * 64},
@@ -2443,6 +2449,8 @@ def test_kubernetes_pass_requires_complete_live_attestation(tmp_path) -> None:
     ("mutation", "reason_fragment"),
     (
         ("schema", "invalid schema_version"),
+        ("topology_host", "reviewed yqzl-external IM topology"),
+        ("topology_disabled", "reviewed yqzl-external IM topology"),
         ("nonce", "run_nonce"),
         ("hpa", "HPA desired replicas"),
         ("hpa_driver_trust", "hpa_driver_trust"),
@@ -2466,6 +2474,10 @@ def test_kubernetes_pass_rejects_incomplete_or_replayed_runtime_evidence(
     value = json.loads(json.dumps(_valid_kubernetes_report()))
     if mutation == "schema":
         value["schema_version"] = 0
+    elif mutation == "topology_host":
+        value["candidate"]["topology"]["external_im_host"] = "ack"  # type: ignore[index]
+    elif mutation == "topology_disabled":
+        value["candidate"]["topology"]["disabled_deployments"] = []  # type: ignore[index]
     elif mutation == "nonce":
         value["candidate"]["run_nonce"] = "b" * 32  # type: ignore[index]
     elif mutation == "hpa":

@@ -159,8 +159,10 @@ Secret 管理系统生成，至少包含 `trpc-service-secrets` 和 `trpc-migrat
 `registry/repository@sha256:<64-hex-digest>` 引用；本地 Docker image ID、未限定名、tag-only、
 example/replace 占位镜像会被拒绝，升级镜像必须是可拉取的不同 digest。
 
-运行器会先执行 server-side dry-run，然后在随机的 `trpc-runtime-gate-*` namespace 中部署生产
-overlay，检查所有 Deployment readiness、滚动升级、worker 扩容、HPA `AbleToScale=True`、
+运行器会先对完整生产 overlay 执行静态契约检查，再在随机的 `trpc-runtime-gate-*` namespace 中部署
+ACK 非 IM 拓扑。该拓扑把 `trpc-wecom-connector` 明确缩为 0，并在证据中绑定
+`scope=ack_non_im`、`external_im_host=yqzl`；飞书公网回调、企业微信唯一长连接和签名在线探针只在
+yqzl 验收，ACK 不得连接真实 IM 账号。运行器检查其余 Deployment readiness、滚动升级、worker 扩容、HPA `AbleToScale=True`、
 Prometheus Adapter/KEDA 提供的 backlog external metric 必须存在且 `ScalingActive=True`；仅有
 metrics-server 的 CPU/内存指标不满足本门禁，
 namespace-scoped Pod Eviction/PDB 恢复、专用节点 cordon/drain/uncordon 和非强制优雅终止，最后无论

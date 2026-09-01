@@ -570,8 +570,10 @@ K8S_REQUIRED_DEPLOYMENTS = (
     "trpc-outbox-dispatcher",
     "trpc-channel-dispatcher",
     "trpc-post-turn-projector",
-    "trpc-wecom-connector",
 )
+K8S_RUNTIME_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
+K8S_RUNTIME_SCOPE = "ack_non_im"
+K8S_EXTERNAL_IM_HOST = "yqzl"
 K8S_IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 K8S_RUN_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 K8S_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -3366,6 +3368,16 @@ def _validate_kubernetes_semantics(
         or candidate.get("enabled") is not True
     ):
         return _k8s_missing("candidate live mode/enabled")
+    topology = candidate.get("topology")
+    if not isinstance(topology, Mapping):
+        return _k8s_missing("candidate.topology")
+    if (
+        topology.get("scope") != K8S_RUNTIME_SCOPE
+        or topology.get("external_im_host") != K8S_EXTERNAL_IM_HOST
+        or topology.get("deployments") != list(K8S_REQUIRED_DEPLOYMENTS)
+        or topology.get("disabled_deployments") != list(K8S_RUNTIME_DISABLED_DEPLOYMENTS)
+    ):
+        return _k8s_failed("ACK runtime topology is not the reviewed yqzl-external IM topology")
     namespace = candidate.get("namespace")
     nonce = candidate.get("run_nonce")
     if (
