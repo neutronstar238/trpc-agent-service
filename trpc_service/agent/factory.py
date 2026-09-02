@@ -16,8 +16,9 @@ from trpc_agent_sdk.models import (
     LlmResponse,
     OpenAIModel,
 )
+from trpc_agent_sdk.planners import BuiltInPlanner
 from trpc_agent_sdk.tools import BaseTool
-from trpc_agent_sdk.types import GenerateContentConfig
+from trpc_agent_sdk.types import GenerateContentConfig, HttpOptions, ThinkingConfig
 
 from trpc_service.agent.fake import DeterministicAgent, DeterministicToolCallModel
 from trpc_service.config.secrets import SecretProvider, SecretRef
@@ -94,15 +95,33 @@ class ProductionAgentLoader:
         digest = hashlib.sha256(
             f"{config.tenant_id}:{config.app_id}:{config.version}".encode()
         ).hexdigest()[:12]
+        agent_kwargs: dict[str, Any] = {}
+        thinking_budget = config.model.thinking_budget_tokens
+        if thinking_budget not in {None, 0}:
+            agent_kwargs["planner"] = BuiltInPlanner(
+                thinking_config=ThinkingConfig(
+                    include_thoughts=True,
+                    thinking_budget=thinking_budget,
+                )
+            )
+        generation_kwargs: dict[str, Any] = {
+            "max_output_tokens": config.budget.max_tokens_per_turn,
+            "http_options": HttpOptions(timeout=max(1, round(config.model.timeout_seconds * 1000))),
+        }
+        if config.model.temperature is not None:
+            generation_kwargs["temperature"] = config.model.temperature
+        if config.model.top_p is not None:
+            generation_kwargs["top_p"] = config.model.top_p
+        if config.model.stop_sequences:
+            generation_kwargs["stop_sequences"] = list(config.model.stop_sequences)
         return LlmAgent(
             name=f"tenant_agent_{digest}",
             description=f"Tenant agent revision {config.version}",
             model=model,
             instruction=config.instructions,
             tools=selected_tools,
-            generate_content_config=GenerateContentConfig(
-                max_output_tokens=config.budget.max_tokens_per_turn
-            ),
+            generate_content_config=GenerateContentConfig(**generation_kwargs),
+            **agent_kwargs,
         )
 
     def _selected_tools(self, config: TenantConfig) -> list[BaseTool]:
@@ -140,6 +159,9 @@ class ProductionAgentLoader:
             kwargs["base_url"] = policy.base_url
         provider = policy.provider.lower()
         if provider == "openai":
+            if policy.reasoning_effort is not None:
+                kwargs["use_responses_api"] = True
+                kwargs["responses_api_params"] = {"reasoning": {"effort": policy.reasoning_effort}}
             primary: LLMModel = OpenAIModel(model_name=policy.model, **kwargs)
         elif provider == "anthropic":
             primary = AnthropicModel(model_name=policy.model, **kwargs)

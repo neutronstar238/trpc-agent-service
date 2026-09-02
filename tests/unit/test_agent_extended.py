@@ -158,9 +158,19 @@ async def test_production_loader_provider_selection_and_tools(monkeypatch) -> No
     assert len(agent.tools) == 1
     assert isinstance(agent.tools[0], GovernedTool)
     assert agent.generate_content_config.max_output_tokens == config.budget.max_tokens_per_turn
+    assert agent.generate_content_config.http_options.timeout == 60_000
     assert created[0] == ("primary", {"api_key": "key", "base_url": "https://model"})
     assert created[1][0] == "secondary"
     assert isinstance(loader._model(config.model), FallbackModel)
+    loader._model(ModelPolicy(provider="openai", model="reasoning", reasoning_effort="medium"))
+    assert created[-1] == (
+        "reasoning",
+        {
+            "api_key": "",
+            "use_responses_api": True,
+            "responses_api_params": {"reasoning": {"effort": "medium"}},
+        },
+    )
     loader._model(ModelPolicy(provider="anthropic", model="a"))
     loader._model(ModelPolicy(provider="litellm", model="l"))
     with pytest.raises(ValueError, match="unsupported"):
@@ -169,6 +179,59 @@ async def test_production_loader_provider_selection_and_tools(monkeypatch) -> No
     unsafe_loader = ProductionAgentLoader(secrets, tools={"a": FunctionTool(tool_a)})
     with pytest.raises(ValueError, match="governance"):
         await unsafe_loader(config)
+
+
+def test_model_generation_controls_are_validated_and_applied(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "trpc_service.agent.factory.LlmAgent", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    loader = ProductionAgentLoader(LocalSecretProvider(allow_literal=True))
+    config = tenant_config().model_copy(
+        update={
+            "model": ModelPolicy(
+                provider="anthropic",
+                model="claude-test",
+                timeout_seconds=12.5,
+                temperature=0.25,
+                top_p=0.8,
+                stop_sequences=("STOP",),
+                thinking_budget_tokens=2048,
+            )
+        }
+    )
+
+    agent = loader._build_agent(config, Model())
+
+    assert agent.generate_content_config.temperature == 0.25
+    assert agent.generate_content_config.top_p == 0.8
+    assert agent.generate_content_config.stop_sequences == ["STOP"]
+    assert agent.generate_content_config.http_options.timeout == 12_500
+    assert agent.planner.thinking_config.include_thoughts is True
+    assert agent.planner.thinking_config.thinking_budget == 2048
+
+    with pytest.raises(ValueError, match="at least 1024"):
+        ModelPolicy(provider="anthropic", model="claude-test", thinking_budget_tokens=512)
+    with pytest.raises(ValueError, match="requires the openai provider"):
+        ModelPolicy(provider="anthropic", model="claude-test", reasoning_effort="high")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ModelPolicy(
+            provider="openai",
+            model="gpt-test",
+            reasoning_effort="low",
+            thinking_budget_tokens=2048,
+        )
+    with pytest.raises(ValueError, match="1 to 256"):
+        ModelPolicy(provider="openai", model="gpt-test", stop_sequences=("",))
+    with pytest.raises(ValueError, match="smaller than max_tokens_per_turn"):
+        value = tenant_config()
+        payload = value.model_dump()
+        payload["model"] = {
+            "provider": "anthropic",
+            "model": "claude-test",
+            "thinking_budget_tokens": 2048,
+        }
+        payload["budget"]["max_tokens_per_turn"] = 2048
+        value.__class__.model_validate(payload)
 
 
 @pytest.mark.asyncio

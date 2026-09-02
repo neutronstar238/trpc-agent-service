@@ -1085,5 +1085,8 @@ def test_production_model_secret_is_scoped_to_worker_and_template_is_runnable() 
         }
     )
     assert config.model.provider == "openai"
+    assert config.model.model == "REPLACE_WITH_APPROVED_MODEL_ID"
+    assert config.model.base_url == "https://api.openai.com/v1"
+    assert config.model.reasoning_effort == "medium"
     assert config.model.api_key_ref is not None
     assert config.model.api_key_ref.uri == "file:///run/secrets/model_api_key"

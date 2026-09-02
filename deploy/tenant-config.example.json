@@ -4,10 +4,16 @@
     "model": {
       "provider": "openai",
       "model": "REPLACE_WITH_APPROVED_MODEL_ID",
+      "base_url": "https://api.openai.com/v1",
       "api_key_ref": {
         "uri": "file:///run/secrets/model_api_key"
       },
-      "timeout_seconds": 60
+      "timeout_seconds": 60,
+      "reasoning_effort": "medium",
+      "thinking_budget_tokens": null,
+      "temperature": null,
+      "top_p": null,
+      "stop_sequences": []
     },
     "tools": {
       "allow": [],

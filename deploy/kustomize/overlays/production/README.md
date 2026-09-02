@@ -61,6 +61,16 @@ Kubernetes `subPath` so it is not updated in place; after rotating the Secret,
 roll out `trpc-worker` and verify the replacement pods before revoking the old
 credential.
 
+Model provider, HTTPS base URL, exact model ID, request timeout, reasoning
+effort/thinking budget, sampling controls, and optional fallback model are
+tenant-revision fields in `deploy/tenant-config.example.json`; they are not
+image or ConfigMap constants. `reasoning_effort` selects the OpenAI Responses
+API, while `thinking_budget_tokens` selects the SDK built-in planner for
+Anthropic or a compatible OpenAI endpoint. They are mutually exclusive and a
+positive thinking budget must be smaller than the tenant turn-token budget.
+Changing a tenant revision does not require an image rollout, but every base
+URL host must already be present in the deployment-wide endpoint allow-list.
+
 Real Feishu and WeCom credentials are supplied through a dedicated Secret named
 `trpc-im-secrets`. It contains exactly `feishu_app_secret`,
 `feishu_verification_token`, `feishu_encrypt_key`, and `wecom_bot_secret`.

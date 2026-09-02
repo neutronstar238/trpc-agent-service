@@ -373,9 +373,10 @@ TRPC_SERVICE_WORKER_DATABASE_PASSWORD=<RAW_WORKER_PASSWORD>
 file:///run/secrets/model_api_key
 ```
 
-这个文件只提供凭据；模型提供方、模型 ID、预算和系统指令属于租户不可变配置，必须按 11.3 节通过 Admin
-API 创建并激活。仅设置 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` 不会启用模型调用。Kubernetes `subPath`
-不会热更新 Secret；轮换 `model_api_key` 后必须滚动重启 `trpc-worker`，确认新 Pod Ready 后再撤销旧 key。
+这个文件只提供凭据；模型提供方、模型 URL、模型 ID、推理强度、采样参数、预算和系统指令属于租户不可变
+配置，必须按 11.3 节通过 Admin API 创建并激活。仅设置 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` 不会启用
+模型调用。Kubernetes `subPath` 不会热更新 Secret；轮换 `model_api_key` 后必须滚动重启
+`trpc-worker`，确认新 Pod Ready 后再撤销旧 key。
 
 ### 7.6 迁移 `migration.env`
 
@@ -669,11 +670,45 @@ curl -i -X POST "$ADMIN_URL/v1/tenants" \
 
 复制并编辑 [租户配置模板](deploy/tenant-config.example.json)：
 
-- `provider` 可为 `openai`、`anthropic` 或 `litellm`；必须与实际 API 兼容。
-- `model` 替换为提供方账户确实可用的模型 ID。
-- `api_key_ref.uri` 保持 `file:///run/secrets/model_api_key`，除非部署已审查另一租户 Secret 路径。
-- 若填写 `base_url`，其 HTTPS 主机必须同时出现在 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS`。
-- `storage` 默认值对应仓库内置的 PostgreSQL/S3/pgvector 正式实现。
+模型配置字段都属于当前租户 revision，而不是进程级硬编码：
+
+| 字段 | 填写方式 | 运行时行为 |
+| --- | --- | --- |
+| `provider` | `openai`、`anthropic` 或 `litellm` | 选择对应 tRPC-Agent 模型适配器 |
+| `base_url` | 完整 HTTPS API 根地址，例如 `https://api.openai.com/v1` | Worker 将其直接交给适配器；主机还必须列入 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` |
+| `model` | 账户实际可用的精确模型 ID；LiteLLM 使用 `provider/model` | 每个租户 revision 可独立选择，不需要重建镜像 |
+| `api_key_ref.uri` | 默认 `file:///run/secrets/model_api_key` | Worker 在运行时解析 Secret，数据库不保存明文 |
+| `timeout_seconds` | `0 < value <= 600` | 转换为 SDK 的单次模型 HTTP 请求超时，不再只是描述字段 |
+| `reasoning_effort` | OpenAI 可填 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | 自动使用 OpenAI Responses API，并原样传递 `reasoning.effort`；具体取值仍须由目标模型支持 |
+| `thinking_budget_tokens` | Anthropic 或支持 SDK thinking 参数的 OpenAI 兼容端填 `-1`（自动）、`0`（关闭）或至少 `1024` | 通过 SDK 内置 planner 设置 token 思考预算；正数必须小于 `budget.max_tokens_per_turn` |
+| `temperature` | `null` 或 `0..2` | 非 `null` 时传给模型；推理模型不支持时保持 `null` |
+| `top_p` | `null` 或 `0..1` | 非 `null` 时传给模型；通常不要和 `temperature` 同时调节 |
+| `stop_sequences` | 最多 8 个、每个 1–256 字符 | 非空时作为停止序列传入模型 |
+| `fallback_model` | 可选的同 provider 备用模型 ID | 主模型在输出任何可用内容前失败时才切换；沿用同一 URL、密钥和生成参数 |
+
+`reasoning_effort` 与 `thinking_budget_tokens` 是两套不同供应商协议，配置模型会拒绝同时设置，避免参数被
+静默忽略。模板默认展示 OpenAI Responses API 用法：保留 `reasoning_effort`，让
+`thinking_budget_tokens` 为 `null`。Anthropic 示例应反过来设置：
+
+```json
+{
+  "provider": "anthropic",
+  "base_url": "https://api.anthropic.com",
+  "model": "REPLACE_WITH_CLAUDE_MODEL_ID",
+  "api_key_ref": {"uri": "file:///run/secrets/model_api_key"},
+  "timeout_seconds": 60,
+  "reasoning_effort": null,
+  "thinking_budget_tokens": 2048,
+  "temperature": null,
+  "top_p": null,
+  "stop_sequences": []
+}
+```
+
+若使用自建 OpenAI 兼容网关，先确认它实现 `/responses` 再填写 `reasoning_effort`；只实现
+`/chat/completions` 的网关应将该字段设为 `null`。修改 `base_url` 后还必须同步更新 production
+ConfigMap 的 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS`，否则 Worker 会按 SSRF 防护策略拒绝加载 revision。
+`storage` 默认值对应仓库内置的 PostgreSQL/S3/pgvector 正式实现。
 
 创建 revision；服务端会注入 `tenant_id`、`app_id` 和递增的 `version`：
 
