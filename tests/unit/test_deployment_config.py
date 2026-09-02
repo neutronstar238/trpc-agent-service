@@ -19,6 +19,7 @@ from scripts.deployment_config import (
 )
 from scripts.deployment_preflight import build_preflight
 from scripts.evidence_lineage import source_fingerprint
+from trpc_service.tenant.models import TenantConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 NONCE = "n" * 32
@@ -1024,3 +1025,65 @@ def test_preflight_returns_structured_failure_for_invalid_document(tmp_path: Pat
             "reason": "runtime gate config is not readable YAML",
         }
     ]
+
+
+def test_production_model_secret_is_scoped_to_worker_and_template_is_runnable() -> None:
+    patch = yaml.safe_load(
+        (ROOT / "deploy/kustomize/overlays/production/model-secret-mount-patch.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert patch["metadata"]["name"] == "trpc-worker"
+    pod = patch["spec"]["template"]["spec"]
+    assert pod["containers"] == [
+        {
+            "name": "worker",
+            "volumeMounts": [
+                {
+                    "name": "model-secrets",
+                    "mountPath": "/run/secrets/model_api_key",
+                    "subPath": "model_api_key",
+                    "readOnly": True,
+                }
+            ],
+        }
+    ]
+    assert pod["volumes"] == [
+        {
+            "name": "model-secrets",
+            "secret": {
+                "secretName": "trpc-model-secrets",
+                "defaultMode": 0o440,
+            },
+        }
+    ]
+
+    secrets = list(
+        yaml.safe_load_all(
+            (ROOT / "deploy/kustomize/base/secrets.example.yaml").read_text(encoding="utf-8")
+        )
+    )
+    model_secret = next(
+        item for item in secrets if item.get("metadata", {}).get("name") == "trpc-model-secrets"
+    )
+    assert model_secret["stringData"] == {"model_api_key": "REPLACE_WITH_MODEL_PROVIDER_API_KEY"}
+
+    kustomization = yaml.safe_load(
+        (ROOT / "deploy/kustomize/overlays/production/kustomization.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "model-secret-mount-patch.yaml" in {item["path"] for item in kustomization["patches"]}
+
+    request = json.loads((ROOT / "deploy/tenant-config.example.json").read_text(encoding="utf-8"))
+    config = TenantConfig.model_validate(
+        {
+            **request["config"],
+            "tenant_id": "tenant-example",
+            "app_id": request["app_id"],
+            "version": 1,
+        }
+    )
+    assert config.model.provider == "openai"
+    assert config.model.api_key_ref is not None
+    assert config.model.api_key_ref.uri == "file:///run/secrets/model_api_key"

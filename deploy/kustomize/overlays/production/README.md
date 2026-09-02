@@ -48,7 +48,20 @@ projector, connector, and recovery pods mount this Secret. The dedicated
 grants on the cross-tenant SECURITY DEFINER functions; the normal tenant
 runtime role must not receive that Secret.
 
-Real Feishu and WeCom credentials are supplied through a fifth Secret named
+The model provider credential is a separate Secret named
+`trpc-model-secrets` with exactly one key, `model_api_key`. The
+`model-secret-mount-patch.yaml` patch mounts that key read-only at
+`/run/secrets/model_api_key` only in `trpc-worker`. A tenant's immutable model
+revision references `file:///run/secrets/model_api_key`; the endpoint host is
+also required in `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS`. Supplying either the
+Secret or the host allow-list alone does not enable real model calls. Do not
+mount this Secret into Gateway, Admin, dispatchers, connectors, migration,
+metrics, recovery, projector, or artifact-GC pods. The single-file mount uses
+Kubernetes `subPath` so it is not updated in place; after rotating the Secret,
+roll out `trpc-worker` and verify the replacement pods before revoking the old
+credential.
+
+Real Feishu and WeCom credentials are supplied through a dedicated Secret named
 `trpc-im-secrets`. It contains exactly `feishu_app_secret`,
 `feishu_verification_token`, `feishu_encrypt_key`, and `wecom_bot_secret`.
 The production `im-secret-mounts-patch.yaml` mounts it read-only at
@@ -59,13 +72,13 @@ binding fields. Do not move these values into the ConfigMap or add the IM
 Secret to Admin, migration, metrics, outbox, projector, recovery, or artifact
 GC pods.
 
-The backlog exporter uses a third Secret named `trpc-metrics-secrets` with
+The backlog exporter uses a separate Secret named `trpc-metrics-secrets` with
 only `TRPC_SERVICE_METRICS_DATABASE_DSN`.  It must connect as the dedicated
 `trpc_metrics` login created before migration `0016`; that login is
 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS` and can execute
 only `public.count_session_ready_backlog()`.  Do not reuse the worker DSN.
 
-The bundled data services require a sixth Secret named
+The bundled data services require a dedicated Secret named
 `trpc-infrastructure-secrets`.  Its exact keys are listed in
 `../../base/secrets.example.yaml`: PostgreSQL superuser and four application
 role passwords, Redis password, MinIO root credentials, and a separate MinIO

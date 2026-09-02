@@ -56,6 +56,7 @@ def _compose_environment(**extra: str) -> dict[str, str]:
             "SESSION_HMAC_KEY": "compose-test-session-hmac-32bytes-0000",
             "EMERGENCY_QUEUE_KEY": "compose-test-emergency-32bytes-0000",
             "DEVELOPMENT_TOKEN": "compose-test-development",
+            "MODEL_API_KEY": "compose-test-model-key",
             "TRPC_FAULT_RUN_ID": "compose-fault-test",
             "TRPC_FAULT_OFFLINE_AGENT_DELAY_SECONDS": "0.5",
             "TRPC_FAULT_RUN_TOKEN": "compose-fault-token",
@@ -184,6 +185,17 @@ def test_compose_forwards_worker_queue_and_database_pool_settings() -> None:
         assert role_environment["TRPC_SERVICE_WORKER_DATABASE_PASSWORD_REF"] == (
             "file:///run/secrets/worker_database_password"
         )
+
+
+def test_compose_mounts_model_secret_only_into_agent_worker() -> None:
+    compose_path = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+
+    assert compose["secrets"]["model_api_key"] == {"environment": "MODEL_API_KEY"}
+    assert "model_api_key" in compose["services"]["worker"]["secrets"]
+    for name, service in compose["services"].items():
+        if name != "worker":
+            assert "model_api_key" not in service.get("secrets", []), name
 
 
 def test_compose_session_recovery_is_postgres_only_and_conservative() -> None:

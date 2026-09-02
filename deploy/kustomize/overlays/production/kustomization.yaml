@@ -27,5 +27,6 @@ patches:
   - path: production-config-patch.yaml
   - path: wecom-ha-patch.yaml
   - path: im-secret-mounts-patch.yaml
+  - path: model-secret-mount-patch.yaml
   - path: deployment-order-patch.yaml
   - path: migration-order-patch.yaml

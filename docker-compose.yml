@@ -142,7 +142,15 @@ services:
       TRPC_SERVICE_WORKER_DATABASE_DSN_REF: env://TRPC_SERVICE_WORKER_DATABASE_DSN
       TRPC_SERVICE_WORKER_DATABASE_DSN: postgresql+asyncpg://${TRPC_WORKER_USER:-trpc_worker}@postgres:5432/${POSTGRES_DB:-trpc_service}
       TRPC_SERVICE_WORKER_DATABASE_PASSWORD_REF: file:///run/secrets/worker_database_password
-    secrets: *worker-secrets
+    secrets:
+      - runtime_database_password
+      - worker_database_password
+      - redis_password
+      - minio_root_password
+      - session_hmac_key
+      - emergency_queue_key
+      - development_token
+      - model_api_key
     healthcheck:
       test: ["CMD", "python", "-m", "trpc_service.probe", "--role", "worker"]
       interval: 10s
@@ -504,3 +512,5 @@ secrets:
     environment: EMERGENCY_QUEUE_KEY
   development_token:
     environment: DEVELOPMENT_TOKEN
+  model_api_key:
+    environment: MODEL_API_KEY

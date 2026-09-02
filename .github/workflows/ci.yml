@@ -92,6 +92,7 @@ jobs:
       SESSION_HMAC_KEY: ci-session-hmac-key-with-32-bytes
       EMERGENCY_QUEUE_KEY: ci-emergency-key-exactly-32bytes
       DEVELOPMENT_TOKEN: ci-development-token
+      MODEL_API_KEY: ci-model-key-not-used-for-network-calls
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet

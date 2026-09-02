@@ -124,7 +124,7 @@ uv run trpc-service doctor --output runs\multitenant\sdk-upgrade.json
 - `file:///absolute/path`：读取绝对路径文件；租户 Secret 必须在
   `TRPC_SERVICE_TENANT_SECRET_ROOT` 下。
 - `.env`：只用于本地 Compose。
-- Kubernetes：非敏感项放 ConfigMap，敏感项放上述六类 Secret。
+- Kubernetes：非敏感项放 ConfigMap，敏感项放下述七类 Secret。
 
 生产禁止 `literal://`。环境专用配置必须覆盖所有 `example.*`、`samples.*`、`REPLACE_*` 值。
 
@@ -156,6 +156,7 @@ Copy-Item .env.example .env
 | `SESSION_HMAC_KEY` | 至少 32 个随机字节 |
 | `EMERGENCY_QUEUE_KEY` | 恰好 32 个随机字节 |
 | `DEVELOPMENT_TOKEN` | 仅本地使用 |
+| `MODEL_API_KEY` | 真实模型提供方密钥；只挂载给 Agent Worker |
 | `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` | JSON 数组，只列批准的模型 API 主机 |
 | `TRPC_SERVICE_TENANT_SECRET_ENV_NAMES` | 默认 `[]`，只增加精确批准的名称 |
 
@@ -363,7 +364,20 @@ TRPC_SERVICE_WORKER_DATABASE_PASSWORD=<RAW_WORKER_PASSWORD>
 
 只有 Worker、dispatcher、projector、connector、recovery 与 artifact GC 可以挂载这份 Secret。
 
-### 7.5 迁移 `migration.env`
+### 7.5 模型 Secret 文件
+
+把真实模型 API key 写入仓库外文件 `/secure/trpc-service/model_api_key`，文件权限设为 0600，且不要添加
+尾随空行。Kubernetes 将它作为 `trpc-model-secrets/model_api_key` 只挂载给 `trpc-worker`，容器内固定路径为：
+
+```text
+file:///run/secrets/model_api_key
+```
+
+这个文件只提供凭据；模型提供方、模型 ID、预算和系统指令属于租户不可变配置，必须按 11.3 节通过 Admin
+API 创建并激活。仅设置 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` 不会启用模型调用。Kubernetes `subPath`
+不会热更新 Secret；轮换 `model_api_key` 后必须滚动重启 `trpc-worker`，确认新 Pod Ready 后再撤销旧 key。
+
+### 7.6 迁移 `migration.env`
 
 ```dotenv
 TRPC_SERVICE_DATABASE_DSN=postgresql://trpc_migration:<URL_ENCODED_PASSWORD>@<PG_HOST>:5432/trpc_service?sslmode=require
@@ -371,7 +385,7 @@ TRPC_SERVICE_DATABASE_DSN=postgresql://trpc_migration:<URL_ENCODED_PASSWORD>@<PG
 
 `trpc_migration` 是 schema owner，只进入 migration Job，不进入任何长期 Pod。
 
-### 7.6 指标 `metrics.env`
+### 7.7 指标 `metrics.env`
 
 ```dotenv
 TRPC_SERVICE_METRICS_DATABASE_DSN=postgresql://trpc_metrics:<URL_ENCODED_PASSWORD>@<PG_HOST>:5432/trpc_service?sslmode=require
@@ -380,7 +394,7 @@ TRPC_SERVICE_METRICS_DATABASE_DSN=postgresql://trpc_metrics:<URL_ENCODED_PASSWOR
 `trpc_metrics` 必须是 `NOSUPERUSER NOBYPASSRLS`，只允许执行
 `public.count_session_ready_backlog()`。
 
-### 7.7 IM Secret 文件
+### 7.8 IM Secret 文件
 
 创建四个无尾随空行的文件，权限 0600：
 
@@ -401,7 +415,7 @@ file:///run/secrets/im/feishu_encrypt_key
 file:///run/secrets/im/wecom_bot_secret
 ```
 
-### 7.8 内置基础设施 `infrastructure.env`
+### 7.9 内置基础设施 `infrastructure.env`
 
 默认 full-stack overlay 还需要一份只给 PostgreSQL、Redis、MinIO 与 bootstrap Job 使用的 Secret：
 
@@ -463,6 +477,14 @@ kubectl -n trpc-service create secret generic trpc-infrastructure-secrets \
   --dry-run=client -o yaml | kubectl apply --server-side -f -
 ```
 
+创建只给 Agent Worker 使用的模型文件 Secret：
+
+```bash
+kubectl -n trpc-service create secret generic trpc-model-secrets \
+  --from-file=model_api_key=/secure/trpc-service/model_api_key \
+  --dry-run=client -o yaml | kubectl apply --server-side -f -
+```
+
 创建 IM 文件 Secret：
 
 ```bash
@@ -521,6 +543,7 @@ kubectl apply --dry-run=server -f /tmp/trpc-render/production.yaml
 - 所有应用镜像均为同一个 `repository@sha256`。
 - Ingress、PostgreSQL、Redis、MinIO、Prometheus、OTel Collector、Prometheus Adapter 与 APIService。
 - `trpc-im-secrets` 只挂载到 Gateway、Worker、Channel Dispatcher、WeCom Connector。
+- `trpc-model-secrets` 只以 `/run/secrets/model_api_key` 挂载到 Agent Worker。
 - Gateway/Worker HPA、PDB、NetworkPolicy、backlog exporter 与 PVC 均存在。
 - production namespace、真实 OIDC/S3/OTLP 值，无 placeholder。
 
@@ -642,7 +665,50 @@ curl -i -X POST "$ADMIN_URL/v1/tenants" \
 保存响应 `ETag`。后续写操作每次先 GET 当前 tenant，使用最新 `ETag` 作为 `If-Match`，并使用新的
 `Idempotency-Key`。
 
-### 11.3 飞书 binding
+### 11.3 创建并激活真实模型配置
+
+复制并编辑 [租户配置模板](deploy/tenant-config.example.json)：
+
+- `provider` 可为 `openai`、`anthropic` 或 `litellm`；必须与实际 API 兼容。
+- `model` 替换为提供方账户确实可用的模型 ID。
+- `api_key_ref.uri` 保持 `file:///run/secrets/model_api_key`，除非部署已审查另一租户 Secret 路径。
+- 若填写 `base_url`，其 HTTPS 主机必须同时出现在 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS`。
+- `storage` 默认值对应仓库内置的 PostgreSQL/S3/pgvector 正式实现。
+
+创建 revision；服务端会注入 `tenant_id`、`app_id` 和递增的 `version`：
+
+```bash
+export ETAG='"1"'  # 替换为 GET tenant 返回的当前值
+
+curl -i -X POST \
+  "$ADMIN_URL/v1/tenants/tenant-example/config-revisions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Idempotency-Key: config-tenant-example-001' \
+  -H "If-Match: $ETAG" \
+  -H 'Content-Type: application/json' \
+  --data @deploy/tenant-config.example.json
+```
+
+保存响应中的 `version`，再次 GET tenant 取得新的 `ETag`，然后 100% 激活：
+
+```bash
+export CONFIG_VERSION='<VERSION_FROM_CREATE_RESPONSE>'
+export ETAG='"2"'  # 替换为最新值
+
+curl -i -X POST \
+  "$ADMIN_URL/v1/tenants/tenant-example/config-revisions/$CONFIG_VERSION:activate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Idempotency-Key: activate-tenant-example-001' \
+  -H "If-Match: $ETAG" \
+  -H 'Content-Type: application/json' \
+  --data '{"app_id":"support","percentage":100}'
+```
+
+不要把 `scripts/performance_fixture.py`、migration/fault bootstrap 中的 `provider=offline` 当成正式配置；它们
+刻意不调用外部模型。真实验收必须从飞书和企业微信分别发送不可预置的问题，确认回复不等于
+`offline deterministic response`，并在 Worker telemetry 中看到对应模型请求成功或明确失败。
+
+### 11.4 飞书 binding
 
 在飞书开放平台创建企业自建应用，启用机器人、加密事件回调、`im.message.receive_v1`、消息发送和媒体
 权限。App ID 放 `account_id`，Secret 只在 `trpc-im-secrets`：
@@ -679,7 +745,7 @@ https://agent.example.com/v1/channels/feishu/feishu-primary/callback
 完成 URL challenge、应用版本发布和可用范围审批，再用测试成员发送唯一 marker；必须只产生一条 Inbox
 和一条最终回复。
 
-### 11.4 企业微信 binding
+### 11.5 企业微信 binding
 
 企业微信使用“智能机器人 → API 模式 → 长连接”，不是群机器人 webhook，也不是普通自建应用
 CorpID/AgentID。Bot ID 放 `account_id`：
@@ -710,7 +776,7 @@ curl -i -X PUT \
 同时断开期间未送达服务的消息无法由应用恢复，必须记录 provider delivery gap，不能把恢复后的新消息
 冒充补投。
 
-### 11.5 多租户统一存储位置
+### 11.6 多租户统一存储位置
 
 正式配置分层如下：
 
@@ -718,6 +784,7 @@ curl -i -X PUT \
 | --- | --- | --- |
 | 集群级非敏感参数 | ConfigMap/Kustomize patch | 否 |
 | 数据库、Redis、S3、OIDC 私密值 | Kubernetes Secret/外部 Secret 管理器 | 是 |
+| 模型 API key | `trpc-model-secrets`，只挂载 Agent Worker | 是 |
 | 飞书/企业微信私密值 | `trpc-im-secrets` | 是 |
 | tenant、app、binding、account ID、能力、SecretRef | PostgreSQL 控制面表 | 否 |
 | release ID、source、image digest | candidate lock 与审计报告 | 否；nonce 原值不公开 |
@@ -726,7 +793,7 @@ curl -i -X PUT \
 binding 引用已批准的 Secret key。需要每租户独立凭据时，使用独立 Secret key/CSI 挂载路径并更新
 SecretRef；不要把所有租户合并成一个 JSON 明文表。
 
-### 11.6 多后端与 storage profile 的真实边界
+### 11.7 多后端与 storage profile 的真实边界
 
 `TenantConfig.storage.profile_id` 是 immutable config revision 的一部分，Worker 每次按
 `(tenant_id, profile_id, 完整 StorageSelection)` 路由；不同租户不需要 sticky session。内置正式镜像只
@@ -763,7 +830,7 @@ PostgreSQL：Worker 会失败关闭。`TRPC_SERVICE_STORAGE_PROFILE_REGISTRY_FIL
 组合。若高监管租户需要独立 PostgreSQL/S3/external-memory 资源，部署扩展必须用各自 SecretRef 构造不同
 `TenantDataServices` bundle，再按 exact tenant/profile 注册；仅修改数据库里的 backend 字符串不算完成。
 
-### 11.7 IM 出站能力矩阵
+### 11.8 IM 出站能力矩阵
 
 binding 的 `capabilities` 是配置声明/要求，当前不会单独执行发送授权，也不会扩大适配器已经实现的能力。
 发送权限应由租户策略与业务入口在创建 Outbox 前校验。当前两通道都能接收入站媒体；出站
