@@ -9,10 +9,11 @@ import hmac
 import inspect
 import json
 import os
+from collections.abc import Mapping
 from datetime import timedelta
 from importlib.metadata import version
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -29,6 +30,12 @@ from trpc_service.config import (
 )
 from trpc_service.log import configure_logging
 from trpc_service.version import __version__
+
+if TYPE_CHECKING:
+    from trpc_service.storage.services import (
+        RegisteredTenantServiceBundle,
+        TenantServiceFactory,
+    )
 
 app = typer.Typer(
     name="trpc-service",
@@ -411,6 +418,45 @@ async def _serve_admin(
     await _serve_uvicorn(server, stop_event)
 
 
+def _worker_tenant_service_factory(
+    repository: Any,
+    artifact_objects: Any | None,
+    *,
+    registered_profiles: Mapping[tuple[str, str], RegisteredTenantServiceBundle] | None = None,
+) -> TenantServiceFactory:
+    """Build the production default plus exact tenant/profile overrides.
+
+    The optional registry file can only bind the process's existing built-in
+    storage bundle.  Programmatic registrations are the extension point for
+    separately constructed physical backends.
+    """
+
+    from trpc_service.storage.services import (
+        CompositeTenantServiceFactory,
+        PostgresTenantServiceFactory,
+        TenantStorageProfileRegistry,
+    )
+
+    default_factory = PostgresTenantServiceFactory(
+        repository.pool,
+        repository=repository,
+        artifact_objects=artifact_objects,
+    )
+    registry_path = os.getenv("TRPC_SERVICE_STORAGE_PROFILE_REGISTRY_FILE", "").strip()
+    if registered_profiles is not None and registry_path:
+        raise ValueError("tenant storage profile registry source is ambiguous")
+    if registered_profiles is None and registry_path:
+        from trpc_service.storage.profile_registry import load_default_profile_registrations
+
+        registrations = load_default_profile_registrations(registry_path, default_factory)
+    else:
+        registrations = dict(registered_profiles or {})
+    return CompositeTenantServiceFactory(
+        TenantStorageProfileRegistry(registrations),
+        default_factory,
+    )
+
+
 async def _serve_worker(
     settings: ServiceSettings,
     secrets: LocalSecretProvider,
@@ -425,7 +471,6 @@ async def _serve_worker(
     from trpc_service.channels.feishu import FeishuAdapter
     from trpc_service.channels.media_locator import WeComMediaLocatorCipher
     from trpc_service.channels.wecom import WeComMediaDownloader
-    from trpc_service.storage.services import PostgresTenantServiceFactory
     from trpc_service.tenant.models import Channel
     from trpc_service.tool.confirmation import ConfirmationTokenService
     from trpc_service.tool.execution import ToolExecutor
@@ -504,10 +549,9 @@ async def _serve_worker(
             worker_id=worker_id,
             agent_loader=agent_loader,
             lease_for=timedelta(seconds=settings.lease_seconds),
-            service_factory=PostgresTenantServiceFactory(
-                runtime_repository.pool,
-                repository=runtime_repository,
-                artifact_objects=artifact_objects,
+            service_factory=_worker_tenant_service_factory(
+                runtime_repository,
+                artifact_objects,
             ),
             media_downloaders={
                 Channel.FEISHU: feishu,

@@ -39,6 +39,7 @@ from trpc_service.storage.services import (
     PostgresSummaryStore,
     PostgresTenantServiceFactory,
     ProfileServiceFactory,
+    RegisteredTenantServiceBundle,
     TenantDataServices,
     _decode,
 )
@@ -295,12 +296,14 @@ def test_model_aliases_and_secret_audit_validation() -> None:
 @pytest.mark.asyncio
 async def test_profile_factory_and_json_decode_edges() -> None:
     bundle = TenantDataServices(*([object()] * 6))  # type: ignore[arg-type]
-    factory = ProfileServiceFactory({("tenant-a", "profile"): bundle, "fallback": bundle})
+    selection = make_config().storage
+    registration = RegisteredTenantServiceBundle(selection=selection, services=bundle)
+    factory = ProfileServiceFactory({("tenant-a", "profile"): registration})
     assert await factory.for_context(make_context(), make_config()) is bundle
-    fallback = ProfileServiceFactory({"profile": bundle})
-    assert await fallback.for_context(make_context(), make_config()) is bundle
     with pytest.raises(ValueError, match="another tenant"):
-        await fallback.for_context(make_context("other"), make_config())
+        await factory.for_context(make_context("other"), make_config())
+    with pytest.raises(ValueError, match="registry key"):
+        ProfileServiceFactory({"profile": registration})  # type: ignore[dict-item]
     with pytest.raises(LookupError, match="unavailable"):
         await ProfileServiceFactory({}).for_context(make_context(), make_config())
     assert _decode('{"ok":true}') == {"ok": True}

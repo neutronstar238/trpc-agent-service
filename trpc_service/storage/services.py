@@ -17,10 +17,11 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import ClassVar, Protocol
+from typing import Protocol
 from uuid import UUID, uuid4
 
 import asyncpg
+from pydantic import ValidationError
 from trpc_agent_sdk.sessions import BaseSessionService
 
 from trpc_service.storage.models import SessionSnapshot, SummarySnapshot
@@ -34,7 +35,12 @@ from trpc_service.storage.protocols import (
     SessionStore,
     SummaryStore,
 )
-from trpc_service.tenant.models import TenantConfig, TenantContext
+from trpc_service.tenant.models import (
+    ProductionStorageSelection,
+    StorageSelection,
+    TenantConfig,
+    TenantContext,
+)
 
 JsonObject = dict[str, object]
 _LOGGER = logging.getLogger(__name__)
@@ -58,27 +64,84 @@ class TenantServiceFactory(Protocol):
     ) -> TenantDataServices: ...
 
 
-class ProfileServiceFactory:
-    """Resolve pre-registered immutable storage profiles.
+@dataclass(frozen=True, slots=True)
+class RegisteredTenantServiceBundle:
+    """One deployment-built bundle bound to an immutable storage selection."""
 
-    A profile object may be shared by tenants because all service methods still
-    receive the tenant id and apply tenant isolation. Deployments that need
-    physical isolation can register a profile under ``(tenant_id, profile)``.
+    selection: StorageSelection
+    services: TenantDataServices
+
+
+class TenantStorageProfileRegistry:
+    """Resolve only explicitly registered tenant/profile service bundles.
+
+    The registry stores constructed services, never connection strings or
+    secret references.  A registration is exact to one tenant and to the full
+    pinned ``StorageSelection`` so a later configuration revision cannot reuse
+    a bundle under the same profile id with different backend semantics.
     """
 
-    def __init__(self, profiles: Mapping[str | tuple[str, str], TenantDataServices]) -> None:
-        self._profiles = dict(profiles)
+    def __init__(
+        self,
+        profiles: Mapping[tuple[str, str], RegisteredTenantServiceBundle],
+    ) -> None:
+        validated: dict[tuple[str, str], RegisteredTenantServiceBundle] = {}
+        for key, registration in profiles.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or not all(isinstance(value, str) and value.strip() for value in key)
+            ):
+                raise ValueError("tenant storage profile registry key is invalid")
+            tenant_id, profile_id = key
+            if registration.selection.profile_id != profile_id:
+                raise ValueError("registered storage profile id does not match its registry key")
+            validated[(tenant_id, profile_id)] = registration
+        self._profiles = validated
 
-    async def for_context(self, context: TenantContext, config: TenantConfig) -> TenantDataServices:
+    def resolve(self, context: TenantContext, config: TenantConfig) -> TenantDataServices | None:
         if context.tenant_id != config.tenant_id:
             raise ValueError("storage configuration belongs to another tenant")
-        scoped = self._profiles.get((context.tenant_id, config.storage.profile_id))
-        if scoped is not None:
-            return scoped
-        try:
-            return self._profiles[config.storage.profile_id]
-        except KeyError as exc:
-            raise LookupError("tenant storage profile is unavailable") from exc
+        registration = self._profiles.get((context.tenant_id, config.storage.profile_id))
+        if registration is None:
+            return None
+        if registration.selection.model_dump() != config.storage.model_dump():
+            raise LookupError(
+                "registered tenant storage profile does not match the pinned configuration"
+            )
+        return registration.services
+
+
+class ProfileServiceFactory(TenantStorageProfileRegistry):
+    """Backward-compatible exact tenant/profile factory.
+
+    Global profile-name fallback was intentionally removed: every registration
+    includes the tenant id and the complete immutable storage selection.
+    """
+
+    async def for_context(self, context: TenantContext, config: TenantConfig) -> TenantDataServices:
+        registered = self.resolve(context, config)
+        if registered is None:
+            raise LookupError("tenant storage profile is unavailable")
+        return registered
+
+
+class CompositeTenantServiceFactory:
+    """Route an exact registered profile or use the production default factory."""
+
+    def __init__(
+        self,
+        registry: TenantStorageProfileRegistry,
+        default_factory: TenantServiceFactory,
+    ) -> None:
+        self._registry = registry
+        self._default_factory = default_factory
+
+    async def for_context(self, context: TenantContext, config: TenantConfig) -> TenantDataServices:
+        registered = self._registry.resolve(context, config)
+        if registered is not None:
+            return registered
+        return await self._default_factory.for_context(context, config)
 
 
 class PostgresSessionStore:
@@ -607,15 +670,9 @@ class PostgresTenantServiceFactory:
 
     This factory is deliberately narrow.  It must not silently replace a
     tenant's configured backend with PostgreSQL: alternative selections are
-    resolved by :class:`ProfileServiceFactory` using a pre-registered bundle.
+    resolved by :class:`TenantStorageProfileRegistry` using a pre-registered
+    exact tenant/profile bundle.
     """
-
-    _EXPECTED_BACKENDS: ClassVar[dict[str, str]] = {
-        "session_backend": "postgresql",
-        "memory_backend": "postgresql",
-        "artifact_backend": "s3",
-        "knowledge_backend": "pgvector",
-    }
 
     def __init__(
         self,
@@ -633,15 +690,27 @@ class PostgresTenantServiceFactory:
     async def for_context(self, context: TenantContext, config: TenantConfig) -> TenantDataServices:
         if context.tenant_id != config.tenant_id:
             raise ValueError("storage configuration belongs to another tenant")
-        self._validate_storage_selection(config)
-        profile = config.storage.profile_id
+        return self.build_bundle(config.storage)
+
+    def build_bundle(self, selection: StorageSelection) -> TenantDataServices:
+        """Build the built-in production bundle for one validated profile."""
+
+        try:
+            configured = ProductionStorageSelection.model_validate(selection.model_dump())
+        except ValidationError as exc:
+            fields = sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+            raise ValueError(
+                "PostgresTenantServiceFactory cannot satisfy configured storage backends: "
+                + ", ".join(fields)
+            ) from exc
+        profile = configured.profile_id
         dimension = self._profile_dimensions.get(profile, 1536)
         if dimension != 1536:
             raise ValueError("pgvector storage profiles must use exactly 1536 dimensions")
         if self._artifact_objects is None:
             raise LookupError(
                 "configured S3 artifact backend is unavailable; inject an object store "
-                "or register the profile with ProfileServiceFactory"
+                "or register an exact tenant profile with TenantStorageProfileRegistry"
             )
         artifact = PostgresArtifactStore(self._pool, self._artifact_objects)
         return TenantDataServices(
@@ -653,23 +722,9 @@ class PostgresTenantServiceFactory:
             audit=PostgresAuditStore(self._pool),
         )
 
-    @classmethod
-    def _validate_storage_selection(cls, config: TenantConfig) -> None:
-        configured = config.storage
-        mismatches = [
-            f"{field}={getattr(configured, field)!r} (requires {expected!r})"
-            for field, expected in cls._EXPECTED_BACKENDS.items()
-            if getattr(configured, field) != expected
-        ]
-        if mismatches:
-            raise ValueError(
-                "PostgresTenantServiceFactory cannot satisfy configured storage backends: "
-                + ", ".join(mismatches)
-                + "; register an alternative bundle with ProfileServiceFactory"
-            )
-
 
 __all__ = [
+    "CompositeTenantServiceFactory",
     "PostgresArtifactStore",
     "PostgresAuditStore",
     "PostgresKnowledgeStore",
@@ -678,6 +733,8 @@ __all__ = [
     "PostgresSummaryStore",
     "PostgresTenantServiceFactory",
     "ProfileServiceFactory",
+    "RegisteredTenantServiceBundle",
     "TenantDataServices",
     "TenantServiceFactory",
+    "TenantStorageProfileRegistry",
 ]

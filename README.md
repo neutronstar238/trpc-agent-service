@@ -5,9 +5,11 @@
 接入、事务型 Session、无状态 Worker、租户隔离、运维治理和可观测性。原始需求归档在
 [docs/requirements.md](docs/requirements.md)。
 
-本文既是项目入口，也是正式部署模板。正式版的 Gateway、Admin、Worker、两个 IM 通道、后台任务、
-数据依赖与观测组件均属于同一 Kubernetes/ACK 部署。`deploy/yqzl` 只保留为临时联调兼容资产，不是正式
-生产拓扑，也不应承载性能或发布门禁。
+本文既是项目入口，也是正式部署模板。默认 production overlay 在同一个 Kubernetes/ACK namespace 中
+部署 Gateway、Admin、Worker、两个 IM 通道、后台任务、Ingress、PostgreSQL/pgvector、Redis、MinIO、
+Prometheus、Prometheus Adapter 与 OpenTelemetry Collector。托管数据库、缓存、对象存储或观测平台仍可
+替换这些内置组件，但必须使用受审查的 managed-services patch；不能一边删除内置依赖，一边继续声称默认
+模板能够独立运行。仓库中的主机联调资产只用于历史兼容，不属于正式部署入口。
 
 ## 1. 已实现能力
 
@@ -29,21 +31,29 @@
 | 模式 | 用途 | 配置入口 | 是否为正式部署 |
 | --- | --- | --- | --- |
 | 本地 Docker Compose | 开发、功能联调、离线故障测试 | `.env` | 否 |
-| Kubernetes/ACK production overlay | 完整服务、真实 IM、HPA、迁移、性能与发布验收 | Kustomize + Kubernetes Secret | 是 |
-| yqzl 临时联调 | 已有域名/测试账号的短期 IM 验证 | `deploy/yqzl` | 否 |
+| Kubernetes/ACK production overlay | 完整应用、Ingress、数据依赖、观测、真实 IM、HPA、迁移与发布验收 | Kustomize + Kubernetes Secret | 是 |
 
-正式部署只采用第二行。不要把 yqzl 的主机路径、systemd、宝塔 PostgreSQL 或临时测试域名复制进正式
-集群配置。
+正式部署只采用第二行。主机路径、systemd、面板数据库或临时测试域名都不得复制进正式集群配置。
 
 ## 3. 正式配置包的组成
 
 本项目使用 Kustomize，不再引入另一套会产生配置漂移的 `values.yaml`。一个环境的正式输入由两份
-非敏感文件和五类 Secret 组成：
+非敏感文件和六类 Secret（五份 env Secret + 一份 IM 文件 Secret）组成：
 
 ```text
 deploy/kustomize/overlays/production/
 ├── kustomization.yaml                 # namespace、资源、镜像仓库和不可变 digest
 ├── production-config-patch.yaml       # OIDC、S3、模型主机、调度器等非敏感设置
+├── infrastructure-config.yaml         # PostgreSQL bootstrap、Prometheus、OTel 配置
+├── infrastructure-services.yaml       # 集群内数据与观测 Service
+├── infrastructure-statefulsets.yaml   # PostgreSQL/Redis/MinIO/Prometheus + PVC
+├── infrastructure-workloads.yaml      # OTel Collector、MinIO bucket bootstrap
+├── infrastructure-network-policy.yaml # 数据与观测最小网络边界
+├── prometheus-adapter.yaml             # external metrics API、RBAC、Adapter
+├── ingress.yaml                        # Gateway HTTPS 入口
+├── deployment-order-patch.yaml         # Argo CD 依赖创建顺序
+├── migration-order-patch.yaml          # 首次部署迁移等待与顺序
+├── managed-services-patch.example.yaml # 可选：删除内置依赖并改接托管服务
 ├── replicas-patch.yaml                # 固定副本基线
 ├── wecom-ha-patch.yaml                # 企业微信连接器跨节点约束
 ├── im-secret-mounts-patch.yaml        # IM Secret 只挂载给需要的角色
@@ -54,6 +64,7 @@ deploy/kustomize/overlays/production/
 ├── worker.env                         # 跨租户 worker 数据库身份
 ├── migration.env                      # schema owner/迁移身份
 ├── metrics.env                        # 只读 backlog 指标身份
+├── infrastructure.env                 # 内置 PG/Redis/MinIO bootstrap 凭据
 └── im/
     ├── feishu_app_secret
     ├── feishu_verification_token
@@ -61,7 +72,7 @@ deploy/kustomize/overlays/production/
     └── wecom_bot_secret
 ```
 
-`kustomization.yaml` 与 `production-config-patch.yaml` 可以放在受审查的私有部署仓库；五类 Secret 只能
+`kustomization.yaml` 与 `production-config-patch.yaml` 可以放在受审查的私有部署仓库；六类 Secret 只能
 进入 Vault、KMS、ExternalSecret 或权限为 0600 的仓库外文件，不能提交到本项目。
 
 ## 4. 通用准备与安全规则
@@ -73,8 +84,10 @@ deploy/kustomize/overlays/production/
 - 本地开发推荐 [uv](https://docs.astral.sh/uv/)。
 - Kubernetes 1.29+、`kubectl` 和内置 Kustomize；ACK 使用受支持版本。
 - 首次使用裸 `kubectl` 部署时建议安装 `yq` v4，用于安全拆分迁移和工作负载。
-- PostgreSQL 16+，提供 `pgcrypto` 与 `vector` 扩展；Redis 7.4+；S3 兼容对象存储。
-- 生产必须有 OIDC issuer/audience、Ingress Controller、TLS 和 External Metrics provider。
+- 默认 overlay 自带 PostgreSQL/pgvector、Redis、MinIO、Prometheus、OTel Collector 与 External Metrics
+  provider；存储类必须能动态供应 `ReadWriteOnce` PVC。
+- 集群仍需提供真实 OIDC issuer/audience、Ingress Controller、DNS 与 TLS Secret；应用调用的模型和 IM
+  平台是经出口策略批准的外部服务，不属于集群内组件。
 
 初始化开发环境：
 
@@ -111,7 +124,7 @@ uv run trpc-service doctor --output runs\multitenant\sdk-upgrade.json
 - `file:///absolute/path`：读取绝对路径文件；租户 Secret 必须在
   `TRPC_SERVICE_TENANT_SECRET_ROOT` 下。
 - `.env`：只用于本地 Compose。
-- Kubernetes：非敏感项放 ConfigMap，敏感项放五类 Secret。
+- Kubernetes：非敏感项放 ConfigMap，敏感项放上述六类 Secret。
 
 生产禁止 `literal://`。环境专用配置必须覆盖所有 `example.*`、`samples.*`、`REPLACE_*` 值。
 
@@ -268,8 +281,24 @@ images:
     digest: sha256:<CURRENT_INITIAL_DIGEST>
 ```
 
-保留资源：base、namespace、`im-external-egress`；保留四个 patch：replicas、production config、WeCom HA、
-IM Secret mounts。不要在这里写 registry token 或机器人 Secret。
+保留 base、namespace、`im-external-egress`、全部 `infrastructure-*`、`prometheus-adapter.yaml` 与
+`ingress.yaml`；保留 replicas、production config、WeCom HA、IM Secret mounts、deployment order 和
+migration order patch。不要在这里写 registry token 或机器人 Secret。
+
+默认渲染的正式拓扑是：
+
+| 层 | 默认资源 | 网络暴露 |
+| --- | --- | --- |
+| 入口 | `trpc-gateway` Ingress/Service | 仅 Gateway 公网 HTTPS；Admin 保持内网 |
+| 权威数据 | pgvector/PostgreSQL StatefulSet + PVC | 仅 namespace 内 5432 |
+| 通知/投影 | Redis StatefulSet + PVC | 仅 namespace 内 6379；不是权威 Session |
+| 对象存储 | MinIO StatefulSet + PVC + bucket bootstrap Job | 仅 namespace 内 9000；Console 不暴露 |
+| 遥测 | OTel Collector、Prometheus StatefulSet + PVC | 仅集群内 |
+| 弹性 | backlog exporter、Prometheus Adapter、External Metrics APIService、HPA | 仅 Kubernetes API/集群内 |
+
+这些镜像均在清单中固定为 `registry/repository@sha256:<digest>`。默认模板是单副本数据依赖，适合完整功能
+验收和单集群部署；生产高可用需要把数据层替换为多可用区托管服务或有明确复制/备份策略的 operator，不能
+把单副本 PVC 当成跨区灾备。
 
 ### 7.2 `production-config-patch.yaml`：非敏感设置
 
@@ -286,9 +315,9 @@ data:
   TRPC_SERVICE_CAPTURE_CONTENT: "false"
   TRPC_SERVICE_OIDC_ISSUER: https://<OIDC_HOST>/
   TRPC_SERVICE_OIDC_AUDIENCE: <OIDC_AUDIENCE>
-  TRPC_SERVICE_S3_ENDPOINT: https://<PRIVATE_S3_OR_OSS_ENDPOINT>
-  TRPC_SERVICE_S3_BUCKET: <PRIVATE_BUCKET>
-  TRPC_SERVICE_OTLP_ENDPOINT: http://<COLLECTOR>.<NAMESPACE>.svc.cluster.local:4317
+  TRPC_SERVICE_S3_ENDPOINT: http://minio:9000
+  TRPC_SERVICE_S3_BUCKET: trpc-artifacts
+  TRPC_SERVICE_OTLP_ENDPOINT: http://otel-collector:4317
   TRPC_SERVICE_MODEL_ENDPOINT_HOSTS: '["api.openai.com"]'
   TRPC_SERVICE_TENANT_SECRET_ROOT: /run/secrets
   TRPC_SERVICE_TENANT_SECRET_ENV_NAMES: "[]"
@@ -301,9 +330,10 @@ data:
   TRPC_SERVICE_WORKER_CONCURRENCY: "10"
 ```
 
-不要保留 `samples.auth0.com`、`example.internal` 或与实际区域不符的 S3 endpoint。模型主机列表是出口
-白名单，不是模型 Secret。飞书正常运行必须保持官方 API root；只有独立在线验收 witness 才可在显式
-启用 online tests 时临时覆盖。
+默认内置依赖时保留 `minio` 与 `otel-collector` 的集群内地址；只有使用
+`managed-services-patch.example.yaml` 时才替换为托管 endpoint。无论哪种模式，都不要保留
+`samples.auth0.com`、`example.internal` 或 `REPLACE_*`。模型主机列表是出口白名单，不是模型 Secret。
+飞书正常运行必须保持官方 API root；只有独立在线验收 witness 才可在显式启用 online tests 时临时覆盖。
 
 ### 7.3 运行时 `service.env`
 
@@ -371,6 +401,36 @@ file:///run/secrets/im/feishu_encrypt_key
 file:///run/secrets/im/wecom_bot_secret
 ```
 
+### 7.8 内置基础设施 `infrastructure.env`
+
+默认 full-stack overlay 还需要一份只给 PostgreSQL、Redis、MinIO 与 bootstrap Job 使用的 Secret：
+
+```dotenv
+postgres_superuser_password=<RANDOM_POSTGRES_SUPERUSER_PASSWORD>
+runtime_database_password=<SAME_RAW_PASSWORD_AS_service.env_RUNTIME_DSN>
+migration_database_password=<SAME_RAW_PASSWORD_AS_migration.env_DSN>
+worker_database_password=<SAME_RAW_PASSWORD_AS_worker.env_DSN>
+metrics_database_password=<SAME_RAW_PASSWORD_AS_metrics.env_DSN>
+redis_password=<SAME_RAW_PASSWORD_AS_service.env_REDIS_URL>
+minio_root_user=<RANDOM_MINIO_ROOT_USER>
+minio_root_password=<RANDOM_MINIO_ROOT_PASSWORD>
+minio_application_user=<RANDOM_NON_ROOT_MINIO_APPLICATION_USER>
+minio_application_password=<RANDOM_NON_ROOT_MINIO_APPLICATION_PASSWORD>
+```
+
+这里相同角色的值必须逐字一致；DSN 中仍使用 URL-encoded 版本。内置 MinIO bootstrap 会创建
+`trpc-artifacts` bucket、受限 application user 和只覆盖该 bucket 的读写 policy。`service.env` 的
+`TRPC_SERVICE_S3_ACCESS_KEY`/`TRPC_SERVICE_S3_SECRET_KEY` 必须分别等于
+`minio_application_user`/`minio_application_password`；MinIO root 凭据只挂载给 MinIO 与 bootstrap，
+应用 Pod 不得使用或挂载 root 身份。
+
+若使用托管 PostgreSQL/Redis/S3/OTel/Prometheus，创建一个环境 overlay 引用 production，并把
+`managed-services-patch.example.yaml` 加入 `patches`。该 patch 会删除内置 StatefulSet、PVC 模板对应
+工作负载、Adapter/APIService 与 PostgreSQL 等待器；随后必须在 Secret/ConfigMap 中提供托管地址，并在
+启用 Worker HPA 前安装能提供 `trpc_session_ready_backlog` 的 External Metrics provider。子 overlay 还
+必须按托管 endpoint 的实际 CIDR/FQDN/端口补充 egress 与 metrics scrape/adapter policy；默认规则只允许
+私网 CIDR 的 5432/6379/9000/4317/4318/443，不能假定公网托管服务或任意 namespace 自动可达。
+
 ## 8. 创建 Kubernetes Secret
 
 先创建 namespace：
@@ -379,7 +439,7 @@ file:///run/secrets/im/wecom_bot_secret
 kubectl apply -f deploy/kustomize/overlays/production/namespace.yaml
 ```
 
-创建四份 env Secret：
+创建五份 env Secret：
 
 ```bash
 kubectl -n trpc-service create secret generic trpc-service-secrets \
@@ -396,6 +456,10 @@ kubectl -n trpc-service create secret generic trpc-migration-secrets \
 
 kubectl -n trpc-service create secret generic trpc-metrics-secrets \
   --from-env-file=/secure/trpc-service/metrics.env \
+  --dry-run=client -o yaml | kubectl apply --server-side -f -
+
+kubectl -n trpc-service create secret generic trpc-infrastructure-secrets \
+  --from-env-file=/secure/trpc-service/infrastructure.env \
   --dry-run=client -o yaml | kubectl apply --server-side -f -
 ```
 
@@ -427,9 +491,11 @@ kubernetes:
   pull_registry: docker.io
 ```
 
-镜像加速在 ACK 节点池/containerd 侧配置，不把清单仓库改成镜像站域名。这样节点通过加速器拉取，
-candidate lock、Pod `imageID` 和证据仍绑定 Docker Hub 原始 digest。创建或扩容节点池后，先在新节点用
-同一 digest 做小 Pod 拉取并核对 `imageID`，避免只在旧节点有缓存。
+镜像加速在 ACK 节点池/containerd 侧配置，不把清单仓库改成镜像站域名。production overlay 的默认
+应用与基础设施镜像均使用 `docker.io/...@sha256`；Prometheus Adapter 使用已同步到 Docker Hub 的固定
+support digest。这样节点通过轩辕加速拉取，candidate lock、Pod `imageID` 和证据仍绑定 Docker Hub
+原始 digest。创建或扩容节点池后，先在新节点用每个不同 digest 做小 Pod 拉取并核对 `imageID`，避免
+只在旧节点有缓存。
 
 私有仓库需创建 `kubernetes.io/dockerconfigjson` Secret，并把
 `image-pull-secret-patch.example.yaml` 复制为环境 patch 后加入 `kustomization.yaml`。不要把解码后的凭据
@@ -453,28 +519,41 @@ kubectl apply --dry-run=server -f /tmp/trpc-render/production.yaml
 确认渲染结果包含：
 
 - 所有应用镜像均为同一个 `repository@sha256`。
+- Ingress、PostgreSQL、Redis、MinIO、Prometheus、OTel Collector、Prometheus Adapter 与 APIService。
 - `trpc-im-secrets` 只挂载到 Gateway、Worker、Channel Dispatcher、WeCom Connector。
-- Gateway/Worker HPA、PDB、NetworkPolicy、backlog exporter 均存在。
+- Gateway/Worker HPA、PDB、NetworkPolicy、backlog exporter 与 PVC 均存在。
 - production namespace、真实 OIDC/S3/OTLP 值，无 placeholder。
 
 ### 10.2 先迁移后启动
 
-Argo CD 会把 migration Job 作为 `PreSync`。使用裸 `kubectl` 首次部署时，用 `yq` v4 拆分：
+production overlay 已把旧 migration `PreSync` 改成可重建的 `Sync` hook：内置
+PostgreSQL/Redis/MinIO 及其 Service 使用 Argo CD sync wave `-2`，schema migration 与 MinIO bootstrap
+使用带 `BeforeHookCreation,HookSucceeded` 清理策略的 wave `-1` Sync hook，应用使用默认 wave `0`。
+migration 另有最多 300 秒的 `pg_isready` init wait；这样首次部署不会在 PostgreSQL 创建前抢跑，后续候选
+改变 Job Pod template 时也不会尝试原地修改已完成的不可变 Job。
+
+使用裸 `kubectl` 首次部署时仍应显式分阶段并等待 StatefulSet：
 
 ```bash
-yq eval 'select(.kind != "Deployment" and .kind != "HorizontalPodAutoscaler" and .kind != "Job")' \
+yq eval 'select(.kind != "Deployment" and .kind != "HorizontalPodAutoscaler" and .kind != "Job" and .kind != "Ingress")' \
   /tmp/trpc-render/production.yaml >/tmp/trpc-render/prerequisites.yaml
-yq eval 'select(.kind == "Job" and .metadata.name == "trpc-schema-migration")' \
-  /tmp/trpc-render/production.yaml >/tmp/trpc-render/migration.yaml
-yq eval 'select(.kind == "Deployment" or .kind == "HorizontalPodAutoscaler")' \
+yq eval 'select(.kind == "Job")' \
+  /tmp/trpc-render/production.yaml >/tmp/trpc-render/bootstrap.yaml
+yq eval 'select(.kind == "Deployment" or .kind == "HorizontalPodAutoscaler" or .kind == "Ingress")' \
   /tmp/trpc-render/production.yaml >/tmp/trpc-render/workloads.yaml
 
 kubectl apply --server-side -f /tmp/trpc-render/prerequisites.yaml
-kubectl -n trpc-service delete job trpc-schema-migration --ignore-not-found
-kubectl apply --server-side -f /tmp/trpc-render/migration.yaml
+kubectl -n trpc-service rollout status statefulset/postgres --timeout=10m
+kubectl -n trpc-service rollout status statefulset/redis --timeout=10m
+kubectl -n trpc-service rollout status statefulset/minio --timeout=10m
+kubectl -n trpc-service delete job trpc-schema-migration minio-bootstrap --ignore-not-found
+kubectl apply --server-side -f /tmp/trpc-render/bootstrap.yaml
 kubectl -n trpc-service wait --for=condition=complete \
   job/trpc-schema-migration --timeout=1800s
+kubectl -n trpc-service wait --for=condition=complete \
+  job/minio-bootstrap --timeout=10m
 kubectl -n trpc-service logs job/trpc-schema-migration
+kubectl -n trpc-service logs job/minio-bootstrap
 kubectl apply --server-side -f /tmp/trpc-render/workloads.yaml
 kubectl apply --server-side -f /tmp/trpc-render/production.yaml
 ```
@@ -507,8 +586,9 @@ Pod 长时间 `Pending` 时检查 node label、affinity、taint/toleration、配
 
 ### 11.1 Ingress
 
-Gateway Service 为 `trpc-gateway:8080`，Admin 为 `trpc-admin:8081`。生产应在私有部署仓库添加 Ingress；
-示例：
+Gateway Service 为 `trpc-gateway:8080`，Admin 为 `trpc-admin:8081`。默认清单已包含
+`deploy/kustomize/overlays/production/ingress.yaml`；部署前必须把其中的 `trpc.example.com`、
+`ingressClassName` 与 `trpc-gateway-tls` 改成真实值。其等价结构如下：
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -538,8 +618,10 @@ Admin 建议使用独立内网域名、VPN 或零信任访问。不要暴露 Pos
 metrics 管理端口。
 
 飞书回调必须公网 HTTPS 可达，证书链完整；企业微信只需要 connector 出站访问
-`wss://openws.work.weixin.qq.com:443`。production overlay 的 IM egress 仅选择 Channel Dispatcher 和
-WeCom Connector；支持 FQDN policy 的 CNI 应把 `0.0.0.0/0:443` 替换为审核后的供应商域名。
+`wss://openws.work.weixin.qq.com:443`。production overlay 有两条独立的角色级 HTTPS fallback：IM policy
+只选择 Channel Dispatcher/WeCom Connector；OIDC/model/tool policy 只选择 Gateway/Admin/Worker。标准
+NetworkPolicy 不能表达 FQDN，因此默认目标为 `0.0.0.0/0:443`；支持 FQDN policy 的 CNI 必须分别替换为
+审核后的飞书/企业微信、OIDC、模型和工具域名，不能扩展到其他 Pod 或其他端口。
 
 ### 11.2 创建租户
 
@@ -583,7 +665,7 @@ curl -i -X PUT \
       "verification_token":{"uri":"file:///run/secrets/im/feishu_verification_token"},
       "encrypt_key":{"uri":"file:///run/secrets/im/feishu_encrypt_key"}
     },
-    "capabilities":["media","proactive"],
+    "capabilities":["text","proactive"],
     "enabled":true
   }'
 ```
@@ -618,7 +700,7 @@ curl -i -X PUT \
     "secret_refs":{
       "bot_secret":{"uri":"file:///run/secrets/im/wecom_bot_secret"}
     },
-    "capabilities":["media","proactive"],
+    "capabilities":["text","proactive"],
     "enabled":true
   }'
 ```
@@ -644,6 +726,58 @@ curl -i -X PUT \
 binding 引用已批准的 Secret key。需要每租户独立凭据时，使用独立 Secret key/CSI 挂载路径并更新
 SecretRef；不要把所有租户合并成一个 JSON 明文表。
 
+### 11.6 多后端与 storage profile 的真实边界
+
+`TenantConfig.storage.profile_id` 是 immutable config revision 的一部分，Worker 每次按
+`(tenant_id, profile_id, 完整 StorageSelection)` 路由；不同租户不需要 sticky session。内置正式镜像只
+实现下列组合：
+
+| 数据域 | 内置正式后端 | 说明 |
+| --- | --- | --- |
+| Session / Memory / Summary / Audit | PostgreSQL | 权威状态、事务和 RLS/fencing |
+| Artifact metadata / object | PostgreSQL / S3-compatible | 默认对象端为同集群 MinIO |
+| Knowledge | PostgreSQL + pgvector | 内置维度固定 1536 |
+| Redis | 仅 SessionReady 通知和可重建投影 | 不能声明为权威 Session/Memory |
+| InMemory | 仅单进程开发/测试 | 不能进入内置 production fallback |
+| external memory/vector | `RegisteredTenantServiceBundle` 扩展口 | 必须由部署代码预构造并显式注册 |
+
+这意味着宽泛 `StorageSelection` 可以描述迁移源/目标和外部适配器，但未注册的组合不会静默退回
+PostgreSQL：Worker 会失败关闭。`TRPC_SERVICE_STORAGE_PROFILE_REGISTRY_FILE` 是可选、严格且无 Secret
+的 JSON，只能把 tenant/profile 绑定到当前进程已经配置好的内置 bundle；它不能携带 DSN，也不能把同一
+物理 pool 冒充成独立后端：
+
+```json
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "tenant_id": "tenant-example",
+      "profile_id": "default",
+      "bundle": "default_postgresql_s3_pgvector"
+    }
+  ]
+}
+```
+
+文件必须是绝对路径、非符号链接、最大 64 KiB。标准内置部署不设置它，因为 default fallback 已覆盖上述
+组合。若高监管租户需要独立 PostgreSQL/S3/external-memory 资源，部署扩展必须用各自 SecretRef 构造不同
+`TenantDataServices` bundle，再按 exact tenant/profile 注册；仅修改数据库里的 backend 字符串不算完成。
+
+### 11.7 IM 出站能力矩阵
+
+binding 的 `capabilities` 是配置声明/要求，当前不会单独执行发送授权，也不会扩大适配器已经实现的能力。
+发送权限应由租户策略与业务入口在创建 Outbox 前校验。当前两通道都能接收入站媒体；出站
+则是严格 text-only：
+
+| 通道 | text/proactive | stream | card | outbound media | recall | 自动长度拆分 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 飞书 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 企业微信 AI Bot | 支持（markdown body） | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+
+`recall()` 对两通道都返回非重试的 `FAILED/unsupported_capability`，不会请求供应商。当前 delivery attempt
+没有持久化分片游标；长文本若在适配器内部分片，部分成功后整条重试会制造重复消息，因此代码不做隐式
+拆分，也不声称未知的供应商长度上限。企业微信 markdown 仍是文本，不作为 card。
+
 更完整的通道权限、媒体、群聊、幂等和故障语义见 [IM 通道文档](docs/im-channels.md)。
 
 ## 12. 生产运行参数参考
@@ -664,6 +798,7 @@ SecretRef；不要把所有租户合并成一个 JSON 明文表。
 | `TRPC_SERVICE_REDIS_RECLAIM_AFTER_MS` | `60000` | 与 lease/恢复策略一致 |
 | `TRPC_SERVICE_TENANT_SECRET_ROOT` | `/run/secrets` | file SecretRef 根目录 |
 | `TRPC_SERVICE_TENANT_SECRET_ENV_NAMES` | `[]` | 使用文件 Secret 时保持 fail-closed |
+| `TRPC_SERVICE_STORAGE_PROFILE_REGISTRY_FILE` | 默认不设置 | 可选的绝对路径、无 Secret、内置 bundle 精确绑定文件 |
 | `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` | 审批后的 JSON 数组 | 阻止租户任意模型出口 |
 | `TRPC_SERVICE_FEISHU_ALLOW_STALE_BINDING_CACHE` | `false` | 生产不得放宽 |
 | `TRPC_SERVICE_FEISHU_SEND_API_ROOT` | `https://open.feishu.cn` | 正常运行固定官方地址 |
@@ -730,6 +865,11 @@ kubectl -n trpc-service rollout status deploy/trpc-gateway --timeout=10m
 - 先滚动/重连一小部分实例，验证供应商 ACK，再完成其余实例。
 - Emergency Queue key 按版本双读窗口轮换；不能直接覆盖后立即删除旧 key。
 - Ed25519 IM probe trust 轮换后旧在线报告失效，必须重跑真实门禁。
+- 内置 PostgreSQL 的角色脚本只在空 PVC 初始化时执行。已有 PVC 轮换密码时，先由受控管理会话执行
+  `ALTER ROLE ... PASSWORD ...`，再原子更新对应 Secret/DSN 并滚动依赖 Pod；只改 Secret 不会修改数据库
+  中的角色密码。
+- MinIO application password 会在重跑 bootstrap Job 时收敛；bucket policy 内容变化时必须同步升级
+  `trpc-artifacts-rw-v1` 的版本化名称并重新附加，不能在原名称下静默修改后期待 Job 覆盖已有 policy。
 
 ## 15. 测试与完成定义
 

@@ -6,7 +6,7 @@ import ipaddress
 from collections.abc import Collection
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -197,6 +197,14 @@ class MediaPolicy(ImmutableModel):
 
 
 class StorageSelection(ImmutableModel):
+    """Descriptive storage selection used by revisions and migration evidence.
+
+    Production workers must validate this value as a
+    :class:`ProductionStorageSelection` before constructing built-in services.
+    The wider backend vocabulary is retained here for offline migration source
+    descriptions; it does not imply a runnable adapter exists.
+    """
+
     profile_id: str
     session_backend: str = "postgresql"
     memory_backend: str = "postgresql"
@@ -207,6 +215,15 @@ class StorageSelection(ImmutableModel):
     @classmethod
     def validate_backend(cls, value: str) -> str:
         return validate_storage_backend(value)
+
+
+class ProductionStorageSelection(StorageSelection):
+    """Storage backends implemented by the built-in production worker."""
+
+    session_backend: Literal["postgresql"] = "postgresql"
+    memory_backend: Literal["postgresql"] = "postgresql"
+    artifact_backend: Literal["s3"] = "s3"
+    knowledge_backend: Literal["pgvector"] = "pgvector"
 
 
 class TenantConfig(ImmutableModel):
@@ -283,6 +300,7 @@ __all__ = [
     "ConversationKind",
     "MediaPolicy",
     "ModelPolicy",
+    "ProductionStorageSelection",
     "StorageSelection",
     "TenantConfig",
     "TenantContext",

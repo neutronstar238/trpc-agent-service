@@ -1,5 +1,12 @@
 # Production overlay
 
+This overlay is a self-contained single-cluster default: it renders the tRPC
+application roles, Gateway Ingress, pgvector/PostgreSQL, Redis, MinIO,
+OpenTelemetry Collector, Prometheus and Prometheus Adapter.  Stateful data uses
+retained `ReadWriteOnce` PVCs.  It is a complete functional deployment, not a
+claim of cross-zone data-layer HA; use a reviewed operator or managed services
+for that requirement.
+
 The overlay intentionally references a pre-created Secret named
 `trpc-service-secrets` and a separate `trpc-worker-secrets`; no credential is
 stored in this repository. Populate them from an ExternalSecret/Vault/KMS
@@ -58,6 +65,25 @@ only `TRPC_SERVICE_METRICS_DATABASE_DSN`.  It must connect as the dedicated
 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS` and can execute
 only `public.count_session_ready_backlog()`.  Do not reuse the worker DSN.
 
+The bundled data services require a sixth Secret named
+`trpc-infrastructure-secrets`.  Its exact keys are listed in
+`../../base/secrets.example.yaml`: PostgreSQL superuser and four application
+role passwords, Redis password, MinIO root credentials, and a separate MinIO
+application identity.  Role passwords must match the raw values encoded in the
+four DSNs.  The MinIO bootstrap creates a bucket-scoped read/write policy for
+the application identity; `trpc-service-secrets` must use that identity for S3,
+while root credentials remain mounted only by MinIO and the bootstrap Job.  The
+rendered manifests never contain this Secret or any credential value.
+
+PostgreSQL role initialization runs only for an empty PVC.  On an existing
+database, rotate each role with a controlled `ALTER ROLE ... PASSWORD ...`
+operation before atomically updating its Secret/DSN and rolling dependent
+Pods; changing the Secret alone does not change the database role.  The MinIO
+bootstrap converges the application password on every rebuild.  Its bucket
+policy name is deliberately versioned (`trpc-artifacts-rw-v1`): whenever the
+policy document changes, bump that name and reattach it instead of expecting an
+existing policy with the same name to be overwritten.
+
 The ConfigMap also sets an explicit tenant-secret policy: file references are
 confined to `/run/secrets`, the environment allowlist is empty by default, and
 `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` must be replaced with the reviewed model
@@ -67,38 +93,62 @@ is disabled.  Emergency queue keys are versioned with
 `TRPC_SERVICE_EMERGENCY_QUEUE_PREVIOUS_KEY_REFS` only while each referenced
 previous key is present in the Secret and being retired.
 
-Replace the example image name/digest and the managed service endpoints in
-`../../base/config.yaml` (or add an environment-specific patch) before
-applying. The runtime account is expected to be a non-owner PostgreSQL role;
+Replace the example application image name/digest, OIDC values and Ingress
+host/TLS settings before applying.  The default S3 and OTLP endpoints are the
+bundled `minio` and `otel-collector` Services.  To use managed dependencies,
+create a child overlay that applies `managed-services-patch.example.yaml`,
+replace its endpoint placeholders, supply managed DSNs in the external
+Secrets, and install another provider for `trpc_session_ready_backlog` before
+enabling the worker HPA. That child overlay must also add endpoint-specific
+egress and metrics scrape/adapter policies; the default only permits managed
+private CIDRs on 5432/6379/9000/4317/4318/443 and does not make public services
+or arbitrary namespaces reachable. The runtime account is expected to be a non-owner PostgreSQL role;
 database migrations run separately with the `migrate` role. The production
 runtime gate rejects tag-only images, `example.*` endpoints, and placeholder
 digests.
 
 The worker capacity envelope is explicit: the production overlay sets
 `TRPC_SERVICE_WORKER_CONCURRENCY=10` and the HPA allows 20 worker replicas,
-which is a maximum 200 concurrent-turn envelope. A Prometheus Adapter (or
-KEDA implementation) must expose `trpc_session_ready_backlog`; CPU-only HPA
-evidence is insufficient and keeps the runtime gate `not_run`.  The supplied
-exporter derives this value from runnable PostgreSQL `session_mailboxes`;
+which is a maximum 200 concurrent-turn envelope. The bundled Prometheus
+Adapter exposes `trpc_session_ready_backlog`; CPU-only HPA evidence is
+insufficient and keeps the runtime gate `not_run`.  The supplied exporter
+derives this value from runnable PostgreSQL `session_mailboxes`;
 Redis stream length is not authoritative because its wake-up entries are
 reconstructable.
 
 The base NetworkPolicy intentionally does not grant arbitrary external HTTPS
 egress. Both production and performance overlays include the shared
 `im-external-egress` policy, which selects only `trpc-channel-dispatcher` and
-`trpc-wecom-connector` and permits only IPv4 TCP/443. Standard Kubernetes
-NetworkPolicy cannot express FQDN destinations, so the portable fallback uses
-`0.0.0.0/0:443`; it does not grant this access to Gateway, Worker, or other
-runtime roles. Where the cluster CNI supports FQDN-aware policies, replace this
-fallback with reviewed Feishu, WeCom, and probe hostnames and remove the
-IPv4-wide destination.
+`trpc-wecom-connector`. Production separately selects Gateway/Admin/Worker for
+OIDC, model, and reviewed tool HTTPS. Standard Kubernetes NetworkPolicy cannot
+express FQDN destinations, so each portable fallback uses `0.0.0.0/0:443` for
+only those roles. Where the cluster CNI supports FQDN-aware policies, replace
+the two IPv4-wide destinations with their independently reviewed provider
+hostnames.
 
-Render and inspect the manifests before applying:
+Render and inspect the manifests, then follow the staged migration/bootstrap
+procedure in the repository README. Do not apply the whole overlay directly:
+plain `kubectl` does not implement Argo hook ordering and cannot replace a
+completed Job whose candidate image changed.
 
 ```bash
 kubectl kustomize deploy/kustomize/overlays/production
-kubectl apply --server-side -k deploy/kustomize/overlays/production
 ```
+
+Argo CD ordering uses normal resources at wave `-2`, rebuildable `Sync` hooks
+for schema migration and MinIO bootstrap at wave `-1`, and application
+Deployments at wave `0`.  The old migration `PreSync` phase could run before a
+first-install PostgreSQL StatefulSet existed; `BeforeHookCreation` also avoids
+trying to mutate an already completed Job after an image change.  Migration
+has a bounded `pg_isready` init wait for direct `kubectl apply`.
+
+Every concrete checked-in infrastructure/support image is a digest-pinned
+`docker.io` reference so ACK nodes can use a transparent Docker Hub accelerator
+such as Xuanyuan.  The application entry is intentionally a `docker.io`
+repository/digest placeholder and must be replaced with the reviewed candidate
+before deployment.  The Prometheus Adapter uses the pre-published Docker Hub
+support digest also pinned by the runtime-gate configuration; do not replace it
+with an unpinned tag.
 
 ## Scheduler version changes
 

@@ -23,7 +23,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
-from trpc_service.channels.base import InboundSink
+from trpc_service.channels.base import ChannelCapabilities, InboundSink
 from trpc_service.channels.envelopes import (
     DeliveryReceipt,
     DeliveryStatus,
@@ -31,6 +31,7 @@ from trpc_service.channels.envelopes import (
     MediaReference,
     OutboundEnvelope,
     PayloadKind,
+    RecallEnvelope,
 )
 from trpc_service.channels.media_locator import (
     WeComMediaLocatorCipher,
@@ -646,6 +647,17 @@ def _media_kind(media_type: str, reference: MediaReference) -> str:
 
 
 class WeComConnector:
+    capabilities = ChannelCapabilities(
+        outbound_payloads=frozenset({PayloadKind.TEXT}),
+        stream=False,
+        card=False,
+        media=False,
+        recall=False,
+        proactive=True,
+        text_split=False,
+        max_text_bytes=None,
+    )
+
     def __init__(
         self,
         secrets: SecretProvider,
@@ -967,6 +979,16 @@ class WeComConnector:
                 provider_code="runtime_unknown",
             )
         return _wecom_response_receipt(envelope, response)
+
+    async def recall(self, envelope: RecallEnvelope, binding: ChannelBinding) -> DeliveryReceipt:
+        """Fail closed because the AI Bot adapter has no recall protocol."""
+
+        del binding
+        return DeliveryReceipt(
+            outbound_id=envelope.outbound_id,
+            status=DeliveryStatus.FAILED,
+            provider_code="unsupported_capability",
+        )
 
 
 async def _wait_for_disconnect_or_stop(

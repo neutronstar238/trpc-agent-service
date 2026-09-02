@@ -2,6 +2,7 @@
 
 from trpc_service.channels.base import (
     ChannelAdapter,
+    ChannelCapabilities,
     StreamingChannelConnector,
     WebhookChannelAdapter,
     WebhookRequest,
@@ -12,6 +13,7 @@ from trpc_service.channels.envelopes import (
     InboundEnvelope,
     OutboundEnvelope,
     PayloadKind,
+    RecallEnvelope,
     VerifiedCallback,
 )
 from trpc_service.channels.feishu import (
@@ -25,6 +27,7 @@ from trpc_service.channels.feishu import (
 
 __all__ = [
     "ChannelAdapter",
+    "ChannelCapabilities",
     "DeliveryReceipt",
     "DeliveryStatus",
     "FeishuAdapter",
@@ -36,6 +39,7 @@ __all__ = [
     "InboundEnvelope",
     "OutboundEnvelope",
     "PayloadKind",
+    "RecallEnvelope",
     "StreamingChannelConnector",
     "VerifiedCallback",
     "WebhookChannelAdapter",

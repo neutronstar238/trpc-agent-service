@@ -34,6 +34,7 @@ from scripts.evidence_lineage import (
     validate_release_binding,
 )
 from scripts.report_io import atomic_write_json
+from trpc_service.channels.base import ChannelCapabilities
 from trpc_service.channels.dispatcher import ChannelDispatcher
 from trpc_service.channels.envelopes import (
     DeliveryReceipt,
@@ -41,6 +42,7 @@ from trpc_service.channels.envelopes import (
     InboundEnvelope,
     OutboundEnvelope,
     PayloadKind,
+    RecallEnvelope,
 )
 from trpc_service.channels.feishu import FeishuAdapter
 from trpc_service.channels.wecom import WeComClient, WeComConnector
@@ -91,6 +93,17 @@ class CountingRepository(InMemoryRuntimeRepository):
 
 
 class SequenceAdapter:
+    capabilities = ChannelCapabilities(
+        outbound_payloads=frozenset({PayloadKind.TEXT}),
+        stream=False,
+        card=False,
+        media=False,
+        recall=False,
+        proactive=True,
+        text_split=False,
+        max_text_bytes=None,
+    )
+
     def __init__(self, receipts: list[DeliveryReceipt]) -> None:
         self._receipts = receipts
         self.calls = 0
@@ -105,6 +118,14 @@ class SequenceAdapter:
                 status=DeliveryStatus.DELIVERED,
             )
         return receipt.model_copy(update={"outbound_id": envelope.outbound_id})
+
+    async def recall(self, envelope: RecallEnvelope, _binding: ChannelBinding) -> DeliveryReceipt:
+        return DeliveryReceipt(
+            outbound_id=envelope.outbound_id,
+            status=DeliveryStatus.FAILED,
+            provider_code="unsupported_capability",
+            retryable=False,
+        )
 
 
 class _WeComSequenceClient:

@@ -4,7 +4,8 @@
 
 每个启用 binding 创建一个官方 `wecom-aibot-sdk-python` WebSocket 客户端，凭证由 `SecretProvider`
 按需解析。PostgreSQL advisory lock 防止两个副本同时连接同一 Bot；断线后 SDK 自动重连，失去锁时
-主动断开。适配器标准化单聊/群聊、文本、语音转写、mixed、图片、文件、视频和事件/撤回。
+主动断开。适配器标准化入站单聊/群聊、文本、语音转写、mixed、图片、文件、视频和撤回事件；这不表示
+出站支持媒体发送或撤回。
 
 ### WebSocket 完整时序
 
@@ -143,26 +144,9 @@ CorpID/AgentID/Secret。操作步骤：
 }
 ```
 
-`yqzl` 已提供不把凭证放入进程参数的配置脚本。在服务器上创建一个仅 root 可读的临时文件，填入
-Bot ID 和 Secret，然后从标准输入执行脚本：
-
-```bash
-install -m 0600 /dev/null /root/wecom-credentials.json
-# 用本机编辑器填入两项真实值后保存
-python3 /www/wwwroot/tx.nstarzx.cn/app/deploy/yqzl/configure_wecom_binding.py \
-  </root/wecom-credentials.json
-rm -f /root/wecom-credentials.json
-```
-
-输入结构如下。脚本会安全写入 Secret、创建启用的 binding 并输出 binding ID；企业微信长连接模式
-没有需要填写的回调 URL：
-
-```json
-{
-  "wecom_bot_id": "...",
-  "wecom_bot_secret": "..."
-}
-```
+正式部署把 Secret 写入同一集群的 `trpc-im-secrets`，把 Bot ID 写入 PostgreSQL channel binding；不要在
+命令参数、ConfigMap 或 binding JSON 中传递 Secret。完整的 Secret 创建与 Admin API binding 模板见根
+目录 README。企业微信长连接模式没有需要填写的回调 URL。
 
 ## 飞书应用机器人
 
@@ -229,35 +213,14 @@ tenant config 固定，下载层还有相同或更低的进程级硬上限。扫
     "verification_token": {"uri": "file:///run/secrets/feishu_verification_token"},
     "encrypt_key": {"uri": "file:///run/secrets/feishu_encrypt_key"}
   },
-  "capabilities": ["media", "proactive"],
+  "capabilities": ["text", "proactive"],
   "enabled": true
 }
 ```
 
-`yqzl` 已提供不把凭证放入进程参数的配置脚本。先由 `provision.sh` 生成不可枚举 binding ID，再在
-服务器上创建一个仅 root 可读的临时 JSON 文件：
-
-```bash
-install -m 0600 /dev/null /root/feishu-credentials.json
-# 用本机编辑器填入四项真实值后保存
-python3 /www/wwwroot/tx.nstarzx.cn/app/deploy/yqzl/configure_feishu_binding.py \
-  </root/feishu-credentials.json
-rm -f /root/feishu-credentials.json
-```
-
-输入结构如下；脚本输出的 `callback_url` 就是飞书后台应填写的完整请求地址：
-
-```json
-{
-  "feishu_app_id": "cli_...",
-  "feishu_app_secret": "...",
-  "feishu_verification_token": "...",
-  "feishu_encrypt_key": "..."
-}
-```
-
-配置完成后运行 `verify_feishu_callback.py`。它会从服务器 Secret 文件构造一次加密 challenge，经公网
-HTTPS/Nginx/Gateway 往返验证，但输出中不包含凭证。
+正式部署把三项 Secret 写入同一集群的 `trpc-im-secrets`，把 App ID 写入 PostgreSQL channel binding；
+飞书后台回调地址指向同一集群 Gateway Ingress。完整的 Secret、Admin API binding 和 callback 模板见根
+目录 README。真实 challenge 必须经公网 HTTPS/Ingress/Gateway 往返验证，验证日志不得包含凭证。
 
 在 PowerShell 中可把 `.env.example` 复制为被 Git 忽略的 `.env.im`，填入真实值后显式启动：
 
@@ -312,9 +275,30 @@ marker 都不能算幂等通过。
 
 ## 通用投递规则
 
-`ChannelCapabilities` 表示 stream/card/media/recall/proactive 能力。适配器负责长度拆分、速率限制和
-平台错误映射；Dispatcher 记录每次 delivery attempt。明确失败可按退避策略重试，并优先遵守供应商
-`Retry-After`（包括平台 JSON 中的 retry hint）；HTTP 超时、连接
+`ChannelCapabilities` 是代码实际实现的**出站**能力，不是供应商理论 API，也不会被
+`ChannelBinding.capabilities` 扩大。后者当前只表达 binding 的声明/要求，不是独立的发送授权执行点；
+发送权限必须在创建 Outbox 前由租户策略/业务入口校验。如果 binding 声明了适配器没有实现的能力，调用
+仍必须失败关闭。
+
+| 通道 | text | stream | card | media | recall | proactive | 文本拆分/本地供应商长度 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 飞书 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 | 支持 | 不拆分；未声明供应商上限 |
+| 企业微信 AI Bot | 支持（markdown body） | 不支持 | 不支持 | 不支持 | 不支持 | 支持 | 不拆分；未声明供应商上限 |
+
+这里的 `media` 只指**出站**媒体。两条通道都能规范化并安全下载受支持的入站媒体，但当前
+`send()` 只接受 `PayloadKind.TEXT`。企业微信的 markdown body 仍是文本消息，不作为 card；飞书适配器
+也没有实现 interactive card。两条适配器的 `recall()` 都固定返回非重试的
+`FAILED/unsupported_capability`，不会把入站撤回事件或供应商可能存在的其他 API 冒充成已审计的出站
+撤回。
+
+当前也不在适配器内拆分超长文本。一次 Outbound Outbox 记录只产生一个供应商发送请求，并继续使用同一个
+飞书 `uuid` 或企业微信 `client_msg_id`。现有 delivery attempt 没有持久化分片游标；若前一片已成功、后
+一片失败或结果未知，整条重试可能制造重复回复。因此 `max_text_bytes=None` 表示“本实现没有宣称经验证的
+供应商长度上限”，不是无限长度保证；供应商的明确拒绝仍按失败映射。未来只有在增加持久化分片状态、逐片
+稳定幂等键和部分成功恢复协议后，才能把 `text_split` 改为 `true`。
+
+适配器继续负责供应商错误和限流映射；Dispatcher 记录每次 delivery attempt。明确失败可按退避策略重试，
+并优先遵守供应商 `Retry-After`（包括平台 JSON 中的 retry hint）；HTTP 超时、连接
 断开等结果未知状态标记 `ambiguous`，必须由 tenant admin 带 `If-Match`、`Idempotency-Key` 和人工
 确认调用 replay。所有日志只记录 tenant/binding/message 哈希和状态，不记录正文或凭证。
 

@@ -18,6 +18,7 @@ from trpc_service.storage.services import (
     PostgresSummaryStore,
     PostgresTenantServiceFactory,
     ProfileServiceFactory,
+    RegisteredTenantServiceBundle,
     TenantDataServices,
 )
 from trpc_service.tenant.models import (
@@ -238,7 +239,8 @@ async def test_postgres_artifact_and_knowledge_keep_metadata_in_the_same_tenant_
 async def test_profile_factory_supports_tenant_scoped_profiles() -> None:
     sentinel = object()
     services = TenantDataServices(sentinel, sentinel, sentinel, sentinel, sentinel, sentinel)  # type: ignore[arg-type]
-    factory = ProfileServiceFactory({("tenant-a", "profile-a"): services})
+    registration = RegisteredTenantServiceBundle(selection=config().storage, services=services)
+    factory = ProfileServiceFactory({("tenant-a", "profile-a"): registration})
     assert await factory.for_context(context(), config()) is services
     with pytest.raises(ValueError, match="another tenant"):
         await factory.for_context(context("tenant-b"), config())

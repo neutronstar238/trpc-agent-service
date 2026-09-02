@@ -25,7 +25,11 @@ from trpc_service.metrics.privacy import (
 )
 from trpc_service.metrics.setup import configure_tracing
 from trpc_service.runtime import TenantRuntime
-from trpc_service.storage.services import ProfileServiceFactory, TenantDataServices
+from trpc_service.storage.services import (
+    ProfileServiceFactory,
+    RegisteredTenantServiceBundle,
+    TenantDataServices,
+)
 from trpc_service.storage.vector import PgVectorKnowledgeStore
 from trpc_service.tenant.auth import (
     AuthenticationError,
@@ -260,7 +264,8 @@ async def test_profile_factory_vector_and_workspace(tmp_path) -> None:
     accepted = await runtime.accept("binding-unpredictable-a", envelope())
     config = tenant_config()
     services = TenantDataServices(*(object() for _ in range(6)))
-    factory = ProfileServiceFactory({"default": services})
+    registration = RegisteredTenantServiceBundle(selection=config.storage, services=services)
+    factory = ProfileServiceFactory({(config.tenant_id, config.storage.profile_id): registration})
     assert await factory.for_context(accepted.context, config) is services
     with pytest.raises(ValueError, match="another tenant"):
         await factory.for_context(

@@ -96,6 +96,8 @@ spec:
           protocol: TCP
         - port: 4318
           protocol: TCP
+        - port: 443
+          protocol: TCP
     - to:
         - namespaceSelector:
             matchLabels:
