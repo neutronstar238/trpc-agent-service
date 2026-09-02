@@ -355,10 +355,13 @@ def _trusted_artifact_sha256(path: Path, *, label: str) -> str:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise RunnerError(f"{label} must be a regular file")
-        if os.name != "nt" and (
-            metadata.st_uid != 0 or metadata.st_mode & 0o022 or not metadata.st_mode & 0o111
-        ):
-            raise RunnerError(f"{label} must be a root-owned immutable executable")
+        if os.name != "nt":
+            if metadata.st_uid != 0:
+                raise RunnerError(f"{label} must be root-owned")
+            if metadata.st_mode & 0o022:
+                raise RunnerError(f"{label} must not be group- or other-writable")
+            if not metadata.st_mode & 0o111:
+                raise RunnerError(f"{label} must be executable")
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             while chunk := stream.read(64 * 1024):
                 digest.update(chunk)
