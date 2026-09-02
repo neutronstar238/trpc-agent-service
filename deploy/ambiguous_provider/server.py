@@ -306,7 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     if not 0 <= args.port <= 65535:
         raise SystemExit("port is outside the valid range")
     server = AmbiguousProviderServer((args.host, args.port), args.ledger)
-    print(f"ambiguous_provider_listening={server.server_address[0]}:{server.server_address[1]}")
+    address = server.server_address
+    host = address[0].decode("ascii") if isinstance(address[0], bytes) else address[0]
+    print(f"ambiguous_provider_listening={host}:{address[1]}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -742,6 +742,7 @@ async def test_v2_exact_ack_probe_requires_empty_pel_and_matching_payload() -> N
                         "generation": "1",
                         "priority": "0",
                         "trace_id": "trace-case",
+                        "trace_headers": "{}",
                         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     },
                 )
@@ -1614,6 +1615,7 @@ async def test_v2_redis_delivery_cleanup_validates_session_ready_without_dedupe_
                         "generation": "1",
                         "priority": "0",
                         "trace_id": "trace-case",
+                        "trace_headers": "{}",
                         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     },
                 )

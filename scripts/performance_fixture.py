@@ -62,9 +62,24 @@ IDENTITY_KEYS = (
     "channel",
 )
 
-# This is intentionally a literal, reviewed list.  Cleanup must never use a
-# schema-wide operation or a caller-provided table name.
-CLEANUP_TABLES: tuple[str, ...] = (
+# Cell events are append-only to ordinary sessions.  The migration-owned
+# cleanup function removes only a cryptographically identified synthetic
+# fixture and returns these exact per-table counts.
+CELL_CLEANUP_TABLES: tuple[str, ...] = (
+    "cell_effect_receipts",
+    "cell_effect_ledger",
+    "cell_tool_intents",
+    "cell_approval_nonces",
+    "cell_placement_reservations",
+    "cell_branch_heads",
+    "cell_events",
+    "agent_cells",
+    "agent_capsules",
+)
+
+# This is intentionally a literal, reviewed list.  Direct cleanup must never
+# use a schema-wide operation or a caller-provided table name.
+_DIRECT_CLEANUP_TABLES: tuple[str, ...] = (
     "session_mailbox_items",
     "delivery_attempts",
     "outbound_messages",
@@ -98,9 +113,13 @@ CLEANUP_TABLES: tuple[str, ...] = (
     "agent_apps",
     "tenants",
 )
+_LEGACY_CLEANUP_TABLES_V2 = _DIRECT_CLEANUP_TABLES
 _LEGACY_CLEANUP_TABLES_V1 = tuple(
-    table for table in CLEANUP_TABLES if table not in {"session_mailbox_items", "session_mailboxes"}
+    table
+    for table in _LEGACY_CLEANUP_TABLES_V2
+    if table not in {"session_mailbox_items", "session_mailboxes"}
 )
+CLEANUP_TABLES = CELL_CLEANUP_TABLES + _DIRECT_CLEANUP_TABLES
 
 _SUFFIX = re.compile(r"^[0-9a-f]{32}$")
 _POSTGRES_SCHEMES = {"postgres", "postgresql", "postgresql+asyncpg"}
@@ -449,7 +468,11 @@ def _validate_report(
     if report.get("manifest_checksum") != _manifest_checksum(report):
         raise FixtureValidationError("fixture report integrity check failed")
     recorded_cleanup_tables = tuple(report.get("cleanup_tables", ()))
-    if recorded_cleanup_tables not in {CLEANUP_TABLES, _LEGACY_CLEANUP_TABLES_V1}:
+    if recorded_cleanup_tables not in {
+        CLEANUP_TABLES,
+        _LEGACY_CLEANUP_TABLES_V2,
+        _LEGACY_CLEANUP_TABLES_V1,
+    }:
         raise FixtureValidationError("fixture report cleanup allowlist is inconsistent")
     recorded_path = report.get("report_path")
     requested_path = _safe_report_path(report_path)
@@ -490,7 +513,29 @@ async def _delete_fixture_rows(
         )
         if owned != 1:
             raise FixtureValidationError("fixture ownership proof is missing")
-        for table in CLEANUP_TABLES:
+        raw_cell_counts = await connection.fetchval(
+            """
+            SELECT public.cleanup_performance_cell_fixture($1, $2, $3)
+            """,
+            tenant_id,
+            run_id,
+            manifest_checksum,
+        )
+        if isinstance(raw_cell_counts, str):
+            try:
+                raw_cell_counts = json.loads(raw_cell_counts)
+            except json.JSONDecodeError as exc:
+                raise FixtureValidationError("Cell cleanup result is invalid JSON") from exc
+        if not isinstance(raw_cell_counts, Mapping) or set(raw_cell_counts) != set(
+            CELL_CLEANUP_TABLES
+        ):
+            raise FixtureValidationError("Cell cleanup result is incomplete")
+        for table in CELL_CLEANUP_TABLES:
+            value = raw_cell_counts[table]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise FixtureValidationError("Cell cleanup count is invalid")
+            counts[table] = value
+        for table in _DIRECT_CLEANUP_TABLES:
             # ``table`` comes only from the literal allowlist above.
             result = await connection.execute(
                 f"DELETE FROM {table} WHERE tenant_id=$1",  # noqa: S608

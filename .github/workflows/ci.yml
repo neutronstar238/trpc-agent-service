@@ -24,6 +24,13 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy trpc_service scripts
+      - name: reject machine-specific checkout paths
+        shell: bash
+        run: |
+          if rg -n -i 'E:[/\\\\]trpc-agent-service' --hidden --glob '!.git/**' .; then
+            echo "found a hard-coded source checkout path"
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-latest
@@ -43,7 +50,7 @@ jobs:
       - run: uv sync --extra dev --locked --python ${{ matrix.python }}
       - run: uv run --python ${{ matrix.python }} pytest tests/unit --cov=trpc_service --cov-branch --cov-report=json:runs/multitenant/coverage.json
       - run: >-
-          uv run --python ${{ matrix.python }} python scripts/check_coverage.py
+          uv run --python ${{ matrix.python }} python -m scripts.check_coverage
           runs/multitenant/coverage.json
           --output runs/multitenant/coverage-gate.json
       - run: uv run --python ${{ matrix.python }} trpc-service doctor --output runs/multitenant/sdk-upgrade.json
@@ -65,7 +72,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --extra dev --locked
-      - run: uv run python scripts/mock_production_gate.py
+      - run: uv run python -m scripts.mock_production_gate
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -140,7 +147,7 @@ jobs:
         run: |
           dependency_status=pass
           if [[ "$(cat runs/multitenant/dependency-audit.exit)" != "0" ]]; then dependency_status=fail; fi
-          uv run python scripts/supply_chain_gate.py \
+          uv run python -m scripts.supply_chain_gate \
             --sbom runs/multitenant/sbom.spdx.json \
             --vulnerabilities runs/multitenant \
             --image trpc-agent-service:ci \

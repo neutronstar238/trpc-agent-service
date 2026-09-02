@@ -33,6 +33,14 @@ IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 REPOSITORY_COMPONENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*[a-z0-9]$")
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 PUSH_DIGEST_RE = re.compile(r"\bdigest:\s*(sha256:[0-9a-f]{64})\b", re.IGNORECASE)
+SOURCE_FINGERPRINT_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")
+CONTAINER_FINGERPRINT_SCRIPT = (
+    "import json;"
+    "from pathlib import Path;"
+    "from scripts.evidence_lineage import SOURCE_FINGERPRINT_ROOTS, source_fingerprint;"
+    "print(json.dumps("
+    "source_fingerprint(Path('/app'), SOURCE_FINGERPRINT_ROOTS), sort_keys=True))"
+)
 
 
 class RegistryImageError(RuntimeError):
@@ -201,6 +209,47 @@ def _build_image(
     return image
 
 
+def _verify_container_source(image: str, *, source: str) -> None:
+    """Recompute the source fingerprint in the built image before pushing it."""
+
+    result = _docker(
+        (
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--workdir=/app",
+            "--entrypoint=/opt/venv/bin/python",
+            image,
+            "-c",
+            CONTAINER_FINGERPRINT_SCRIPT,
+        )
+    )
+    try:
+        observed = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as error:
+        raise RegistryImageError("container source fingerprint output is not valid JSON") from error
+    if not isinstance(observed, Mapping):
+        raise RegistryImageError("container source fingerprint payload is malformed")
+    status = observed.get("status")
+    if status != "available":
+        if status == "unavailable":
+            raise RegistryImageError("container source fingerprint is unavailable")
+        raise RegistryImageError("container source fingerprint payload is malformed")
+    value = observed.get("value")
+    if (
+        observed.get("algorithm") != "sha256"
+        or not isinstance(value, str)
+        or SOURCE_FINGERPRINT_VALUE_RE.fullmatch(value) is None
+    ):
+        raise RegistryImageError("container source fingerprint payload is malformed")
+    if value != source:
+        raise RegistryImageError("container source fingerprint does not match checkout")
+
+
 def publish_candidate(
     *,
     repository: str,
@@ -231,6 +280,7 @@ def publish_candidate(
         source=source_value,
         context=context,
     )
+    _verify_container_source(initial_image, source=source_value)
     initial_digest = _push_digest(initial_image)
     upgrade_image = _build_image(
         repository=normalized_repository,
@@ -239,6 +289,7 @@ def publish_candidate(
         context=context,
         role="upgrade",
     )
+    _verify_container_source(upgrade_image, source=source_value)
     upgrade_digest = _push_digest(upgrade_image)
     if initial_digest == upgrade_digest:
         raise RegistryImageError("initial and upgrade registry digests must differ")

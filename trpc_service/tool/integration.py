@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+import hashlib
+import json
+import logging
+from typing import Any, Protocol
 
 from trpc_agent_sdk.context import InvocationContext
 from trpc_agent_sdk.tools import BaseTool
@@ -10,8 +14,49 @@ from trpc_agent_sdk.types import FunctionDeclaration
 from typing_extensions import override
 
 from trpc_service.tenant.models import TenantConfig, TenantContext, ToolRisk
-from trpc_service.tool.execution import ToolExecutor
+from trpc_service.tool.confirmation import arguments_hash
+from trpc_service.tool.execution import HumanReviewRequired, ToolExecutor
 from trpc_service.tool.governance import Decision, GovernancePipeline
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class GovernedToolObserver(Protocol):
+    """Causal observer for the real governed SDK tool boundary.
+
+    Raw arguments and results never cross this interface.  The observer gets
+    only stable hashes and non-sensitive routing metadata, which is sufficient
+    to join Policy/Effect facts to the Cell turn without leaking tool content.
+    """
+
+    async def intent_created(
+        self,
+        context: TenantContext,
+        *,
+        turn_id: str,
+        invocation_id: str,
+        tool_name: str,
+        arguments_hash: str,
+        effect_key: str,
+        risk: ToolRisk,
+    ) -> object: ...
+
+    async def policy_decided(
+        self,
+        token: object,
+        *,
+        decision: Decision,
+        reason: str,
+    ) -> None: ...
+
+    async def effect_completed(
+        self,
+        token: object,
+        *,
+        status: str,
+        result_hash: str | None,
+        error_type: str | None,
+    ) -> None: ...
 
 
 class GovernedTool(BaseTool):
@@ -24,6 +69,7 @@ class GovernedTool(BaseTool):
         config: TenantConfig,
         governance: GovernancePipeline,
         executor: ToolExecutor,
+        observer: GovernedToolObserver | None = None,
     ) -> None:
         if tool.is_progress_streaming:
             raise ValueError("progress-streaming tools need a governed streaming adapter")
@@ -32,6 +78,7 @@ class GovernedTool(BaseTool):
         self._config = config
         self._governance = governance
         self._executor = executor
+        self._observer = observer
 
     @property
     def is_streaming(self) -> bool:
@@ -55,6 +102,25 @@ class GovernedTool(BaseTool):
         metadata = tool_context.agent_context.metadata
         context = _tenant_context(metadata)
         confirmation_token = _confirmation_token(metadata, self.name)
+        risk = self._config.tools.classifications.get(self.name, ToolRisk.UNKNOWN)
+        turn_id = str(metadata.get("turn_id") or context.request_id)
+        effect_key = self._executor.key_for(
+            context,
+            turn_id=turn_id,
+            tool_name=self.name,
+            arguments=args,
+        )
+        observer_token: object | None = None
+        if self._observer is not None:
+            observer_token = await self._observer.intent_created(
+                context,
+                turn_id=turn_id,
+                invocation_id=str(getattr(tool_context, "invocation_id", context.request_id)),
+                tool_name=self.name,
+                arguments_hash=arguments_hash(args),
+                effect_key=effect_key,
+                risk=risk,
+            )
         result = await self._governance.evaluate(
             context=context,
             config=self._config,
@@ -63,25 +129,91 @@ class GovernedTool(BaseTool):
             estimated_cost=1,
             confirmation_token=confirmation_token,
         )
+        if self._observer is not None and observer_token is not None:
+            await self._observer.policy_decided(
+                observer_token,
+                decision=result.decision,
+                reason=result.reason,
+            )
         if result.decision != Decision.ALLOW:
             return {
                 "error": result.reason,
                 "status": result.decision.value,
             }
 
-        risk = self._config.tools.classifications.get(self.name, ToolRisk.UNKNOWN)
-        turn_id = str(metadata.get("turn_id") or context.request_id)
         lease_owner, lease_epoch = _lease_identity(metadata)
-        return await self._executor.execute(
-            context,
-            turn_id=turn_id,
-            tool_name=self.name,
-            arguments=args,
-            risk=risk,
-            owner_id=lease_owner,
-            fencing_token=lease_epoch,
-            call=lambda: self._tool.run_async(tool_context=tool_context, args=args),
-        )
+        try:
+            effect_result = await self._executor.execute(
+                context,
+                turn_id=turn_id,
+                tool_name=self.name,
+                arguments=args,
+                risk=risk,
+                owner_id=lease_owner,
+                fencing_token=lease_epoch,
+                call=lambda: self._tool.run_async(tool_context=tool_context, args=args),
+            )
+        except asyncio.CancelledError as error:
+            if self._observer is not None and observer_token is not None:
+                await self._notify_effect(
+                    observer_token,
+                    status="failed",
+                    result_hash=None,
+                    error_type=type(error).__name__[:64],
+                )
+            raise
+        except HumanReviewRequired as error:
+            if self._observer is not None and observer_token is not None:
+                await self._notify_effect(
+                    observer_token,
+                    status="ambiguous",
+                    result_hash=None,
+                    error_type=type(error).__name__[:64],
+                )
+            raise
+        except Exception as error:
+            if self._observer is not None and observer_token is not None:
+                await self._notify_effect(
+                    observer_token,
+                    status="failed",
+                    result_hash=None,
+                    error_type=type(error).__name__[:64],
+                )
+            raise
+        if self._observer is not None and observer_token is not None:
+            await self._notify_effect(
+                observer_token,
+                status="succeeded",
+                result_hash=_value_hash(effect_result),
+                error_type=None,
+            )
+        return effect_result
+
+    async def _notify_effect(
+        self,
+        token: object,
+        *,
+        status: str,
+        result_hash: str | None,
+        error_type: str | None,
+    ) -> None:
+        """Do not turn an already-ledgered external result into a replay."""
+
+        assert self._observer is not None
+        try:
+            await self._observer.effect_completed(
+                token,
+                status=status,
+                result_hash=result_hash,
+                error_type=error_type,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as observer_error:
+            _LOGGER.error(
+                "cell tool projection requires reconciliation: %s",
+                type(observer_error).__name__,
+            )
 
 
 def _tenant_context(metadata: dict[str, Any]) -> TenantContext:
@@ -128,4 +260,18 @@ def _lease_identity(metadata: dict[str, Any]) -> tuple[str | None, int | None]:
     return owner, epoch
 
 
-__all__ = ["GovernedTool"]
+def _value_hash(value: object) -> str:
+    try:
+        canonical = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        canonical = repr(type(value))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+__all__ = ["GovernedTool", "GovernedToolObserver"]

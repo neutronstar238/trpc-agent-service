@@ -5,6 +5,8 @@ param(
     [int]$EndStage = 8
 )
 
+throw "This legacy acceptance wrapper is disabled because it targets the protected fallback namespace. Use deploy/runtime-gate.yaml with the current candidate lock and the canonical Python gates."
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 

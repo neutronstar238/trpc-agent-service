@@ -56,11 +56,58 @@ def _job_evidence(namespace: str, nonce: str, fingerprint: str) -> dict[str, dic
             "trpc.io/hpa-cluster": fingerprint[:63],
         },
         "namespace": namespace,
+        "target_namespace": namespace,
+        "job_namespace": "trpc-runtime-driver",
         "run_nonce": nonce,
         "cluster_fingerprint": fingerprint,
         "phase": "load",
     }
-    return {"load": dict(common), "clear": {**common, "job_deleted": True}}
+    return {
+        "load": dict(common),
+        "clear": {**common, "job_deleted": True, "already_absent": False},
+    }
+
+
+def _production_hpa_job_evidence(namespace: str, nonce: str, fingerprint: str) -> dict[str, object]:
+    evidence = _job_evidence(namespace, nonce, fingerprint)
+    placement = {
+        "pod_name": "hpa-load-pod",
+        "pod_uid": "hpa-pod-uid",
+        "pod_node_name": "cn-shenzhen.10.134.38.156",
+        "pod_phase": "Running",
+        "expected_node_name": "cn-shenzhen.10.134.38.156",
+        "node_selector": {
+            "trpc-role": "load-driver",
+            "kubernetes.io/hostname": "cn-shenzhen.10.134.38.156",
+        },
+        "tolerations": [
+            {
+                "key": "trpc-role",
+                "operator": "Equal",
+                "value": "load-driver",
+                "effect": "NoSchedule",
+            }
+        ],
+    }
+    evidence["load"]["placement"] = placement
+    evidence["clear"]["placement"] = deepcopy(placement)
+    evidence["clear"]["cleanup"] = {
+        "api_observed": True,
+        "job_deleted": True,
+        "job_name": f"trpc-hpa-cleanup-{nonce[:20]}",
+        "job_uid": "cleanup-job-uid-1",
+        "receipt": {
+            "schema_version": 1,
+            "status": "pass",
+            "phase": "clear",
+            "run_nonce": nonce,
+            "tenant_id": f"hpa-{nonce}",
+            "already_absent": False,
+            "deleted": {name: 0 for name in runtime_gate._HPA_CLEANUP_TABLES},
+            "residual": {name: 0 for name in runtime_gate._HPA_CLEANUP_TABLES},
+        },
+    }
+    return evidence
 
 
 def _externalize_hpa_observation(observation: dict[str, object]) -> dict[str, object]:
@@ -363,13 +410,188 @@ def test_generated_overlay_pins_runtime_pods_to_controlled_label(tmp_path) -> No
         tmp_path,
         namespace="trpc-runtime-gate-test",
         image="registry.example/trpc-service:test",
-        node_label=("trpc-runtime-gate", "acceptance"),
+        node_label=("trpc-cell-fabric-owner", "innovation"),
+        node_name="ack-workload-0",
     )
     rendered = path.read_text(encoding="utf-8")
     patch = (tmp_path / "controlled-node-patch.yaml").read_text(encoding="utf-8")
     assert "controlled-node-patch.yaml" in rendered
     assert "kind: Deployment" in rendered
-    assert 'trpc-runtime-gate: "acceptance"' in patch
+    assert "kind: Job" in rendered
+    assert "name: trpc-schema-migration" in rendered
+    parsed_patch = yaml.safe_load(patch)
+    assert parsed_patch[0]["value"] == {
+        "trpc-cell-fabric-owner": "innovation",
+        "kubernetes.io/hostname": "ack-workload-0",
+    }
+
+
+def test_generated_overlay_pins_migration_and_head_check_to_same_node(tmp_path) -> None:
+    path = _write_overlay(
+        tmp_path,
+        namespace="trpc-runtime-gate-test",
+        image="registry.example/trpc-service:test",
+        node_label=("trpc-cell-fabric-owner", "innovation"),
+        node_name="ack-workload-0",
+    )
+
+    assert "kind: Job" in path.read_text(encoding="utf-8")
+    node_patch = yaml.safe_load(
+        (tmp_path / "controlled-node-patch.yaml").read_text(encoding="utf-8")
+    )
+    assert node_patch == [
+        {
+            "op": "add",
+            "path": "/spec/template/spec/nodeSelector",
+            "value": {
+                "trpc-cell-fabric-owner": "innovation",
+                "kubernetes.io/hostname": "ack-workload-0",
+            },
+        }
+    ]
+
+    migration_manifest = _migration_manifest_for_head_check()
+    migration = yaml.safe_load(migration_manifest)
+    migration["spec"]["template"]["spec"]["nodeSelector"] = node_patch[0]["value"]
+    head = _schema_head_check_manifest(
+        yaml.safe_dump(migration, sort_keys=False), namespace="trpc-runtime-gate-test"
+    )
+    assert head["spec"]["template"]["spec"]["nodeSelector"] == node_patch[0]["value"]
+
+
+def test_generated_overlay_binds_backlog_prometheus_policy_to_configured_support_namespace(
+    tmp_path,
+) -> None:
+    path = _write_overlay(
+        tmp_path,
+        namespace="trpc-runtime-gate-test",
+        image="registry.example/trpc-service:test",
+        support_namespace="trpc-cell-fabric-support",
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert "support-namespace-patch.yaml" in rendered
+    support_patch = yaml.safe_load(
+        (tmp_path / "support-namespace-patch.yaml").read_text(encoding="utf-8")
+    )
+    assert support_patch == [
+        {
+            "op": "replace",
+            "path": "".join(
+                (
+                    "/spec/ingress/0/from/1/namespaceSelector/",
+                    "matchLabels/kubernetes.io~1metadata.name",
+                )
+            ),
+            "value": "trpc-cell-fabric-support",
+        },
+        {
+            "op": "replace",
+            "path": "".join(
+                (
+                    "/spec/egress/0/to/1/namespaceSelector/",
+                    "matchLabels/kubernetes.io~1metadata.name",
+                )
+            ),
+            "value": "trpc-cell-fabric-support",
+        },
+    ]
+
+
+def test_generated_overlay_labels_backlog_service_and_pod_for_metric_discovery(tmp_path) -> None:
+    path = _write_overlay(
+        tmp_path,
+        namespace="trpc-runtime-gate-test",
+        image="registry.example/trpc-service:test",
+        run_nonce="a" * 32,
+        cluster_fingerprint="b" * 64,
+    )
+
+    assert "runtime-ownership-patch.yaml" in path.read_text(encoding="utf-8")
+    documents = list(
+        yaml.safe_load_all((tmp_path / "runtime-ownership-patch.yaml").read_text(encoding="utf-8"))
+    )
+    expected = {
+        "trpc.io/managed-by": "trpc-kubernetes-runtime-gate",
+        "trpc.io/run-nonce": "a" * 32,
+        "trpc.io/cluster-fingerprint": "b" * 63,
+    }
+    assert documents[0]["kind"] == "Service"
+    assert documents[0]["metadata"]["labels"] == expected
+    assert documents[1]["kind"] == "Deployment"
+    assert documents[1]["metadata"]["labels"] == expected
+    assert documents[1]["spec"]["template"]["metadata"]["labels"] == expected
+    assert documents[1]["spec"]["template"]["spec"]["containers"] == [
+        {
+            "name": "backlog-exporter",
+            "env": [
+                {
+                    "name": "TRPC_BACKLOG_TENANT_ID",
+                    "value": "hpa-" + "a" * 32,
+                }
+            ],
+        }
+    ]
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.count("path: runtime-pod-ownership-patch.yaml") == 2
+    pod_patch = yaml.safe_load(
+        (tmp_path / "runtime-pod-ownership-patch.yaml").read_text(encoding="utf-8")
+    )
+    assert {item["path"]: item["value"] for item in pod_patch} == {
+        "/spec/template/metadata/labels/trpc.io~1managed-by": ("trpc-kubernetes-runtime-gate"),
+        "/spec/template/metadata/labels/trpc.io~1run-nonce": "a" * 32,
+        "/spec/template/metadata/labels/trpc.io~1cluster-fingerprint": "b" * 63,
+    }
+
+
+def test_generated_overlay_rejects_missing_controlled_node_name(tmp_path) -> None:
+    with pytest.raises(ValueError, match="controlled node name"):
+        _write_overlay(
+            tmp_path,
+            namespace="trpc-runtime-gate-test",
+            image="registry.example/trpc-service:test",
+            node_label=("trpc-cell-fabric-owner", "innovation"),
+        )
+
+
+def test_generated_overlay_rejects_invalid_support_namespace(tmp_path) -> None:
+    with pytest.raises(ValueError, match="support namespace"):
+        _write_overlay(
+            tmp_path,
+            namespace="trpc-runtime-gate-test",
+            image="registry.example/trpc-service:test",
+            support_namespace="trpc-runtime.support",
+        )
+
+
+def test_generated_overlay_rejects_partial_runtime_ownership_identity(tmp_path) -> None:
+    with pytest.raises(ValueError, match="runtime ownership labels"):
+        _write_overlay(
+            tmp_path,
+            namespace="trpc-runtime-gate-test",
+            image="registry.example/trpc-service:test",
+            run_nonce="a" * 32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_nonce", "cluster_fingerprint", "message"),
+    (
+        ("A" * 32, "b" * 64, "run nonce"),
+        ("a" * 32, "g" * 64, "cluster fingerprint"),
+    ),
+)
+def test_generated_overlay_rejects_invalid_runtime_ownership_identity(
+    tmp_path, run_nonce: str, cluster_fingerprint: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _write_overlay(
+            tmp_path,
+            namespace="trpc-runtime-gate-test",
+            image="registry.example/trpc-service:test",
+            run_nonce=run_nonce,
+            cluster_fingerprint=cluster_fingerprint,
+        )
 
 
 def test_generated_overlay_configures_private_registry_for_deployments_and_jobs(
@@ -695,6 +917,76 @@ def test_production_prerequisites_require_release_binding(monkeypatch) -> None:
     assert "TRPC_RELEASE_NONCE is required for a production runtime acceptance" in missing
 
 
+def test_production_prerequisites_require_complete_hpa_load_driver_placement(monkeypatch) -> None:
+    placement = {
+        runtime_gate.HPA_DRIVER_NODE_NAME_ENV: "cn-shenzhen.10.134.38.156",
+        runtime_gate.HPA_DRIVER_NODE_LABEL_ENV: "trpc-role=load-driver",
+        runtime_gate.HPA_DRIVER_TAINT_KEY_ENV: "trpc-role",
+        runtime_gate.HPA_DRIVER_TAINT_VALUE_ENV: "load-driver",
+        runtime_gate.HPA_DRIVER_TAINT_EFFECT_ENV: "NoSchedule",
+    }
+    for name in placement:
+        monkeypatch.delenv(name, raising=False)
+
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=False,
+        require_release_binding=False,
+    )
+
+    assert all(name in missing for name in placement)
+    monkeypatch.setenv(
+        runtime_gate.HPA_DRIVER_NODE_NAME_ENV,
+        placement[runtime_gate.HPA_DRIVER_NODE_NAME_ENV],
+    )
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=False,
+        require_release_binding=False,
+    )
+    assert runtime_gate.HPA_DRIVER_NODE_NAME_ENV not in missing
+    assert runtime_gate.HPA_DRIVER_NODE_LABEL_ENV in missing
+
+
+def test_production_prerequisites_reject_non_probe_hpa_command(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND",
+        '["python","-c","print(\\"marker\\")"]',
+    )
+
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=False,
+        require_release_binding=False,
+    )
+
+    assert "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND must be the bounded backlog probe command" in missing
+
+
+def test_kind_prerequisites_may_omit_hpa_load_driver_placement(monkeypatch) -> None:
+    for name in (
+        runtime_gate.HPA_DRIVER_NODE_NAME_ENV,
+        runtime_gate.HPA_DRIVER_NODE_LABEL_ENV,
+        runtime_gate.HPA_DRIVER_TAINT_KEY_ENV,
+        runtime_gate.HPA_DRIVER_TAINT_VALUE_ENV,
+        runtime_gate.HPA_DRIVER_TAINT_EFFECT_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=True,
+        require_release_binding=False,
+    )
+
+    assert not any(
+        name in missing
+        for name in (
+            runtime_gate.HPA_DRIVER_NODE_NAME_ENV,
+            runtime_gate.HPA_DRIVER_NODE_LABEL_ENV,
+            runtime_gate.HPA_DRIVER_TAINT_KEY_ENV,
+            runtime_gate.HPA_DRIVER_TAINT_VALUE_ENV,
+            runtime_gate.HPA_DRIVER_TAINT_EFFECT_ENV,
+        )
+    )
+
+
 def test_kind_prerequisites_can_skip_production_release_binding(monkeypatch) -> None:
     monkeypatch.delenv("TRPC_RELEASE_ID", raising=False)
     monkeypatch.delenv("TRPC_RELEASE_NONCE", raising=False)
@@ -714,6 +1006,21 @@ def test_runtime_prerequisites_reject_invalid_image_pull_secret(monkeypatch) -> 
         require_release_binding=False,
     )
     assert "TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET is invalid" in missing
+
+
+def test_production_prerequisites_require_valid_support_namespace(monkeypatch) -> None:
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=False,
+        require_release_binding=False,
+    )
+    assert "TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE" in missing
+
+    monkeypatch.setenv("TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE", "support.namespace")
+    missing = runtime_gate._missing_prerequisites(
+        allow_local_images=False,
+        require_release_binding=False,
+    )
+    assert "TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE is invalid" in missing
 
 
 def test_runtime_report_rejects_symlink_output(tmp_path) -> None:
@@ -839,6 +1146,7 @@ def test_runtime_attestation_does_not_promote_node_preflight_as_eviction() -> No
     assert attestation["actions"]["node_eviction"] is False
     assert attestation["node_eviction_status"] == "not_run"
     assert attestation["eviction_scope"] == "namespace_pod_eviction"
+    assert attestation["node_drain_policy"] == {}
 
 
 def test_runtime_attestation_contract_requires_all_actions() -> None:
@@ -878,6 +1186,13 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
     )
     checks = {name: {"status": "pass"} for name in _REQUIRED_RUNTIME_CHECKS}
     checks["hpa_load_observation"] = {"status": "pass", "observation": hpa_observation}
+    checks["node_eviction"]["drain"] = {
+        "post_drain_inventory": {
+            "status": "pass",
+            "blocking_pod_count": 0,
+            "gate_namespace_pod_count": 0,
+        }
+    }
     initial_image_ids = {
         deployment: ["sha256:" + "1" * 64] for deployment, _container in runtime_gate.DEPLOYMENTS
     }
@@ -922,12 +1237,32 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
                 "upgrade": upgrade_image_ids,
             },
             "eviction_scope": "namespace_pod_eviction+controlled_node",
+            "node_drain_policy": {
+                "mode": "hard-node-failure",
+                "disable_eviction": True,
+                "pdb_bypass": True,
+                "pdb_preflight_required": True,
+            },
             "node_eviction_status": "pass",
         },
     }
     valid, reasons = _runtime_attestation_contract(candidate)
     assert valid
     assert reasons == ()
+
+    candidate_without_node_policy = deepcopy(candidate)
+    candidate_without_node_policy["runtime_attestation"].pop("node_drain_policy")
+    valid, reasons = _runtime_attestation_contract(candidate_without_node_policy)
+    assert not valid
+    assert any("node drain policy is missing" in reason for reason in reasons)
+
+    candidate_with_residual_pod = deepcopy(candidate)
+    candidate_with_residual_pod["checks"]["node_eviction"]["drain"]["post_drain_inventory"][
+        "gate_namespace_pod_count"
+    ] = 1
+    valid, reasons = _runtime_attestation_contract(candidate_with_residual_pod)
+    assert not valid
+    assert any("retained gate pods" in reason for reason in reasons)
 
     candidate_without_rollback = deepcopy(candidate)
     candidate_without_rollback["checks"]["rolling_upgrade"].pop("rollback")
@@ -1100,6 +1435,107 @@ def test_hpa_load_observation_accepts_cached_metric_and_status_lag() -> None:
 
     assert not valid
     assert any("ready replicas did not return" in reason for reason in reasons)
+
+
+def test_production_hpa_load_observation_rejects_nonzero_baseline(monkeypatch) -> None:
+    nonce = "a" * 32
+    fingerprint = "a" * 64
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_NODE_NAME_ENV, "cn-shenzhen.10.134.38.156")
+    evidence = _externalize_hpa_observation(
+        {
+            "status": "pass",
+            "observed_live": True,
+            "source": "kubectl_api",
+            "hpa_name": "trpc-worker",
+            "metric_name": "trpc_session_ready_backlog",
+            "scale_up_timeout_seconds": 120,
+            "scale_down_timeout_seconds": 360,
+            "trigger": {"kind": "controlled_backlog", "source": "bounded-driver"},
+            "run_nonce": nonce,
+            "namespace": "isolated",
+            "driver_evidence": _production_hpa_job_evidence("isolated", nonce, fingerprint),
+            "cluster_identity": {"fingerprint_sha256": fingerprint},
+            "before": {
+                "metric_value": 1,
+                "desired_replicas": 2,
+                "current_replicas": 2,
+                "ready_replicas": 2,
+            },
+            "during": {
+                "metric_value": 25,
+                "desired_replicas": 4,
+                "current_replicas": 4,
+                "ready_replicas": 4,
+            },
+            "after": {
+                "metric_value": 0,
+                "desired_replicas": 2,
+                "current_replicas": 2,
+                "ready_replicas": 2,
+            },
+        }
+    )
+
+    valid, reasons = _hpa_load_observation_contract(
+        evidence,
+        cluster_fingerprint=fingerprint,
+        run_nonce=nonce,
+        namespace="isolated",
+    )
+
+    assert not valid
+    assert "production HPA baseline backlog must be zero" in reasons
+
+
+def test_production_hpa_load_observation_rejects_after_residual(monkeypatch) -> None:
+    nonce = "a" * 32
+    fingerprint = "a" * 64
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_NODE_NAME_ENV, "cn-shenzhen.10.134.38.156")
+    evidence = _externalize_hpa_observation(
+        {
+            "status": "pass",
+            "observed_live": True,
+            "source": "kubectl_api",
+            "hpa_name": "trpc-worker",
+            "metric_name": "trpc_session_ready_backlog",
+            "scale_up_timeout_seconds": 120,
+            "scale_down_timeout_seconds": 360,
+            "trigger": {"kind": "controlled_backlog", "source": "bounded-driver"},
+            "run_nonce": nonce,
+            "namespace": "isolated",
+            "driver_evidence": _production_hpa_job_evidence("isolated", nonce, fingerprint),
+            "cluster_identity": {"fingerprint_sha256": fingerprint},
+            "before": {
+                "metric_value": 0,
+                "desired_replicas": 2,
+                "current_replicas": 2,
+                "ready_replicas": 2,
+            },
+            "during": {
+                "metric_value": 25,
+                "desired_replicas": 4,
+                "current_replicas": 4,
+                "ready_replicas": 4,
+            },
+            "after": {
+                "metric_value": 1,
+                "desired_replicas": 2,
+                "current_replicas": 2,
+                "ready_replicas": 2,
+            },
+        }
+    )
+
+    valid, reasons = _hpa_load_observation_contract(
+        evidence,
+        cluster_fingerprint=fingerprint,
+        run_nonce=nonce,
+        namespace="isolated",
+    )
+
+    assert not valid
+    assert "production HPA backlog must return to zero after cleanup" in reasons
+    assert "production HPA after backlog must equal the zero baseline" in reasons
 
 
 def test_hpa_load_report_payload_is_fixed_and_content_free() -> None:
@@ -1876,6 +2312,10 @@ def test_hpa_driver_cannot_supply_evidence_file(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-inherit")
     monkeypatch.setenv("TRPC_SERVICE_DATABASE_DSN", "postgresql://secret")
     monkeypatch.setenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "ghcr-pull")
+    monkeypatch.setenv(
+        "TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT",
+        "system:serviceaccount:runtime-gate:hpa-driver",
+    )
 
     def fake_run(command, **kwargs):
         captured["command"] = command
@@ -1884,6 +2324,8 @@ def test_hpa_driver_cannot_supply_evidence_file(monkeypatch, tmp_path) -> None:
             "status": "pass",
             "phase": "load",
             "namespace": "runtime-gate",
+            "target_namespace": "runtime-gate",
+            "job_namespace": "runtime-gate",
             "run_nonce": "a" * 32,
             "cluster_fingerprint": "b" * 64,
             "job_uid": "job-uid-1",
@@ -1935,6 +2377,7 @@ def test_hpa_driver_cannot_supply_evidence_file(monkeypatch, tmp_path) -> None:
         "TEMP",
         "TRPC_K8S_HPA_RUN_NONCE",
         "TRPC_K8S_HPA_NAMESPACE",
+        "TRPC_K8S_HPA_JOB_NAMESPACE",
         "TRPC_K8S_HPA_CLUSTER_FINGERPRINT",
         "TRPC_K8S_HPA_PHASE",
         "TRPC_K8S_HPA_DRIVER_SUBJECT",
@@ -1946,6 +2389,587 @@ def test_hpa_driver_cannot_supply_evidence_file(monkeypatch, tmp_path) -> None:
     assert "AWS_SECRET_ACCESS_KEY" not in environment
     assert "TRPC_SERVICE_DATABASE_DSN" not in environment
     assert environment["TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET"] == "ghcr-pull"
+
+
+def test_secret_profiles_are_applied_only_from_projected_stdin(monkeypatch) -> None:
+    calls: list[tuple[list[str], str | None]] = []
+
+    def fake_kubectl(arguments, **kwargs):
+        calls.append((arguments, kwargs.get("input_text")))
+        return CommandResult(status="pass")
+
+    monkeypatch.setattr(runtime_gate, "_kubectl", fake_kubectl)
+    result = runtime_gate._apply_secret_profiles(
+        (
+            ("runtime", "trpc-runtime-gate-a1b2c3d4e5", "runtime-projected"),
+            ("hpa", "trpc-runtime-driver", "hpa-projected"),
+        ),
+        context="ack",
+        timeout_seconds=5,
+        dry_run=True,
+    )
+
+    assert result.status == "pass"
+    assert [value for _command, value in calls] == ["runtime-projected", "hpa-projected"]
+    assert all(command[-2:] == ["-f", "-"] for command, _value in calls)
+    assert all("--dry-run=server" in command for command, _value in calls)
+    assert result.evidence == {
+        "values_recorded": False,
+        "completed_profiles": [
+            {"profile": "runtime", "namespace": "trpc-runtime-gate-a1b2c3d4e5"},
+            {"profile": "hpa", "namespace": "trpc-runtime-driver"},
+        ],
+    }
+
+
+def test_hpa_driver_control_plane_is_bound_only_in_driver_namespace(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_kubectl(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured["manifest"] = kwargs.get("input_text")
+        return CommandResult(status="pass")
+
+    monkeypatch.setattr(runtime_gate, "_kubectl", fake_kubectl)
+    result = runtime_gate._bind_hpa_driver_rbac(
+        subject="system:serviceaccount:trpc-runtime-driver:hpa-driver",
+        namespace="trpc-runtime-driver",
+        context="ack",
+        timeout_seconds=5,
+        support_namespace="trpc-cell-fabric-support",
+        role_name="trpc-hpa-load-driver-a1b2c3d4e5",
+    )
+
+    assert result.status == "pass"
+    documents = list(yaml.safe_load_all(str(captured["manifest"])))
+    assert {item["kind"] for item in documents} == {"Role", "RoleBinding", "NetworkPolicy"}
+    assert {item["metadata"]["namespace"] for item in documents} == {"trpc-runtime-driver"}
+    role = next(item for item in documents if item["kind"] == "Role")
+    assert role["metadata"]["name"] == "trpc-hpa-load-driver-a1b2c3d4e5"
+    pod_rule = next(rule for rule in role["rules"] if rule["resources"] == ["pods"])
+    assert pod_rule["verbs"] == ["get", "list"]
+    policy = next(item for item in documents if item["kind"] == "NetworkPolicy")
+    assert policy["spec"]["podSelector"]["matchLabels"] == {
+        "trpc.io/hpa-gate": "bounded-job-driver"
+    }
+    assert "trpc-cell-fabric-support" in str(policy["spec"])
+
+
+def test_hpa_driver_binding_rejects_cross_namespace_subject(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runtime_gate,
+        "_kubectl",
+        lambda *_args, **_kwargs: pytest.fail("kubectl must not run"),
+    )
+
+    result = runtime_gate._bind_hpa_driver_rbac(
+        subject="system:serviceaccount:other:hpa-driver",
+        namespace="trpc-runtime-driver",
+        context="ack",
+        timeout_seconds=5,
+    )
+
+    assert result.status == "not_run"
+    assert "subject namespace" in result.reason
+
+
+def test_hpa_driver_control_cleanup_requires_owned_resources(monkeypatch) -> None:
+    resources = {
+        ("role", "trpc-hpa-load-driver-a1b2c3d4e5"): {
+            "metadata": {
+                "name": "trpc-hpa-load-driver-a1b2c3d4e5",
+                "namespace": "trpc-runtime-driver",
+                "labels": {
+                    runtime_gate.HPA_DRIVER_OWNER_LABEL: runtime_gate.HPA_DRIVER_OWNER_VALUE
+                },
+            }
+        },
+        ("rolebinding", "trpc-hpa-load-driver-a1b2c3d4e5"): {
+            "metadata": {
+                "name": "trpc-hpa-load-driver-a1b2c3d4e5",
+                "namespace": "trpc-runtime-driver",
+                "labels": {
+                    runtime_gate.HPA_DRIVER_OWNER_LABEL: runtime_gate.HPA_DRIVER_OWNER_VALUE
+                },
+            }
+        },
+        ("networkpolicy", "trpc-hpa-load-driver-egress-a1b2c3d4e5"): {
+            "metadata": {
+                "name": "trpc-hpa-load-driver-egress-a1b2c3d4e5",
+                "namespace": "trpc-runtime-driver",
+                "labels": {
+                    runtime_gate.HPA_DRIVER_OWNER_LABEL: runtime_gate.HPA_DRIVER_OWNER_VALUE
+                },
+            }
+        },
+    }
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        return CommandResult(status="pass"), resources[(arguments[1], arguments[2])]
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    result = runtime_gate._verify_hpa_driver_control_resource_ownership(
+        namespace="trpc-runtime-driver",
+        role_name="trpc-hpa-load-driver-a1b2c3d4e5",
+        network_policy_name="trpc-hpa-load-driver-egress-a1b2c3d4e5",
+        context="ack",
+        timeout_seconds=5,
+    )
+    assert result.status == "pass"
+    assert result.evidence is not None
+    assert all(item["state"] == "owned" for item in result.evidence["resources"])
+
+    resources[("role", "trpc-hpa-load-driver-a1b2c3d4e5")]["metadata"]["labels"] = {}
+    result = runtime_gate._verify_hpa_driver_control_resource_ownership(
+        namespace="trpc-runtime-driver",
+        role_name="trpc-hpa-load-driver-a1b2c3d4e5",
+        network_policy_name="trpc-hpa-load-driver-egress-a1b2c3d4e5",
+        context="ack",
+        timeout_seconds=5,
+    )
+    assert result.status == "fail"
+    assert "owner label" in result.reason
+
+
+@pytest.mark.parametrize("case", ["absent", "api-error", "invalid-name"])
+def test_hpa_driver_control_cleanup_is_fail_closed_for_unverified_resources(
+    monkeypatch, case
+) -> None:
+    if case == "invalid-name":
+        monkeypatch.setattr(
+            runtime_gate,
+            "_json_command",
+            lambda *_args, **_kwargs: pytest.fail("kubectl must not run"),
+        )
+        result = runtime_gate._verify_hpa_driver_control_resource_ownership(
+            namespace="trpc-runtime-driver",
+            role_name="bad.name",
+            network_policy_name="egress",
+            context="ack",
+            timeout_seconds=5,
+        )
+        assert result.status == "not_run"
+        assert "name is invalid" in result.reason
+        return
+
+    def fake_json(_arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        if case == "absent":
+            return CommandResult(status="fail", stderr="NotFound"), None
+        return CommandResult(status="fail", stderr="forbidden"), None
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    result = runtime_gate._verify_hpa_driver_control_resource_ownership(
+        namespace="trpc-runtime-driver",
+        role_name="trpc-hpa-load-driver-a1b2c3d4e5",
+        network_policy_name="trpc-hpa-load-driver-egress-a1b2c3d4e5",
+        context="ack",
+        timeout_seconds=5,
+    )
+    if case == "absent":
+        assert result.status == "pass"
+        assert all(item["state"] == "absent" for item in result.evidence["resources"])
+    else:
+        assert result.status == "fail"
+        assert "ownership could not be verified" in result.reason
+
+
+def test_hpa_cleanup_receipt_sanitizer_drops_unknown_fields() -> None:
+    nonce = "a" * 32
+    receipt = {
+        "schema_version": 1,
+        "status": "pass",
+        "phase": "clear",
+        "run_nonce": nonce,
+        "tenant_id": "hpa-" + nonce,
+        "already_absent": False,
+        "deleted": {name: 0 for name in runtime_gate._HPA_CLEANUP_TABLES},
+        "residual": {name: 0 for name in runtime_gate._HPA_CLEANUP_TABLES},
+        "diagnostic": "discard-me",
+    }
+    sanitized = runtime_gate._sanitized_hpa_cleanup_receipt(receipt, nonce=nonce)
+    assert sanitized is not None
+    assert "diagnostic" not in sanitized
+    assert set(sanitized) == {
+        "schema_version",
+        "status",
+        "phase",
+        "run_nonce",
+        "tenant_id",
+        "already_absent",
+        "deleted",
+        "residual",
+    }
+
+
+def test_hpa_driver_namespace_preflight_requires_empty_dedicated_namespace(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        calls.append(arguments)
+        if arguments[:2] == ["get", "namespace"]:
+            return CommandResult(status="pass"), {
+                "metadata": {
+                    "name": "trpc-runtime-driver",
+                    "labels": {
+                        runtime_gate.HPA_DRIVER_NAMESPACE_OWNER_LABEL: (
+                            runtime_gate.HPA_DRIVER_NAMESPACE_OWNER_VALUE
+                        )
+                    },
+                }
+            }
+        if arguments[:2] == ["get", "serviceaccount"]:
+            return CommandResult(status="pass"), {
+                "metadata": {
+                    "name": "hpa-driver",
+                    "namespace": "trpc-runtime-driver",
+                }
+            }
+        return CommandResult(status="pass"), {"items": []}
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    monkeypatch.setattr(
+        runtime_gate,
+        "_permission_check",
+        lambda *_args, **_kwargs: CommandResult(status="pass"),
+    )
+
+    result = runtime_gate._hpa_driver_namespace_preflight(
+        subject="system:serviceaccount:trpc-runtime-driver:hpa-driver",
+        namespace="trpc-runtime-driver",
+        context="ack",
+        timeout_seconds=5,
+    )
+
+    assert result.status == "pass"
+    assert result.evidence is not None
+    assert result.evidence["job_count"] == 0
+    assert result.evidence["pod_count"] == 0
+    assert len(result.evidence["permissions"]) == 16
+    assert [value[1] for value in calls] == [
+        "namespace",
+        "serviceaccount",
+        "serviceaccounts",
+        "secrets",
+        "deployments",
+        "statefulsets",
+        "daemonsets",
+        "replicasets",
+        "cronjobs",
+        "jobs",
+        "replicationcontrollers",
+        "pods",
+    ]
+
+
+def test_hpa_driver_namespace_preflight_rejects_existing_workload(monkeypatch) -> None:
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        if arguments[:2] == ["get", "namespace"]:
+            return CommandResult(status="pass"), {
+                "metadata": {
+                    "name": "trpc-runtime-driver",
+                    "labels": {
+                        runtime_gate.HPA_DRIVER_NAMESPACE_OWNER_LABEL: (
+                            runtime_gate.HPA_DRIVER_NAMESPACE_OWNER_VALUE
+                        )
+                    },
+                }
+            }
+        if arguments[:2] == ["get", "serviceaccount"]:
+            return CommandResult(status="pass"), {
+                "metadata": {
+                    "name": "hpa-driver",
+                    "namespace": "trpc-runtime-driver",
+                }
+            }
+        if arguments[1] == "serviceaccounts":
+            return CommandResult(status="pass"), {"items": [{"metadata": {"name": "hpa-driver"}}]}
+        if arguments[1] == "secrets":
+            return CommandResult(status="pass"), {"items": []}
+        return CommandResult(status="pass"), {"items": [{"metadata": {"name": "stale"}}]}
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+
+    result = runtime_gate._hpa_driver_namespace_preflight(
+        subject="system:serviceaccount:trpc-runtime-driver:hpa-driver",
+        namespace="trpc-runtime-driver",
+        context="ack",
+        timeout_seconds=5,
+    )
+
+    assert result.status == "not_run"
+    assert "pre-existing workloads" in result.reason
+
+
+@pytest.mark.parametrize("case", ["owner", "serviceaccount", "secret"])
+def test_hpa_driver_namespace_preflight_rejects_unapproved_static_objects(
+    monkeypatch, case
+) -> None:
+    namespace = "trpc-runtime-driver"
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        resource = arguments[1]
+        if resource == "namespace":
+            labels = {
+                runtime_gate.HPA_DRIVER_NAMESPACE_OWNER_LABEL: (
+                    "wrong-owner"
+                    if case == "owner"
+                    else runtime_gate.HPA_DRIVER_NAMESPACE_OWNER_VALUE
+                )
+            }
+            return CommandResult(status="pass"), {"metadata": {"name": namespace, "labels": labels}}
+        if resource == "serviceaccount":
+            return CommandResult(status="pass"), {
+                "metadata": {"name": "hpa-driver", "namespace": namespace}
+            }
+        if resource == "serviceaccounts":
+            items = [{"metadata": {"name": "hpa-driver"}}]
+            if case == "serviceaccount":
+                items.append({"metadata": {"name": "unexpected"}})
+            return CommandResult(status="pass"), {"items": items}
+        if resource == "secrets":
+            items = []
+            if case == "secret":
+                items = [{"metadata": {"name": "unexpected-secret"}}]
+            return CommandResult(status="pass"), {"items": items}
+        return CommandResult(status="pass"), {"items": []}
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    result = runtime_gate._hpa_driver_namespace_preflight(
+        subject=f"system:serviceaccount:{namespace}:hpa-driver",
+        namespace=namespace,
+        context="ack",
+        timeout_seconds=5,
+    )
+
+    assert result.status == "not_run"
+    if case == "owner":
+        assert "owner label" in result.reason
+    elif case == "serviceaccount":
+        assert "unexpected ServiceAccount" in result.reason
+    else:
+        assert "unexpected Secret" in result.reason
+
+
+def test_hpa_driver_namespace_preflight_rejects_invalid_static_secret_allowlist(
+    monkeypatch,
+) -> None:
+    result = runtime_gate._hpa_driver_namespace_preflight(
+        subject="system:serviceaccount:trpc-runtime-driver:hpa-driver",
+        namespace="trpc-runtime-driver",
+        context="ack",
+        timeout_seconds=5,
+        allowed_secret_names=("",),
+    )
+    assert result.status == "not_run"
+    assert "allowlist is invalid" in result.reason
+
+
+def test_observe_hpa_driver_job_attests_pod_node_and_template(monkeypatch) -> None:
+    namespace = "runtime-gate"
+    nonce = "a" * 32
+    fingerprint = "b" * 64
+    node_name = "cn-shenzhen.10.134.38.156"
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_NODE_LABEL_ENV, "trpc-role=load-driver")
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_TAINT_KEY_ENV, "trpc-role")
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_TAINT_VALUE_ENV, "load-driver")
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_TAINT_EFFECT_ENV, "NoSchedule")
+    job_name = runtime_gate._hpa_job_name(nonce)
+    job_uid = "job-uid"
+    job = {
+        "metadata": {
+            "name": job_name,
+            "namespace": namespace,
+            "uid": job_uid,
+            "labels": {
+                runtime_gate.HPA_DRIVER_OWNER_LABEL: runtime_gate.HPA_DRIVER_OWNER_VALUE,
+                runtime_gate.HPA_DRIVER_RUN_LABEL: nonce,
+                runtime_gate.HPA_DRIVER_PHASE_LABEL: "load",
+                runtime_gate.HPA_DRIVER_CLUSTER_LABEL: fingerprint[:63],
+            },
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "nodeSelector": {
+                        "trpc-role": "load-driver",
+                        "kubernetes.io/hostname": node_name,
+                    },
+                    "tolerations": [
+                        {
+                            "key": "trpc-role",
+                            "operator": "Equal",
+                            "value": "load-driver",
+                            "effect": "NoSchedule",
+                        }
+                    ],
+                }
+            }
+        },
+    }
+    pod = {
+        "metadata": {
+            "name": "hpa-pod",
+            "uid": "pod-uid",
+            "labels": {
+                runtime_gate.HPA_DRIVER_OWNER_LABEL: runtime_gate.HPA_DRIVER_OWNER_VALUE,
+                runtime_gate.HPA_DRIVER_RUN_LABEL: nonce,
+                runtime_gate.HPA_DRIVER_PHASE_LABEL: "load",
+                runtime_gate.HPA_DRIVER_CLUSTER_LABEL: fingerprint[:63],
+                "app.kubernetes.io/part-of": "trpc-agent-service",
+            },
+            "ownerReferences": [
+                {"kind": "Job", "uid": job_uid, "controller": True},
+            ],
+        },
+        "spec": {"nodeName": node_name},
+        "status": {"phase": "Running"},
+    }
+    calls: list[list[str]] = []
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        calls.append(arguments)
+        if arguments[1] == "job":
+            return CommandResult(status="pass"), job
+        assert arguments[1] == "pods"
+        return CommandResult(status="pass"), {"items": [pod]}
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    result, evidence = runtime_gate._observe_hpa_driver_job(
+        namespace=namespace,
+        run_nonce=nonce,
+        cluster_fingerprint=fingerprint,
+        context="admin",
+        timeout_seconds=5,
+        expected_node_name=node_name,
+    )
+
+    assert result.status == "pass"
+    assert evidence is not None
+    assert evidence["placement"] == {
+        "pod_name": "hpa-pod",
+        "pod_uid": "pod-uid",
+        "pod_node_name": node_name,
+        "pod_phase": "Running",
+        "expected_node_name": node_name,
+        "node_selector": {
+            "trpc-role": "load-driver",
+            "kubernetes.io/hostname": node_name,
+        },
+        "tolerations": [
+            {
+                "key": "trpc-role",
+                "operator": "Equal",
+                "value": "load-driver",
+                "effect": "NoSchedule",
+            }
+        ],
+    }
+    assert calls[1][0:2] == ["get", "pods"]
+
+
+def test_observe_hpa_driver_job_rejects_unexpected_pod_node(monkeypatch) -> None:
+    node_name = "cn-shenzhen.10.134.38.156"
+    unexpected_node = "cn-shenzhen.10.134.38.131"
+    nonce = "a" * 32
+    fingerprint = "b" * 64
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_NODE_LABEL_ENV, "trpc-role=load-driver")
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_TAINT_KEY_ENV, "trpc-role")
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_TAINT_VALUE_ENV, "load-driver")
+    monkeypatch.setenv(runtime_gate.HPA_DRIVER_TAINT_EFFECT_ENV, "NoSchedule")
+    job_name = runtime_gate._hpa_job_name(nonce)
+    labels = {
+        runtime_gate.HPA_DRIVER_OWNER_LABEL: runtime_gate.HPA_DRIVER_OWNER_VALUE,
+        runtime_gate.HPA_DRIVER_RUN_LABEL: nonce,
+        runtime_gate.HPA_DRIVER_PHASE_LABEL: "load",
+        runtime_gate.HPA_DRIVER_CLUSTER_LABEL: fingerprint[:63],
+    }
+    job = {
+        "metadata": {
+            "name": job_name,
+            "namespace": "runtime-gate",
+            "uid": "job-uid",
+            "labels": labels,
+        },
+        "spec": {"template": {"spec": {}}},
+    }
+    pod = {
+        "metadata": {
+            "name": "hpa-pod",
+            "uid": "pod-uid",
+            "labels": {**labels, "app.kubernetes.io/part-of": "trpc-agent-service"},
+            "ownerReferences": [{"kind": "Job", "uid": "job-uid", "controller": True}],
+        },
+        "spec": {"nodeName": unexpected_node},
+        "status": {"phase": "Running"},
+    }
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        if arguments[1] == "job":
+            return CommandResult(status="pass"), job
+        return CommandResult(status="pass"), {"items": [pod]}
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    result, evidence = runtime_gate._observe_hpa_driver_job(
+        namespace="runtime-gate",
+        run_nonce=nonce,
+        cluster_fingerprint=fingerprint,
+        context="admin",
+        timeout_seconds=5,
+        expected_node_name=node_name,
+    )
+
+    assert result.status == "fail"
+    assert "unexpected node" in result.reason
+    assert evidence is None
+
+
+def test_observe_hpa_driver_job_tolerates_api_gap_longer_than_thirty_seconds(
+    monkeypatch,
+) -> None:
+    clock = 0.0
+    attempts = 0
+
+    def monotonic() -> float:
+        return clock
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    def observe_once(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 130:
+            return CommandResult(
+                status="fail",
+                reason="HPA load Job API object is unavailable",
+            ), None
+        return CommandResult(status="pass"), {"api_observed": True}
+
+    monkeypatch.setattr(runtime_gate.time, "monotonic", monotonic)
+    monkeypatch.setattr(runtime_gate.time, "sleep", sleep)
+    monkeypatch.setattr(runtime_gate, "_observe_hpa_driver_job_once", observe_once)
+
+    result, evidence = runtime_gate._observe_hpa_driver_job(
+        namespace="driver-namespace",
+        target_namespace="runtime-namespace",
+        run_nonce="a" * 32,
+        cluster_fingerprint="b" * 64,
+        context="admin",
+        timeout_seconds=60,
+    )
+
+    assert clock > 30
+    assert attempts == 131
+    assert result.status == "pass"
+    assert evidence == {"api_observed": True}
 
 
 def test_driver_kubectl_keeps_required_os_runtime_env_without_parent_secrets(monkeypatch) -> None:
@@ -2018,7 +3042,7 @@ def _install_driver_scope_mocks(
     transient_review_failures: dict[str, int] | None = None,
 ) -> tuple[str, str, list[str], list[list[str]]]:
     subject = "system:serviceaccount:trpc-hpa-driver:trpc-hpa-driver"
-    namespace = "runtime-gate"
+    namespace = "trpc-hpa-driver"
     review_namespaces: list[str] = []
     admin_calls: list[list[str]] = []
     non_resource_rules = non_resource_rules or [
@@ -2077,7 +3101,7 @@ def _install_driver_scope_mocks(
         ]
         target_rules = [
             {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create", "get", "delete"]},
-            {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]},
+            {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
             {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
         ]
         resource_rules = identity_rules + (
@@ -2134,6 +3158,25 @@ def test_driver_scope_allows_standard_discovery_and_audits_bindings(monkeypatch)
         "matching_rolebinding_count": 1,
         "matching_clusterrolebinding_count": 0,
     }
+
+
+def test_driver_scope_rejects_subject_outside_job_namespace(monkeypatch) -> None:
+    subject, namespace, _review_namespaces, _admin_calls = _install_driver_scope_mocks(monkeypatch)
+    server_identity = "v1.33.1|commit|linux/amd64"
+    cluster_fingerprint = hashlib.sha256(server_identity.encode("utf-8")).hexdigest()
+
+    allowed, reasons, _attestation = runtime_gate._driver_identity_and_scope(
+        kubeconfig_path="driver.kubeconfig",
+        driver_context="trpc-hpa-driver-gate2",
+        admin_context="kind-trpc-runtime-gate2",
+        subject=subject,
+        namespace=f"{namespace}-other",
+        cluster_fingerprint=cluster_fingerprint,
+        timeout_seconds=5,
+    )
+
+    assert not allowed
+    assert "HPA driver subject namespace differs from the Job namespace" in reasons
 
 
 def test_driver_scope_retries_transient_rules_review_failure(monkeypatch) -> None:
@@ -2278,6 +3321,7 @@ def test_hpa_driver_rejects_gate_kubeconfig_reuse(monkeypatch, tmp_path) -> None
 
 def test_controlled_node_drain_requires_dedicated_node_and_uncordons(monkeypatch) -> None:
     cordoned = False
+    drained = False
     calls: list[list[str]] = []
 
     def fake_json(arguments, *, context, timeout_seconds):
@@ -2288,12 +3332,15 @@ def test_controlled_node_drain_requires_dedicated_node_and_uncordons(monkeypatch
                 "spec": {"unschedulable": cordoned},
                 "status": {"conditions": [{"type": "Ready", "status": "True"}]},
             }
+        if drained:
+            return CommandResult(status="pass"), {"items": []}
         return CommandResult(status="pass"), {
             "items": [
                 {
                     "metadata": {
                         "namespace": "runtime-gate",
-                        "ownerReferences": [{"kind": "Deployment"}],
+                        "labels": {"app.kubernetes.io/name": "trpc-worker"},
+                        "ownerReferences": [{"kind": "ReplicaSet", "controller": True}],
                     }
                 }
             ]
@@ -2301,10 +3348,12 @@ def test_controlled_node_drain_requires_dedicated_node_and_uncordons(monkeypatch
 
     def fake_kubectl(arguments, *, context, timeout_seconds, input_text=None):
         del context, timeout_seconds, input_text
-        nonlocal cordoned
+        nonlocal cordoned, drained
         calls.append(arguments)
         if arguments[0] == "cordon":
             cordoned = True
+        elif arguments[0] == "drain":
+            drained = True
         elif arguments[0] == "uncordon":
             cordoned = False
         return CommandResult(status="pass")
@@ -2323,9 +3372,70 @@ def test_controlled_node_drain_requires_dedicated_node_and_uncordons(monkeypatch
     assert [call[0] for call in calls] == ["cordon", "drain", "uncordon"]
     drain_args = calls[1]
     assert "--delete-emptydir-data=true" in drain_args
+    assert "--disable-eviction=true" in drain_args
     assert "--force=false" in drain_args
+    assert details["drain_policy"] == {
+        "mode": "hard-node-failure",
+        "disable_eviction": True,
+        "pdb_bypass": True,
+        "pdb_preflight_required": True,
+    }
     assert details["post_drain"]["node_cordoned"] is True
     assert details["uncordon"]["status"] == "pass"
+
+
+def test_node_drain_preflight_rejects_unowned_pod_in_gate_namespace(monkeypatch) -> None:
+    trusted = False
+
+    def fake_json(arguments, *, context, timeout_seconds):
+        del context, timeout_seconds
+        if arguments[:2] == ["get", "node"]:
+            return CommandResult(status="pass"), {
+                "metadata": {"labels": {"trpc-cell-fabric-owner": "innovation"}},
+                "spec": {"unschedulable": False},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            }
+        labels = {"app.kubernetes.io/name": "trpc-worker"}
+        if trusted:
+            labels.update(
+                {
+                    "trpc.io/managed-by": "trpc-kubernetes-runtime-gate",
+                    "trpc.io/run-nonce": "a" * 32,
+                    "trpc.io/cluster-fingerprint": "b" * 63,
+                }
+            )
+        return CommandResult(status="pass"), {
+            "items": [
+                {
+                    "metadata": {
+                        "namespace": "runtime-gate",
+                        "labels": labels,
+                        "ownerReferences": [{"kind": "ReplicaSet", "controller": True}],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(runtime_gate, "_json_command", fake_json)
+    arguments = {
+        "namespace": "runtime-gate",
+        "label_key": "trpc-cell-fabric-owner",
+        "label_value": "innovation",
+        "context": "test",
+        "timeout_seconds": 5,
+        "run_nonce": "a" * 32,
+        "cluster_fingerprint": "b" * 64,
+    }
+
+    result, details = runtime_gate._node_drain_preflight("node-1", **arguments)
+    assert result.status == "not_run"
+    assert details["blocking_pod_count"] == 1
+
+    trusted = True
+    result, details = runtime_gate._node_drain_preflight("node-1", **arguments)
+    assert result.status == "pass"
+    assert details["blocking_pod_count"] == 0
+    assert details["gate_namespace_pod_count"] == 1
 
 
 def test_controlled_node_drain_refuses_other_workloads(monkeypatch) -> None:
@@ -2374,6 +3484,7 @@ def test_controlled_node_drain_allows_ready_pdb_protected_system_replica(
     monkeypatch,
 ) -> None:
     cordoned = False
+    drained = False
     calls: list[list[str]] = []
 
     def fake_json(arguments, *, context, timeout_seconds):
@@ -2399,31 +3510,37 @@ def test_controlled_node_drain_allows_ready_pdb_protected_system_replica(
                     }
                 ]
             }
-        return CommandResult(status="pass"), {
-            "items": [
+        items = [
+            {
+                "metadata": {
+                    "namespace": "kube-system",
+                    "labels": {"k8s-app": "kube-dns"},
+                    "ownerReferences": [{"kind": "ReplicaSet", "controller": True}],
+                },
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            }
+        ]
+        if not drained:
+            items.insert(
+                0,
                 {
                     "metadata": {
                         "namespace": "runtime-gate",
-                        "ownerReferences": [{"kind": "Deployment"}],
+                        "labels": {"app.kubernetes.io/name": "trpc-worker"},
+                        "ownerReferences": [{"kind": "ReplicaSet", "controller": True}],
                     }
                 },
-                {
-                    "metadata": {
-                        "namespace": "kube-system",
-                        "labels": {"k8s-app": "kube-dns"},
-                        "ownerReferences": [{"kind": "ReplicaSet", "controller": True}],
-                    },
-                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
-                },
-            ]
-        }
+            )
+        return CommandResult(status="pass"), {"items": items}
 
     def fake_kubectl(arguments, *, context, timeout_seconds, input_text=None):
         del context, timeout_seconds, input_text
-        nonlocal cordoned
+        nonlocal cordoned, drained
         calls.append(arguments)
         if arguments[0] == "cordon":
             cordoned = True
+        elif arguments[0] == "drain":
+            drained = True
         elif arguments[0] == "uncordon":
             cordoned = False
         return CommandResult(status="pass")
@@ -2442,6 +3559,7 @@ def test_controlled_node_drain_allows_ready_pdb_protected_system_replica(
     assert details["blocking_pod_count"] == 0
     assert details["pdb_protected_system_pod_count"] == 1
     assert [call[0] for call in calls] == ["cordon", "drain", "uncordon"]
+    assert "--disable-eviction=true" in calls[1]
 
 
 def test_controlled_node_drain_rejects_system_replica_without_pdb_headroom(
@@ -2695,6 +3813,96 @@ def test_rendered_manifest_contract_requires_v2_and_resource_protection() -> Non
     invalid, reasons = _rendered_manifest_contract(fake_drain)
     assert not invalid
     assert any("exact drain" in reason for reason in reasons)
+
+
+def test_rendered_manifest_contract_checks_runtime_node_and_discovery_isolation() -> None:
+    root = Path("deploy/kustomize/base")
+    rendered = "\n---\n".join(
+        (root / name).read_text(encoding="utf-8")
+        for name in (
+            "config.yaml",
+            "deployments.yaml",
+            "disruption.yaml",
+            "network-policy.yaml",
+            "autoscaling.yaml",
+            "migration-job.yaml",
+            "services.yaml",
+        )
+    )
+    documents = [
+        document for document in yaml.safe_load_all(rendered) if isinstance(document, dict)
+    ]
+    selector = {
+        "trpc-runtime-gate": "acceptance",
+        "kubernetes.io/hostname": "ack-workload-0",
+    }
+    labels = {
+        "trpc.io/managed-by": "trpc-kubernetes-runtime-gate",
+        "trpc.io/run-nonce": "a" * 32,
+        "trpc.io/cluster-fingerprint": "b" * 63,
+    }
+    for document in documents:
+        kind = document.get("kind")
+        metadata = document.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if kind == "Deployment":
+            spec = document["spec"]
+            spec["template"]["spec"]["nodeSelector"] = dict(selector)
+            spec["template"].setdefault("metadata", {}).setdefault("labels", {}).update(labels)
+            if name == "trpc-backlog-exporter":
+                document.setdefault("metadata", {})["labels"] = dict(labels)
+                container = next(
+                    item
+                    for item in spec["template"]["spec"]["containers"]
+                    if item["name"] == "backlog-exporter"
+                )
+                container.setdefault("env", []).append(
+                    {
+                        "name": "TRPC_BACKLOG_TENANT_ID",
+                        "value": "hpa-" + "a" * 32,
+                    }
+                )
+        elif kind == "Job" and name == "trpc-schema-migration":
+            document["spec"]["template"]["spec"]["nodeSelector"] = dict(selector)
+            document["spec"]["template"].setdefault("metadata", {}).setdefault("labels", {}).update(
+                labels
+            )
+        elif kind == "Service" and name == "trpc-backlog-exporter":
+            document.setdefault("metadata", {})["labels"] = dict(labels)
+        elif kind == "NetworkPolicy" and name == "trpc-allow-backlog-exporter":
+            policy_spec = document["spec"]
+            policy_spec["ingress"][0]["from"][1]["namespaceSelector"]["matchLabels"][
+                "kubernetes.io/metadata.name"
+            ] = "trpc-cell-fabric-support"
+            policy_spec["egress"][0]["to"][1]["namespaceSelector"]["matchLabels"][
+                "kubernetes.io/metadata.name"
+            ] = "trpc-cell-fabric-support"
+
+    valid, reasons = _rendered_manifest_contract(
+        yaml.safe_dump_all(documents, sort_keys=False),
+        required_node_selector=selector,
+        required_runtime_labels=labels,
+        support_namespace="trpc-cell-fabric-support",
+    )
+    assert valid
+    assert reasons == ()
+
+    tampered = deepcopy(documents)
+    worker = next(
+        document
+        for document in tampered
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "trpc-worker"
+    )
+    worker["spec"]["template"]["spec"]["nodeSelector"].pop("kubernetes.io/hostname")
+    invalid, reasons = _rendered_manifest_contract(
+        yaml.safe_dump_all(tampered, sort_keys=False),
+        required_node_selector=selector,
+        required_runtime_labels=labels,
+        support_namespace="trpc-cell-fabric-support",
+    )
+    assert not invalid
+    assert "trpc-worker is not pinned" in " ".join(reasons)
 
 
 def test_manifest_contract_uses_ten_second_timeout_for_database_exec_probes() -> None:

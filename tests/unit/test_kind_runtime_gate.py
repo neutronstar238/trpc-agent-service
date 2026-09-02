@@ -51,11 +51,25 @@ def test_kind_prerequisites_are_isolated_and_complete() -> None:
     assert len(runtime["TRPC_SERVICE_SESSION_HMAC_KEY"]) >= 32
     assert len(runtime["TRPC_SERVICE_EMERGENCY_QUEUE_KEY"]) == 32
     init_sql = resources[("ConfigMap", "trpc-gate-postgres-init")]["data"]["001-runtime-role.sql"]
+    migration_role_contract = (
+        "CREATE ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
+    )
+    assert migration_role_contract in init_sql
+    assert "ALTER ROLE trpc_migration LOGIN NOSUPERUSER" in init_sql
+    assert "ALTER DATABASE trpc_service OWNER TO trpc_migration" in init_sql
     assert "CREATE ROLE trpc_worker LOGIN NOSUPERUSER" in init_sql
     assert "NOINHERIT BYPASSRLS" in init_sql
     assert ("Deployment", "postgres") in resources
     assert ("Deployment", "redis") in resources
     assert ("NetworkPolicy", "trpc-gate-allow-dependencies") in resources
+    postgres_env = {
+        entry["name"]: entry.get("value")
+        for entry in resources[("Deployment", "postgres")]["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+    }
+    assert postgres_env["POSTGRES_USER"] == "trpc_gate_bootstrap"
+    assert postgres_env["POSTGRES_USER"] != "trpc_migration"
 
     expected_selector = {"node-role.kubernetes.io/control-plane": ""}
     expected_toleration = {

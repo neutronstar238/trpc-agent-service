@@ -3,8 +3,8 @@
 The cell event log is deliberately small and persistence neutral.  It is the
 contract that a PostgreSQL implementation can later back without changing
 replay or branch semantics.  A stream is identified by the complete cell
-scope (tenant, cell, session, capsule and branch); no method in this module
-accepts a partially qualified stream.
+scope (tenant, app, cell, session, capsule and branch); no method in this
+module accepts a partially qualified stream.
 
 The in-memory implementation is synchronous because appending an event is a
 local, atomic operation.  ``*_async`` methods are provided as thin adapters
@@ -115,6 +115,10 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _is_sha256_hex(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def _timestamp(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("occurred_at must be timezone-aware")
@@ -130,15 +134,26 @@ class CellAddress:
     session_id: str
     capsule_digest: str
     branch_id: str = "main"
+    # Kept after the historical positional fields for backwards compatibility;
+    # it is still part of the complete stream identity and event hash.
+    app_id: str = "default"
 
     def __post_init__(self) -> None:
-        for name in ("tenant_id", "cell_id", "session_id", "capsule_digest", "branch_id"):
+        for name in (
+            "tenant_id",
+            "app_id",
+            "cell_id",
+            "session_id",
+            "capsule_digest",
+            "branch_id",
+        ):
             _require_identifier(name, getattr(self, name))
 
     @property
-    def stream_key(self) -> tuple[str, str, str, str, str]:
+    def stream_key(self) -> tuple[str, str, str, str, str, str]:
         return (
             self.tenant_id,
+            self.app_id,
             self.cell_id,
             self.session_id,
             self.capsule_digest,
@@ -148,6 +163,7 @@ class CellAddress:
     def with_branch(self, branch_id: str) -> CellAddress:
         return CellAddress(
             tenant_id=self.tenant_id,
+            app_id=self.app_id,
             cell_id=self.cell_id,
             session_id=self.session_id,
             capsule_digest=self.capsule_digest,
@@ -182,11 +198,13 @@ class EventDraft:
     trace_id: str | None = None
     request_id: str | None = None
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    app_id: str = "default"
 
     @property
     def address(self) -> CellAddress:
         return CellAddress(
             tenant_id=self.tenant_id,
+            app_id=self.app_id,
             cell_id=self.cell_id,
             session_id=self.session_id,
             capsule_digest=self.capsule_digest,
@@ -197,6 +215,7 @@ class EventDraft:
         """Return a validated, immutable-copy-friendly draft."""
 
         _require_identifier("event_type", str(self.event_type))
+        _require_identifier("app_id", self.app_id)
         if self.event_id is not None:
             _require_identifier("event_id", self.event_id)
         if self.causation_id is not None:
@@ -215,6 +234,7 @@ class EventDraft:
         payload = cast(Mapping[str, object], payload_value)
         return EventDraft(
             tenant_id=self.tenant_id,
+            app_id=self.app_id,
             cell_id=self.cell_id,
             session_id=self.session_id,
             capsule_digest=self.capsule_digest,
@@ -255,11 +275,13 @@ class CausalEvent:
     prev_hash: str
     payload_hash: str
     event_hash: str
+    app_id: str = "default"
 
     @property
     def address(self) -> CellAddress:
         return CellAddress(
             tenant_id=self.tenant_id,
+            app_id=self.app_id,
             cell_id=self.cell_id,
             session_id=self.session_id,
             capsule_digest=self.capsule_digest,
@@ -276,6 +298,7 @@ class CausalEvent:
         return {
             "version": 1,
             "tenant_id": self.tenant_id,
+            "app_id": self.app_id,
             "cell_id": self.cell_id,
             "session_id": self.session_id,
             "capsule_digest": self.capsule_digest,
@@ -303,7 +326,9 @@ class CausalEvent:
 
         if self.sequence < 1:
             raise ChainIntegrityError("event sequence must be positive")
-        if len(self.prev_hash) != 64 or len(self.payload_hash) != 64 or len(self.event_hash) != 64:
+        if not all(
+            _is_sha256_hex(value) for value in (self.prev_hash, self.payload_hash, self.event_hash)
+        ):
             raise ChainIntegrityError("event hashes must be SHA-256 hex strings")
         if self.recompute_payload_hash() != self.payload_hash:
             raise ChainIntegrityError(f"payload hash mismatch for event {self.event_id}")
@@ -315,6 +340,7 @@ class CausalEvent:
 
         return {
             "tenant_id": self.tenant_id,
+            "app_id": self.app_id,
             "cell_id": self.cell_id,
             "session_id": self.session_id,
             "capsule_digest": self.capsule_digest,
@@ -347,6 +373,7 @@ class CausalEvent:
             raise TypeError("event payload must be a JSON object")
         event = cls(
             tenant_id=_require_identifier("tenant_id", cast(str, row.get("tenant_id"))),
+            app_id=_require_identifier("app_id", cast(str, row.get("app_id", "default"))),
             cell_id=_require_identifier("cell_id", cast(str, row.get("cell_id"))),
             session_id=_require_identifier("session_id", cast(str, row.get("session_id"))),
             capsule_digest=_require_identifier(
@@ -386,11 +413,13 @@ class EventBranch:
     base_hash: str
     parent_capsule_digest: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    app_id: str = "default"
 
     @property
     def address(self) -> CellAddress:
         return CellAddress(
             tenant_id=self.tenant_id,
+            app_id=self.app_id,
             cell_id=self.cell_id,
             session_id=self.session_id,
             capsule_digest=self.capsule_digest,
@@ -403,6 +432,7 @@ class EventBranch:
             return None
         return CellAddress(
             tenant_id=self.tenant_id,
+            app_id=self.app_id,
             cell_id=self.cell_id,
             session_id=self.session_id,
             capsule_digest=self.parent_capsule_digest or self.capsule_digest,
@@ -421,7 +451,7 @@ class BranchView:
         return iter(self.events)
 
 
-StreamKey: TypeAlias = tuple[str, str, str, str]
+StreamKey: TypeAlias = tuple[str, str, str, str, str]
 
 
 class EventStore(Protocol):
@@ -430,7 +460,7 @@ class EventStore(Protocol):
     The protocol is intentionally independent of SQLAlchemy.  A PostgreSQL
     adapter can implement the same methods using ``SELECT ... FOR UPDATE`` on
     the branch head and a unique ``(tenant_id, cell_id, session_id,
-    capsule_digest, branch_id, sequence)`` constraint.
+    app_id, capsule_digest, branch_id, sequence)`` constraint.
     """
 
     def append(self, draft: EventDraft | None = None, **kwargs: object) -> CausalEvent:
@@ -481,11 +511,15 @@ class InMemoryEventStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._branches: dict[StreamKey, dict[str, _BranchState]] = {}
-        self._event_ids: dict[str, CausalEvent] = {}
+        # Event ids are ingress idempotency keys within a tenant.  Reusing an
+        # id in another tenant is safe; reusing it across streams in one
+        # tenant is a namespace violation.
+        self._event_ids: dict[tuple[str, str], CausalEvent] = {}
 
     def _stream_key(self, address: CellAddress) -> StreamKey:
         return (
             address.tenant_id,
+            address.app_id,
             address.cell_id,
             address.session_id,
             address.capsule_digest,
@@ -499,6 +533,7 @@ class InMemoryEventStore:
             root = _BranchState(
                 metadata=EventBranch(
                     tenant_id=address.tenant_id,
+                    app_id=address.app_id,
                     cell_id=address.cell_id,
                     session_id=address.session_id,
                     capsule_digest=address.capsule_digest,
@@ -568,19 +603,29 @@ class InMemoryEventStore:
             draft = draft.normalised()
             address = draft.address
 
-            # Check the globally unique event id before materialising a
-            # possibly forged namespace.  A retry from another tenant is a
-            # namespace violation, not a harmless "unknown branch" lookup.
+            # Check the tenant-scoped unique event id before materialising a
+            # possibly forged namespace.  The same id in another tenant is a
+            # separate idempotency domain and is therefore allowed.
             if draft.event_id is not None:
-                existing = self._event_ids.get(draft.event_id)
+                existing = self._event_ids.get((draft.tenant_id, draft.event_id))
                 if existing is not None and existing.address != address:
                     raise NamespaceViolation(
                         f"event {draft.event_id} already belongs to another cell namespace"
                     )
             branch = self._branch(address)
 
+            visible = self._lineage(address)
+            if draft.causation_id is not None:
+                cause = self._event_ids.get((draft.tenant_id, draft.causation_id))
+                if cause is not None and cause.event_id not in {
+                    event.event_id for event in visible
+                }:
+                    raise NamespaceViolation(
+                        f"causation event {draft.causation_id} crosses the cell namespace"
+                    )
+
             if draft.event_id is not None:
-                existing = self._event_ids.get(draft.event_id)
+                existing = self._event_ids.get((draft.tenant_id, draft.event_id))
                 if existing is not None:
                     if not self._same_draft(existing, draft, supplied=supplied_draft):
                         raise AppendOnlyViolation(
@@ -588,14 +633,13 @@ class InMemoryEventStore:
                         )
                     return existing
 
-            visible = self._lineage(address)
             sequence = (visible[-1].sequence + 1) if visible else 1
             prev_hash = visible[-1].event_hash if visible else branch.metadata.base_hash
             event = self._build_event(draft, sequence=sequence, prev_hash=prev_hash)
             self._validate_namespace(event, address)
             event.verify_integrity()
             branch.events.append(event)
-            self._event_ids[event.event_id] = event
+            self._event_ids[(event.tenant_id, event.event_id)] = event
             return event
 
     @staticmethod
@@ -628,6 +672,7 @@ class InMemoryEventStore:
         payload_hash = _sha256(_canonical_json(payload))
         event = CausalEvent(
             tenant_id=draft.tenant_id,
+            app_id=draft.app_id,
             cell_id=draft.cell_id,
             session_id=draft.session_id,
             capsule_digest=draft.capsule_digest,
@@ -647,6 +692,7 @@ class InMemoryEventStore:
         )
         return CausalEvent(
             tenant_id=event.tenant_id,
+            app_id=event.app_id,
             cell_id=event.cell_id,
             session_id=event.session_id,
             capsule_digest=event.capsule_digest,
@@ -707,11 +753,12 @@ class InMemoryEventStore:
             for event in events:
                 if (
                     event.tenant_id != address.tenant_id
+                    or event.app_id != address.app_id
                     or event.cell_id != address.cell_id
                     or event.session_id != address.session_id
                 ):
                     raise NamespaceViolation(
-                        "event crosses tenant, cell or session boundary in a branch lineage"
+                        "event crosses tenant, app, cell or session boundary in a branch lineage"
                     )
                 matching_branch = next(
                     (
@@ -800,6 +847,7 @@ class InMemoryEventStore:
             _require_identifier("target_capsule_digest", target_capsule)
             target = CellAddress(
                 tenant_id=address.tenant_id,
+                app_id=address.app_id,
                 cell_id=address.cell_id,
                 session_id=address.session_id,
                 capsule_digest=target_capsule,
@@ -815,6 +863,7 @@ class InMemoryEventStore:
             )
             metadata = EventBranch(
                 tenant_id=address.tenant_id,
+                app_id=address.app_id,
                 cell_id=address.cell_id,
                 session_id=address.session_id,
                 capsule_digest=target_capsule,

@@ -203,8 +203,9 @@ export TRPC_PROVISION_METRICS_PASSWORD="$metrics_password"
     '\getenv worker_password TRPC_PROVISION_WORKER_PASSWORD' \
     '\getenv metrics_password TRPC_PROVISION_METRICS_PASSWORD'
   cat <<'SQL'
-SELECT format('CREATE ROLE trpc_migration LOGIN NOINHERIT PASSWORD %L', :'migration_password')
+SELECT format('CREATE ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD %L', :'migration_password')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_migration') \gexec
+ALTER ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
 SELECT format('ALTER ROLE trpc_migration PASSWORD %L', :'migration_password') \gexec
 SELECT format('CREATE ROLE trpc_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD %L', :'runtime_password')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_runtime') \gexec

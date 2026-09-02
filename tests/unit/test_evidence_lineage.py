@@ -32,6 +32,8 @@ def test_shared_source_roots_include_dockerfile() -> None:
     assert "Dockerfile" in SOURCE_FINGERPRINT_ROOTS
     assert {".dockerignore", "alembic.ini", "README.md"} <= set(SOURCE_FINGERPRINT_ROOTS)
     assert "tests/integration" in SOURCE_FINGERPRINT_ROOTS
+    assert ".github/workflows" in SOURCE_FINGERPRINT_ROOTS
+    assert "tests/simulation" in SOURCE_FINGERPRINT_ROOTS
 
 
 def test_source_fingerprint_is_bounded_and_excludes_generated_files(tmp_path) -> None:

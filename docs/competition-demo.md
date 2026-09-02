@@ -27,8 +27,9 @@
 trpc-service cell-demo --output runs/cell-fabric-demo.json
 ```
 
-解释 Capsule 将 Graph、Prompt、模型策略、工具清单、治理策略、Knowledge snapshot、Storage profile
-和 SLO 固化成一个 digest。修改任意字段后签名验证失败。
+解释 Capsule 的 `CapsuleSpec` 将 Graph、Prompt、模型策略、工具清单、治理策略、Knowledge snapshot、
+Storage profile 和 SLO 固化成一个 digest；生产 Registry 再用 `validate_asset_refs()` 检查内容 digest
+或显式 logical ref。修改任意字段后签名验证失败。
 
 ### 0:40–1:30：语义调度
 
@@ -71,5 +72,6 @@ state hash 保持一致。修改一个历史 payload，hash-chain 校验失败�
 - “Exactly once”指平台内的 **exactly-once-by-intent**。外部供应商没有幂等协议时，发送后断线只能
   标记 `ambiguous` 并停止自动重试。
 - Replay 的确定性来自复用已经记录的模型/工具响应；重新采样模型属于反事实执行，不宣称确定性。
-- 当前离线 demo 使用内存 Registry/Event/Effect Ledger；生产数据库结构由迁移 0017 提供，真实 KMS、
-  多节点调度状态和批量影子评估仍需部署环境接入。
+- 当前离线 demo 使用内存 Registry/Event/Effect Ledger；生产数据库结构由迁移 0017—0023 提供，默认
+  AgentWorker 已绑定 PostgreSQL `CellTurnJournal` 与 commit reconciler。Semantic Scheduler 和原生 Cell
+  Effect 尚未接管默认热路径；真实 KMS、多节点调度状态和批量影子评估仍需部署环境接入。

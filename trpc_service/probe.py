@@ -17,6 +17,12 @@ from trpc_service.config.secrets import (
     SecretRef,
     SecretResolutionError,
 )
+from trpc_service.database_contract import (
+    RUNTIME_FORBIDDEN_CELL_PRIVILEGES,
+    WORKER_CELL_FUNCTIONS,
+    WORKER_FORBIDDEN_CELL_PRIVILEGES,
+    WORKER_TABLE_PRIVILEGES,
+)
 
 _SECRET_REFERENCE_SCHEMES = frozenset({"env", "file", "literal"})
 
@@ -123,6 +129,7 @@ _DATABASE_FUNCTIONS = {
     "gateway": ("public.resolve_channel_binding(text)",),
     "worker": (
         "public.resolve_channel_binding(text)",
+        *WORKER_CELL_FUNCTIONS,
         "public.list_channel_bindings(text)",
         "public.claim_outbox_events(text,text,integer,integer)",
         "public.sweep_expired_session_leases(integer)",
@@ -148,37 +155,6 @@ _DATABASE_FUNCTIONS = {
     ),
     "artifact-gc": (),
 }
-_WORKER_TABLES = (
-    "tenants",
-    "agent_apps",
-    "config_revisions",
-    "storage_profiles",
-    "tenant_policies",
-    "admin_idempotency",
-    "channel_bindings",
-    "channel_identities",
-    "inbound_messages",
-    "outbound_messages",
-    "delivery_attempts",
-    "sessions",
-    "session_turns",
-    "turn_intents",
-    "session_events",
-    "session_summaries",
-    "memories",
-    "artifacts",
-    "knowledge_items",
-    "knowledge_embeddings",
-    "outbox_events",
-    "dead_letters",
-    "tool_executions",
-    "confirmation_challenges",
-    "audit_logs",
-    "tenant_budget_usage",
-    "fault_stage_controls",
-    "session_mailboxes",
-    "session_mailbox_items",
-)
 
 
 def _url_password(url: str, password: str | None) -> str:
@@ -287,12 +263,35 @@ async def check(role: str) -> bool:
                     has_table_privilege(
                         current_user,
                         format('public.%I', table_name),
-                        'SELECT,INSERT,UPDATE,DELETE'
+                        required_privileges
                     )
                 )
-                  FROM unnest($1::text[]) AS table_name
+                  FROM unnest($1::text[], $2::text[])
+                    AS required(table_name, required_privileges)
             """,
-            list(_WORKER_TABLES),
+            list(WORKER_TABLE_PRIVILEGES),
+            list(WORKER_TABLE_PRIVILEGES.values()),
+        ):
+            return False
+        forbidden_privileges = (
+            WORKER_FORBIDDEN_CELL_PRIVILEGES
+            if expected_bypass
+            else RUNTIME_FORBIDDEN_CELL_PRIVILEGES
+        )
+        if await connection.fetchval(
+            """
+                SELECT COALESCE(bool_or(
+                    has_table_privilege(
+                        current_user,
+                        format('public.%I', table_name),
+                        forbidden_privilege
+                    )
+                ), false)
+                  FROM unnest($1::text[], $2::text[])
+                    AS forbidden(table_name, forbidden_privilege)
+            """,
+            [table for table, _ in forbidden_privileges],
+            [privilege for _, privilege in forbidden_privileges],
         ):
             return False
         if role == "artifact-gc":

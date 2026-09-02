@@ -21,17 +21,25 @@
 完整设计、数据协议和演示验收场景见
 [Causal Agent Cell Fabric 架构](docs/agent-cell-fabric.md)。
 
-## 已实现能力
+## 当前能力与边界
 
 - 由已认证 `channel_binding_id` 解析租户，服务端 HMAC 生成 Session ID，外部消息不能声明租户。
 - PostgreSQL Inbox/Outbox、幂等键、Session lease 与 fencing token；Redis Streams 只作可重建传输。
 - 同一 Session 串行提交、不同 Session 并行；一次 turn 的 event/state/outbound 原子可见。
 - 企业微信 AI Bot WebSocket 长连接，以及飞书加密 HTTP 事件回调、URL 校验和 OpenAPI 异步回复。
 - OIDC/JWKS、RBAC、ETag 乐观并发、Admin 幂等、审计、DLQ 查询和人工 outbound 重放。
-- 工具白名单、预算预留、SDK Tool Safety、一次性确认令牌和非幂等工具歧义状态。
+- 工具白名单、SDK Tool Safety、一次性确认令牌、预算预留和非幂等工具歧义状态。
 - PostgreSQL/RLS、Redis 单调投影、S3/MinIO staged artifact、pgvector 与外部 Memory 扩展口。
 - 隐私优先 OpenTelemetry、Prometheus 指标、Docker Compose 和 Kubernetes/Kustomize。
 - `prepare → backfill → shadow-read → dual-write → cutover → verify → cleanup/rollback` 迁移状态机。
+- Agent Cell 的 Capsule、确定性调度、因果事件、Intent/Effect 和 Replay 提供离线可验证闭环。真实
+  Worker 默认通过 PostgreSQL `CellTurnJournal` 投影实际 SDK Event、治理决策和 legacy effect key；
+  Session lease/fencing 阻止旧 Worker 继续写，`post_turn.ready` 事务 Outbox 会修复 commit/effect 投影
+  的崩溃窗口。Worker 生成的 Capsule 明确标为 `runtime_projection`，不能授权节点调度；可授权的
+  `deployment` Capsule 仍必须由控制面/KMS 签发。Semantic Cell Scheduler、原生 Cell
+  `ExactlyOnceEffectExecutor` 和 Quality Judge 尚未进入默认 Worker 热路径，不由 `cell-demo` 冒充完成。
+  数据库对在线 Cell append 强制 Session lease proof，对提交后补投影强制 committed-turn proof；独立
+  `trpc_cell_executor` 身份及真实供应商凭证当前也未由默认部署 provision。
 
 项目不包含管理 UI、Telegram、微信公众号或微信客服；InMemory 后端仅用于单进程开发。
 
@@ -80,11 +88,31 @@ Gateway 为 `http://localhost:8080`，Admin 为 `http://localhost:8081`，Promet
 ```bash
 uv run ruff format --check .
 uv run ruff check .
-uv run mypy trpc_service
-uv run pytest --cov=trpc_service --cov-branch
-uv run python scripts/mock_production_gate.py
+uv run mypy trpc_service scripts
+sh coverage.sh
+uv run python -m scripts.mock_production_gate
 kubectl kustomize deploy/kustomize/overlays/production >/dev/null
 ```
+
+本地覆盖率路径必须执行独立的 line/branch 门禁：`coverage.sh` 使用 `tests/unit` 生成
+`runs/multitenant/coverage.json`，随后调用 `scripts.check_coverage` 生成并校验
+`coverage-gate.json`；语句覆盖率和分支覆盖率必须分别不低于 90%。只看 pytest 显示的综合百分比
+不构成覆盖率门禁通过。若环境不能运行 `sh coverage.sh`，也必须先生成同一份覆盖率 JSON，再显式执行：
+
+```bash
+uv run python -m scripts.check_coverage runs/multitenant/coverage.json \
+  --output runs/multitenant/coverage-gate.json
+```
+
+`coverage.sh` 与 CI 使用相同的 `tests/unit` 范围；生成的 `coverage-gate.json` 还记录测试范围、
+UTC 生成时间、可得的 Git SHA 和源码内容指纹，便于审计未提交变更对应的候选版本。
+
+历史流水线如果仍调用 `lint_flake8.sh`，可直接使用仓库根目录的兼容入口；它实际执行锁文件检查、
+Ruff 格式/规则检查和 mypy，不会额外引入一套与 CI 不同的 Flake8 规则。当 GitHub Actions 的静态、
+单元、模拟、供应链和清单 job 实际通过时，只代表该提交的源码候选可复现；不能从本地结果推断远端
+CI 已通过。真实 IM、真实多节点存储、故障注入、迁移、性能和 OTel 运行态必须在显式凭证/基础设施
+下单独执行：未执行是 `not_run`，执行但不满足阈值是 `fail`，只有证据报告明确给出
+`production_gate=pass` 才能称为生产门禁通过。
 
 默认测试完全离线。真实 IM、性能、故障注入和部署门禁需要显式凭证或本地基础设施；没有完成
 这些门禁时只能称为“开发候选”，不能称为生产候选。

@@ -29,9 +29,12 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, gen
 METRICS_PORT = 9100
 METRIC_NAME = "trpc_session_ready_backlog"
 BACKLOG_QUERY = "SELECT public.count_session_ready_backlog()"
+TENANT_BACKLOG_QUERY = "SELECT public.count_session_ready_backlog_for_tenant($1)"
 DATABASE_DSN_ENV = "TRPC_SERVICE_METRICS_DATABASE_DSN"
 NAMESPACE_ENV = "TRPC_BACKLOG_NAMESPACE"
+TENANT_ID_ENV = "TRPC_BACKLOG_TENANT_ID"
 _NAMESPACE_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+_HPA_TENANT_RE = re.compile(r"^hpa-[0-9a-f]{32}$")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -41,6 +44,7 @@ class ExporterConfig:
 
     database_dsn: str
     namespace: str
+    tenant_id: str | None = None
 
 
 def _configuration() -> ExporterConfig:
@@ -48,15 +52,18 @@ def _configuration() -> ExporterConfig:
 
     database_dsn = os.getenv(DATABASE_DSN_ENV, "").strip()
     namespace = os.getenv(NAMESPACE_ENV, "").strip().lower()
+    tenant_id = os.getenv(TENANT_ID_ENV, "").strip().lower() or None
     if not database_dsn:
         raise ValueError(f"{DATABASE_DSN_ENV} is required")
     if len(namespace) > 63 or _NAMESPACE_RE.fullmatch(namespace) is None:
         raise ValueError(f"{NAMESPACE_ENV} must be a DNS label")
+    if tenant_id is not None and _HPA_TENANT_RE.fullmatch(tenant_id) is None:
+        raise ValueError(f"{TENANT_ID_ENV} must identify a bounded HPA tenant")
     # asyncpg accepts the PostgreSQL URI scheme, not SQLAlchemy's driver
     # suffix.  Keeping this normalization local avoids putting connection
     # details into any report or metric label.
     database_dsn = database_dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
-    return ExporterConfig(database_dsn=database_dsn, namespace=namespace)
+    return ExporterConfig(database_dsn=database_dsn, namespace=namespace, tenant_id=tenant_id)
 
 
 class BacklogExporter:
@@ -116,7 +123,10 @@ class BacklogExporter:
         try:
             pool = await self._pool_or_create()
             async with pool.acquire() as connection:
-                value = await connection.fetchval(BACKLOG_QUERY)
+                if self._config is not None and self._config.tenant_id is not None:
+                    value = await connection.fetchval(TENANT_BACKLOG_QUERY, self._config.tenant_id)
+                else:
+                    value = await connection.fetchval(BACKLOG_QUERY)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise RuntimeError("backlog function returned an invalid count")
             return cast(int, value)

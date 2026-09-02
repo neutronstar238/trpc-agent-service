@@ -14,6 +14,8 @@ import math
 from typing import Protocol
 
 from trpc_service.faults import FaultStage, FaultStageController, FaultStageEvent
+from trpc_service.metrics.privacy import extract_trace_context
+from trpc_service.metrics.telemetry import get_tracer, mark_span_error
 from trpc_service.queue.session_ready import SessionReady, SessionReadyDelivery
 from trpc_service.storage.models import MailboxClaimStatus, SessionClaim
 
@@ -268,25 +270,33 @@ class SessionWorkerConsumer:
         delivery: SessionReadyDelivery,
         permit: _PermitLease,
     ) -> None:
-        try:
-            await self._claim_ack_execute(delivery)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # The task boundary is intentionally isolated: one bad session
-            # must not stop either source loop.
-            logger.error(
-                "session-ready delivery failed",
-                extra={
-                    "event_id": delivery.message.event_id,
-                    "tenant_id": delivery.message.tenant_id,
-                    "session_id": delivery.message.session_id,
-                    "error_type": type(exc).__name__,
-                },
-                exc_info=True,
-            )
-        finally:
-            permit.release()
+        parent_context = extract_trace_context(delivery.message.trace_headers)
+        with get_tracer().start_as_current_span(
+            "queue.consume",
+            context=parent_context,
+            attributes={"queue": "session.ready.v2"},
+        ) as span:
+            try:
+                await self._claim_ack_execute(delivery)
+            except asyncio.CancelledError:
+                mark_span_error(span, "cancelled")
+                raise
+            except Exception as exc:
+                mark_span_error(span, type(exc).__name__)
+                # The task boundary is intentionally isolated: one bad session
+                # must not stop either source loop.
+                logger.error(
+                    "session-ready delivery failed",
+                    extra={
+                        "event_id": delivery.message.event_id,
+                        "tenant_id": delivery.message.tenant_id,
+                        "session_id": delivery.message.session_id,
+                        "error_type": type(exc).__name__,
+                    },
+                    exc_info=True,
+                )
+            finally:
+                permit.release()
 
     async def _claim_ack_execute(self, delivery: SessionReadyDelivery) -> None:
         # This is the v2 claim-before fault checkpoint.  It is deliberately

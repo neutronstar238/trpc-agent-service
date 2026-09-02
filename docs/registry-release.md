@@ -1,4 +1,4 @@
-# Registry candidate release
+# Registry candidate release (DockerHub → Xuanyuan pull-through)
 
 `scripts/registry_image.py` creates the two immutable image references needed by
 the production Kubernetes gate: an initial candidate and a distinct rollout
@@ -15,7 +15,7 @@ Kubernetes resources.
 ```powershell
 $env:TRPC_RELEASE_ID = "release-20260825-example"
 $env:TRPC_RELEASE_NONCE = "<inject-a-random-32-byte-url-safe-value>"
-$repository = "ghcr.io/<owner>/trpc-agent-service"
+$repository = "docker.io/<owner>/trpc-agent-cell-fabric"
 
 .venv\Scripts\python.exe scripts\registry_image.py publish `
   --repository $repository `
@@ -58,3 +58,11 @@ The repository's production Kustomize overlay keeps a placeholder registry and
 digest on purpose. Replace it only in the reviewed deployment input or pass
 the digest-pinned references through the runtime gate; never commit credentials
 or an unreviewed mutable tag.
+
+在 ACK 验收中，DockerHub 是候选镜像的 canonical push registry，轩辕是集群侧的
+pull-through registry。发布成功后在 `deploy/runtime-gate.yaml` 设置
+`kubernetes.pull_registry` 为轩辕 registry host（只填 host，不带 scheme 或路径），并使用
+`image_pull_secret: xuanyuan-pull`。运行时会保留 DockerHub repository path 和两个
+`@sha256` digest，只替换拉取 host；因此 push、candidate lock、renderer 输出和 Kubernetes
+实际拉取的内容仍由同一 immutable digest 绑定。support/MinIO 镜像也必须使用轩辕侧的完整
+digest 引用。不要把 DockerHub/轩辕凭证写进配置、命令参数、报告或日志。

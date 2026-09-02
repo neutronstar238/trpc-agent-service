@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Aggregate complete SBOM, SARIF, dependency, and image lineage evidence."""
 
 from __future__ import annotations
@@ -7,13 +8,23 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+# Direct file execution otherwise places ``scripts/`` before the checkout
+# root, allowing a different checkout supplied through ``PYTHONPATH`` to
+# satisfy the namespace import below.
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+_REPO_IMPORT_ROOT_STR = str(_REPO_IMPORT_ROOT)
+while _REPO_IMPORT_ROOT_STR in sys.path:
+    sys.path.remove(_REPO_IMPORT_ROOT_STR)
+sys.path.insert(0, _REPO_IMPORT_ROOT_STR)
 
 from scripts.evidence_lineage import source_fingerprint
 from scripts.report_io import atomic_write_json
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = _REPO_IMPORT_ROOT
 
 
 def _load(path: Path) -> dict[str, Any]:

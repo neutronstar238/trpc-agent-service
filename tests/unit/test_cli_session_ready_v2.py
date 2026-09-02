@@ -65,6 +65,7 @@ def patch_worker_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         "trpc_service.agent.factory.DevelopmentAgentLoader",
         "trpc_service.agent.factory.ProductionAgentLoader",
         "trpc_service.agent.worker.AgentWorker",
+        "trpc_service.cell.worker_journal.PostgresCellRuntimeJournal",
         "trpc_service.channels.feishu.FeishuAdapter",
         "trpc_service.channels.media_locator.WeComMediaLocatorCipher",
         "trpc_service.channels.wecom.WeComMediaDownloader",

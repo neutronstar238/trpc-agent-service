@@ -594,6 +594,15 @@ class Projection:
         self.values.append((args, kwargs))
 
 
+class CellReconciler:
+    def __init__(self):
+        self.calls = []
+
+    async def reconcile_committed_turn(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return True
+
+
 @pytest.mark.asyncio
 async def test_projector_missing_success_and_idle(monkeypatch) -> None:
     item = record("post_turn.ready").model_copy(update={"payload": {"session_id": "session"}})
@@ -632,6 +641,37 @@ async def test_projector_stop_event_does_not_claim_new_records() -> None:
 
     assert await projector.project_once(stop_event=stop_event) == 0
     assert repo.records == [item]
+
+
+@pytest.mark.asyncio
+async def test_projector_repairs_cell_commit_before_publishing_outbox() -> None:
+    item = record("post_turn.ready").model_copy(
+        update={
+            "payload": {
+                "session_id": "session",
+                "turn_id": "turn-a",
+                "up_to_sequence": 3,
+            }
+        }
+    )
+    repo = DispatchRepository([item])
+    repo.snapshot_value = SessionSnapshot(
+        tenant_id="tenant-a",
+        app_id="app-unit",
+        session_id="session",
+        principal_id="principal",
+        next_sequence=4,
+    )
+    reconciler = CellReconciler()
+    projector = PostTurnProjector(
+        repo,
+        Projection(),
+        owner_id="projector",
+        cell_reconciler=reconciler,
+    )
+
+    assert await projector.project_once() == 1
+    assert reconciler.calls == [((item.tenant_id, "turn-a"), {"up_to_sequence": 3})]
 
 
 class ConsumerQueue:

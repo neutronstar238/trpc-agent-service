@@ -23,19 +23,36 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+SOURCE_FINGERPRINT_STATIC_FILES: tuple[str, ...] = (
+    "runs/multitenant/ack-runtime-support.yaml",
+    "runs/multitenant/ack-runtime-minio.yaml",
+    "runs/multitenant/project_kubernetes_secrets.py",
+)
+
 SOURCE_FINGERPRINT_ROOTS: tuple[str, ...] = (
     "Dockerfile",
     ".dockerignore",
     "alembic.ini",
     "README.md",
+    "build.sh",
+    "clean.sh",
+    "coverage.sh",
+    "format.sh",
+    "lint.sh",
+    "lint_flake8.sh",
+    "start.sh",
+    "stop.sh",
     "pyproject.toml",
     "uv.lock",
     "docker-compose.yml",
+    ".github/workflows",
     "deploy",
     "migrations",
     "scripts",
     "tests/integration",
+    "tests/simulation",
     "trpc_service",
+    *SOURCE_FINGERPRINT_STATIC_FILES,
 )
 FINGERPRINT_MAX_FILES = 10_000
 FINGERPRINT_MAX_BYTES = 128 * 1024 * 1024
@@ -52,10 +69,18 @@ FINGERPRINT_IGNORED_DIRS = frozenset(
     }
 )
 FINGERPRINT_IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
-# This file is operator-local runtime input rather than a candidate source
-# input.  Keep this list exact: broad deploy-directory exclusions would allow
+FINGERPRINT_INCLUDED_FILES = frozenset(path.lower() for path in SOURCE_FINGERPRINT_STATIC_FILES)
+# These files are operator-local runtime inputs rather than candidate source
+# inputs. Keep this list exact: broad deploy-directory exclusions would allow
 # release-relevant manifests to drift without changing the candidate binding.
-FINGERPRINT_IGNORED_FILES = frozenset({"deploy/runtime-gate.yaml"})
+FINGERPRINT_IGNORED_FILES = frozenset(
+    {
+        "deploy/runtime-gate.yaml",
+        "deploy/yqzl/admin.env",
+        "deploy/yqzl/gateway.env",
+        "deploy/yqzl/runtime.env",
+    }
+)
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_KIND = "current_candidate"
 DEFAULT_EVIDENCE_TTL_SECONDS = 24 * 60 * 60
@@ -133,6 +158,8 @@ def validate_release_binding(
 
 def _is_ignored_path(relative_path: Path) -> bool:
     normalized_path = relative_path.as_posix().lower()
+    if normalized_path in FINGERPRINT_INCLUDED_FILES:
+        return False
     if normalized_path in FINGERPRINT_IGNORED_FILES:
         return True
     return any(part.lower() in FINGERPRINT_IGNORED_DIRS for part in relative_path.parts)

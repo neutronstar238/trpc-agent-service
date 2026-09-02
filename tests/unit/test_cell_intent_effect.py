@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -11,6 +12,8 @@ import pytest
 
 from trpc_service.cell.effects import (
     AmbiguousEffectOutcome,
+    ApprovalCredential,
+    CellApprovalAuthority,
     ConfirmationRequired,
     EffectClaim,
     EffectExecutionError,
@@ -19,6 +22,7 @@ from trpc_service.cell.effects import (
     EffectReceipt,
     EffectStatus,
     ExactlyOnceEffectExecutor,
+    InMemoryApprovalLedger,
     InMemoryEffectLedger,
     KnownEffectFailure,
     UnknownEffectOutcome,
@@ -26,6 +30,7 @@ from trpc_service.cell.effects import (
 )
 from trpc_service.cell.intents import (
     ConfirmationScope,
+    IntentIntegrityError,
     IntentRisk,
     PolicyDecision,
     ToolIntent,
@@ -43,11 +48,40 @@ def make_intent(**overrides: object) -> ToolIntent:
         "tool_name": "create_ticket",
         "arguments": {"priority": "normal", "subject": "hello"},
         "risk": IntentRisk.LOW,
+        # The helper represents a policy-approved fixture.  A bare ToolIntent
+        # intentionally defaults to DENY; executor tests inject the trusted
+        # policy authority below.
+        "policy_decision": PolicyDecision.ALLOW,
         "principal_id": "principal-a",
         "trace_id": "trace-a",
     }
     values.update(overrides)
     return ToolIntent(**values)  # type: ignore[arg-type]
+
+
+def allow_policy(_intent: ToolIntent) -> PolicyDecision:
+    return PolicyDecision.ALLOW
+
+
+def make_executor(
+    ledger: InMemoryEffectLedger | None = None,
+    **kwargs: object,
+) -> ExactlyOnceEffectExecutor:
+    kwargs.setdefault("policy_judge", allow_policy)
+    return ExactlyOnceEffectExecutor(ledger, **kwargs)  # type: ignore[arg-type]
+
+
+async def approval_for(
+    authority: CellApprovalAuthority,
+    intent: ToolIntent,
+    *,
+    approval_id: str = "approval-1",
+) -> ApprovalCredential:
+    return await authority.issue(
+        intent,
+        approved_by="operator",
+        approval_id=approval_id,
+    )
 
 
 def test_effect_key_is_order_independent_and_tenant_scoped() -> None:
@@ -59,7 +93,12 @@ def test_effect_key_is_order_independent_and_tenant_scoped() -> None:
     assert make_intent(tenant_id="tenant-b").effect_key != first.effect_key
     assert arguments_hash({"a": 1}) == arguments_hash({"a": 1})
     assert make_intent(branch_id="candidate").effect_key != first.effect_key
-    candidate = make_intent(arguments=first.arguments, branch_id="candidate")
+    assert make_intent(app_id="app-b").effect_key != first.effect_key
+    candidate = make_intent(
+        arguments=first.arguments,
+        branch_id="candidate",
+        app_id="app-b",
+    )
     assert (
         stable_effect_key(
             tenant_id="tenant-a",
@@ -68,6 +107,7 @@ def test_effect_key_is_order_independent_and_tenant_scoped() -> None:
             intent_id="intent-a",
             tool_name="create_ticket",
             arguments=first.arguments,
+            app_id="app-b",
             branch_id="candidate",
             principal_id="principal-a",
         )
@@ -90,8 +130,14 @@ def test_invalid_policy_risk_and_argument_values_fail_closed() -> None:
         IntentRisk.parse("not-a-risk")
     with pytest.raises(TypeError, match="unsupported value"):
         arguments_hash({"unhashable": object()})
+    with pytest.raises(TypeError, match="keys must be strings"):
+        arguments_hash({1: "ambiguous"})
+    with pytest.raises(TypeError, match="keys must be strings"):
+        make_intent(metadata={1: "ambiguous"})
     with pytest.raises(ValueError, match="branch_id"):
         make_intent(branch_id="")
+    with pytest.raises(ValueError, match="app_id"):
+        make_intent(app_id="")
     with pytest.raises(TypeError, match="arguments"):
         make_intent(arguments=["not", "a", "mapping"])
     with pytest.raises(ValueError, match="intent_id"):
@@ -151,6 +197,7 @@ def test_confirmation_scope_factories_and_optional_expiry() -> None:
         "arguments_hash",
         "effect_key",
         "branch_id",
+        "app_id",
     ):
         altered = cast(Any, replace)(scope, **{field_name: "different"})
         assert not altered.matches(intent)
@@ -196,7 +243,7 @@ def test_confirmation_scope_cannot_cross_identity_or_arguments() -> None:
 @pytest.mark.asyncio
 async def test_allow_is_exactly_once_and_cached_result_is_authoritative() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    executor = make_executor(ledger)
     intent = make_intent()
     calls = 0
     started = asyncio.Event()
@@ -322,7 +369,7 @@ async def test_ledger_rejects_invalid_transitions_and_key_identity_conflicts() -
 @pytest.mark.asyncio
 async def test_deny_and_simulate_never_cross_effect_boundary() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    executor = make_executor(ledger)
     calls: list[str] = []
 
     async def effect() -> str:
@@ -351,7 +398,7 @@ async def test_deny_and_simulate_never_cross_effect_boundary() -> None:
 @pytest.mark.asyncio
 async def test_simulation_without_callback_is_recorded_and_effect_aliases_work() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger, worker_id="worker-a")
+    executor = make_executor(ledger, worker_id="worker-a")
     simulated = await executor.execute(
         make_intent(intent_id="simulation-empty", policy_decision=PolicyDecision.SIMULATE_ONLY)
     )
@@ -378,7 +425,8 @@ async def test_simulation_without_callback_is_recorded_and_effect_aliases_work()
 @pytest.mark.asyncio
 async def test_confirmation_decision_and_confirmation_alias_are_supported() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    authority = CellApprovalAuthority(b"a" * 32)
+    executor = make_executor(ledger, approval_authority=authority)
     intent = make_intent(
         intent_id="confirmation-policy",
         policy_decision=PolicyDecision.REQUIRE_CONFIRMATION,
@@ -393,10 +441,12 @@ async def test_confirmation_decision_and_confirmation_alias_are_supported() -> N
 
     pending = await executor.execute(intent, sync_effect)
     assert pending.status is EffectStatus.REQUIRE_CONFIRMATION
+    credential = await approval_for(authority, intent)
     done = await executor.execute(
         intent,
         sync_effect,
         confirmation=intent.confirmation_scope(approved_by="operator"),
+        approval_credential=credential,
     )
     assert done.status is EffectStatus.SUCCEEDED
     assert calls == 1
@@ -405,8 +455,8 @@ async def test_confirmation_decision_and_confirmation_alias_are_supported() -> N
 @pytest.mark.asyncio
 async def test_running_claim_can_be_observed_without_waiting() -> None:
     ledger = InMemoryEffectLedger()
-    first_executor = ExactlyOnceEffectExecutor(ledger, worker_id="worker-a")
-    second_executor = ExactlyOnceEffectExecutor(ledger, worker_id="worker-b")
+    first_executor = make_executor(ledger, worker_id="worker-a")
+    second_executor = make_executor(ledger, worker_id="worker-b")
     intent = make_intent(intent_id="no-wait")
     release = asyncio.Event()
     started = asyncio.Event()
@@ -454,7 +504,8 @@ async def test_running_claim_can_be_observed_without_waiting() -> None:
 @pytest.mark.asyncio
 async def test_high_risk_requires_exact_scope_before_execution() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    authority = CellApprovalAuthority(b"b" * 32)
+    executor = make_executor(ledger, approval_authority=authority)
     intent = make_intent(intent_id="pay", risk=IntentRisk.HIGH)
     calls = 0
 
@@ -483,6 +534,7 @@ async def test_high_risk_requires_exact_scope_before_execution() -> None:
         intent,
         effect,
         confirmation_scope=intent.confirmation_scope(approved_by="operator"),
+        approval_credential=await approval_for(authority, intent),
     )
     assert approved.status is EffectStatus.SUCCEEDED
     assert calls == 1
@@ -491,7 +543,8 @@ async def test_high_risk_requires_exact_scope_before_execution() -> None:
 @pytest.mark.asyncio
 async def test_unknown_or_ambiguous_result_is_never_auto_replayed() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    authority = CellApprovalAuthority(b"c" * 32)
+    executor = make_executor(ledger, approval_authority=authority)
     intent = make_intent(intent_id="send", risk=IntentRisk.LOW)
     calls = 0
 
@@ -516,6 +569,7 @@ async def test_unknown_or_ambiguous_result_is_never_auto_replayed() -> None:
         intent,
         confirmed_replay,
         confirmation_scope=intent.confirmation_scope(approved_by="operator"),
+        approval_credential=await approval_for(authority, intent, approval_id="replay-1"),
     )
     assert replay.status is EffectStatus.SUCCEEDED
     assert replay.replayed
@@ -526,7 +580,7 @@ async def test_unknown_or_ambiguous_result_is_never_auto_replayed() -> None:
 @pytest.mark.asyncio
 async def test_known_failure_is_the_only_automatic_retry_path() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    executor = make_executor(ledger)
     intent = make_intent(intent_id="retryable")
     calls = 0
 
@@ -548,7 +602,7 @@ async def test_known_failure_is_the_only_automatic_retry_path() -> None:
 @pytest.mark.asyncio
 async def test_expired_running_lease_becomes_ambiguous_and_key_conflicts_are_rejected() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger, lease_seconds=0.01)
+    executor = make_executor(ledger, lease_seconds=0.01)
     intent = make_intent(intent_id="crashed")
     claim = await ledger.claim(intent, lease_seconds=0.001)
     assert claim.acquired
@@ -610,7 +664,7 @@ async def test_confirmation_required_claim_and_policy_state_are_not_bypassed() -
 @pytest.mark.asyncio
 async def test_executor_keeps_existing_confirmation_state_for_simulation_variant() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    executor = make_executor(ledger)
     original = make_intent(intent_id="simulation-guard", risk=IntentRisk.HIGH)
     pending = await executor.execute(original, lambda: "must-not-run")
     assert pending.status is EffectStatus.REQUIRE_CONFIRMATION
@@ -636,7 +690,7 @@ async def test_executor_init_and_explicit_unknown_exceptions_are_safe() -> None:
 
     for error in (UnknownEffectOutcome("unknown"), AmbiguousEffectOutcome("ambiguous")):
         ledger = InMemoryEffectLedger()
-        executor = ExactlyOnceEffectExecutor(ledger)
+        executor = make_executor(ledger)
         intent = make_intent(intent_id=type(error).__name__)
 
         async def effect(error: Exception = error) -> None:
@@ -661,7 +715,7 @@ async def test_effect_completion_cannot_overwrite_another_terminal_state() -> No
 @pytest.mark.asyncio
 async def test_cancelled_effect_is_recorded_ambiguous_before_cancellation_propagates() -> None:
     ledger = InMemoryEffectLedger()
-    executor = ExactlyOnceEffectExecutor(ledger)
+    executor = make_executor(ledger)
     intent = make_intent(intent_id="cancelled")
     started = asyncio.Event()
 
@@ -677,3 +731,281 @@ async def test_cancelled_effect_is_recorded_ambiguous_before_cancellation_propag
     receipt = await ledger.get(intent.effect_key)
     assert receipt is not None
     assert receipt.status is EffectStatus.AMBIGUOUS
+
+
+def test_intent_values_are_recursively_frozen_and_integrity_is_verified() -> None:
+    source_arguments = {"nested": {"items": [1, 2]}}
+    source_metadata = {"nested": {"labels": ["safe"]}}
+    intent = make_intent(arguments=source_arguments, metadata=source_metadata)
+
+    source_arguments["nested"]["items"].append(3)
+    source_metadata["nested"]["labels"].append("changed")
+    assert intent.arguments["nested"]["items"] == (1, 2)
+    assert intent.metadata["nested"]["labels"] == ("safe",)
+    with pytest.raises(TypeError):
+        intent.arguments["nested"]["items"] += (3,)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        intent.metadata["nested"]["new"] = "nope"  # type: ignore[index]
+    assert intent.validate_integrity() is True
+
+    object.__setattr__(intent, "arguments", {"nested": {"items": [1, 2]}})
+    with pytest.raises(IntentIntegrityError, match="not recursively immutable"):
+        intent.validate_integrity()
+
+    intent = make_intent(arguments=source_arguments, metadata=source_metadata)
+    object.__setattr__(intent, "metadata", {"tampered": True})
+    with pytest.raises(IntentIntegrityError, match="not recursively immutable"):
+        intent.validate_integrity()
+
+    tampered_hash = make_intent(intent_id="tampered-hash")
+    object.__setattr__(tampered_hash, "arguments_hash", "0" * 64)
+    with pytest.raises(IntentIntegrityError, match="arguments hash"):
+        tampered_hash.validate_integrity()
+
+
+@pytest.mark.asyncio
+async def test_unset_or_self_reported_allow_is_denied_without_policy_authority() -> None:
+    calls = 0
+
+    def effect() -> str:
+        nonlocal calls
+        calls += 1
+        return "must-not-run"
+
+    unset = ToolIntent(
+        tenant_id="tenant-a",
+        cell_id="cell-a",
+        session_id="session-a",
+        tool_name="dangerous.tool",
+        arguments={},
+        risk=IntentRisk.LOW,
+    )
+    assert unset.policy_decision is PolicyDecision.DENY
+    denied_unset = await ExactlyOnceEffectExecutor().execute(unset, effect)
+    assert denied_unset.status is EffectStatus.DENIED
+    assert denied_unset.error_type == "policy_denied"
+
+    self_reported = make_intent(intent_id="self-reported", policy_decision=PolicyDecision.ALLOW)
+    denied_self_reported = await ExactlyOnceEffectExecutor().execute(self_reported, effect)
+    assert denied_self_reported.status is EffectStatus.DENIED
+    assert denied_self_reported.error_type == "policy_unverified"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_policy_authority_is_injected_and_failures_deny() -> None:
+    class Authority:
+        def __init__(self, decision: object) -> None:
+            self.decision = decision
+
+        async def decide(self, _intent: ToolIntent) -> object:
+            if isinstance(self.decision, BaseException):
+                raise self.decision
+            return self.decision
+
+    allowed_intent = make_intent(intent_id="authority-allow")
+    allowed = await ExactlyOnceEffectExecutor(
+        policy_authority=Authority(PolicyDecision.ALLOW),
+    ).execute(allowed_intent, lambda: "ok")
+    assert allowed.status is EffectStatus.SUCCEEDED
+
+    denied_intent = make_intent(intent_id="authority-deny")
+    denied = await ExactlyOnceEffectExecutor(
+        policy_authority=Authority(PolicyDecision.DENY),
+    ).execute(denied_intent, lambda: "no")
+    assert denied.status is EffectStatus.DENIED
+
+    error_intent = make_intent(intent_id="authority-error")
+    error = await ExactlyOnceEffectExecutor(
+        policy_authority=Authority(RuntimeError("policy backend unavailable")),
+    ).execute(error_intent, lambda: "no")
+    assert error.status is EffectStatus.DENIED
+    assert error.error_type == "policy_judge_error"
+
+
+@pytest.mark.asyncio
+async def test_authorize_result_is_executor_bound_and_avoids_double_policy_call() -> None:
+    calls = 0
+
+    def policy(_intent: ToolIntent) -> PolicyDecision:
+        nonlocal calls
+        calls += 1
+        return PolicyDecision.ALLOW
+
+    intent = make_intent(intent_id="preauthorized")
+    executor = ExactlyOnceEffectExecutor(policy_judge=policy)
+    authorized, error = await executor.authorize(intent)
+    assert authorized.policy_decision is PolicyDecision.ALLOW
+    assert error is None
+    receipt = await executor.execute(intent, lambda: "ok", authorized_intent=authorized)
+    assert receipt.status is EffectStatus.SUCCEEDED
+    assert calls == 1
+    assert intent.effect_key not in executor._policy_authorizations
+
+    # A fabricated ALLOW replacement is not in the executor's authorization
+    # cache and therefore cannot be used as a policy bypass.
+    fabricated = replace_intent_decision(intent, PolicyDecision.ALLOW)
+    other = make_intent(intent_id="preauthorized-other")
+    refused = await executor.execute(other, lambda: "no", authorized_intent=fabricated)
+    assert refused.status is EffectStatus.DENIED
+    assert refused.error_type == "policy_authorization_invalid"
+
+
+@pytest.mark.asyncio
+async def test_confirmation_scope_is_not_a_credential() -> None:
+    intent = make_intent(intent_id="forged-scope", risk=IntentRisk.HIGH)
+    calls = 0
+
+    def effect() -> str:
+        nonlocal calls
+        calls += 1
+        return "must-not-run"
+
+    executor = make_executor()
+    receipt = await executor.execute(
+        intent,
+        effect,
+        confirmation_scope=intent.confirmation_scope(
+            approved_by="attacker",
+            approval_id="forged",
+        ),
+    )
+    assert receipt.status is EffectStatus.REQUIRE_CONFIRMATION
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_signed_approval_is_one_time_exact_scope_and_branch_bound() -> None:
+    authority = CellApprovalAuthority(b"s" * 32)
+    intent = make_intent(intent_id="signed-approval", risk=IntentRisk.HIGH)
+    credential = await authority.issue(
+        intent,
+        approved_by="operator",
+        approval_id="approval-signed",
+    )
+    assert "approval-signed" not in repr(credential)
+    assert await authority.verify_and_consume(credential, intent) is True
+    assert await authority.verify_and_consume(credential, intent) is False
+
+    candidate = make_intent(
+        intent_id="signed-approval",
+        branch_id="candidate",
+        risk=IntentRisk.HIGH,
+    )
+    assert candidate.effect_key != intent.effect_key
+    assert await authority.verify_and_consume(credential, candidate) is False
+
+
+@pytest.mark.asyncio
+async def test_executor_consumes_signed_approval_and_rejects_reuse_or_wrong_scope() -> None:
+    authority = CellApprovalAuthority(b"t" * 32)
+    intent = make_intent(intent_id="approval-executor", risk=IntentRisk.HIGH)
+    executor = make_executor(approval_authority=authority)
+    credential = await authority.issue(
+        intent,
+        approved_by="operator",
+        approval_id="approval-executor",
+    )
+    calls = 0
+
+    def effect() -> str:
+        nonlocal calls
+        calls += 1
+        return "done"
+
+    done = await executor.execute(intent, effect, approval_token=credential)
+    assert done.status is EffectStatus.SUCCEEDED
+    assert calls == 1
+
+    # The cached terminal row means a duplicate request does not need to spend
+    # another token and cannot invoke the provider again.
+    duplicate = await executor.execute(intent, effect, approval_token=credential)
+    assert duplicate == done
+    assert calls == 1
+
+    other = make_intent(intent_id="approval-other", risk=IntentRisk.HIGH)
+    refused = await executor.execute(other, effect, approval_token=credential)
+    assert refused.status is EffectStatus.REQUIRE_CONFIRMATION
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_approval_authority_rejects_malformed_expired_and_duplicate_nonces() -> None:
+    with pytest.raises(ValueError, match="32 bytes"):
+        CellApprovalAuthority(b"short")
+    with pytest.raises(ValueError, match="TTL"):
+        CellApprovalAuthority(b"k" * 32, ttl_seconds=0)
+    with pytest.raises(ValueError, match="approval token"):
+        ApprovalCredential("")
+
+    intent = make_intent(intent_id="approval-validation", risk=IntentRisk.HIGH)
+    authority = CellApprovalAuthority(b"v" * 32)
+    with pytest.raises(ValueError, match="approved_by"):
+        await authority.issue(intent, approved_by="", approval_id="a")
+    with pytest.raises(ValueError, match="approval_id"):
+        await authority.issue(intent, approved_by="operator", approval_id="")
+    with pytest.raises(ValueError, match="TTL"):
+        await authority.issue(intent, approved_by="operator", approval_id="a", ttl_seconds=0)
+    assert await authority.verify_and_consume("not-a-token", intent) is False
+    assert await authority.verify_and_consume(ApprovalCredential("bad.token"), intent) is False
+
+    ledger = InMemoryApprovalLedger()
+    await ledger.issue("duplicate", time.time() + 10, "digest")
+    with pytest.raises(ValueError, match="already exists"):
+        await ledger.issue("duplicate", time.time() + 10, "digest")
+    assert await ledger.consume("missing", 0, "digest") is False
+    assert await ledger.consume("duplicate", time.time() + 10, "wrong") is False
+    assert await ledger.consume("duplicate", time.time() - 1, "digest") is False
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_cannot_complete_and_is_persisted_ambiguous() -> None:
+    ledger = InMemoryEffectLedger()
+    intent = make_intent(intent_id="late-completion")
+    claim = await ledger.claim(intent, lease_seconds=0.001, worker_id="worker-a")
+    assert claim.acquired
+    await asyncio.sleep(0.01)
+    with pytest.raises(EffectLeaseConflict, match="expired"):
+        await ledger.complete(
+            intent,
+            attempt=claim.receipt.attempt,
+            status=EffectStatus.SUCCEEDED,
+            result="late-success",
+            worker_id="worker-a",
+        )
+    current = await ledger.get(intent.effect_key)
+    assert current is not None
+    assert current.status is EffectStatus.AMBIGUOUS
+    assert current.result is None
+
+
+@pytest.mark.asyncio
+async def test_executor_returns_ambiguous_when_completion_loses_lease() -> None:
+    ledger = InMemoryEffectLedger()
+    executor = make_executor(ledger, lease_seconds=0.001)
+    intent = make_intent(intent_id="executor-late-completion")
+
+    async def slow_success() -> str:
+        await asyncio.sleep(0.01)
+        return "provider-may-have-applied"
+
+    receipt = await executor.execute(intent, slow_success)
+    assert receipt.status is EffectStatus.AMBIGUOUS
+    assert receipt.error_type == "effect_lease_expired"
+
+
+@pytest.mark.asyncio
+async def test_wait_marks_expired_running_and_never_waits_forever() -> None:
+    ledger = InMemoryEffectLedger()
+    intent = make_intent(intent_id="wait-expiry")
+    await ledger.claim(intent, lease_seconds=0.001)
+    await asyncio.sleep(0.01)
+    expired = await ledger.wait(intent.effect_key, timeout=0.1)
+    assert expired is not None
+    assert expired.status is EffectStatus.AMBIGUOUS
+
+    still_running = make_intent(intent_id="wait-bounded")
+    await ledger.claim(still_running, lease_seconds=60)
+    observed = await ledger.wait(still_running.effect_key, timeout=0.001)
+    assert observed is not None
+    assert observed.status is EffectStatus.RUNNING

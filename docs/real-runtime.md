@@ -119,7 +119,9 @@ fault-stage 项目同名；`trpc-perf-*` 性能项目也不能直接作为 `real
 
 ```powershell
 $ErrorActionPreference = "Stop"
-Set-Location E:\trpc-agent-service
+# This snippet is saved under runs/multitenant; never replace this with a fixed drive path.
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+Set-Location -LiteralPath $repoRoot
 $env:COMPOSE_DISABLE_ENV_FILE = "1"
 $runStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $runtimeProject = "trpc-fault-runtime-$runStamp"
@@ -548,8 +550,13 @@ $fixtureReport = "runs/multitenant/performance-fixture.json"
 ```
 
 将报告中的 `tenant_id` 和 `run_id` 原样传给性能门禁使用；完成验收后，必须使用同一份报告
-和这两个身份字段清理。清理只在事务内按固定 tenant-first allowlist 删除该 `perf-` 租户的
-行，不删除 schema、其他租户或 Compose volume：
+和这两个身份字段清理。普通表按固定 tenant-first allowlist 删除；Cell 数据由 migration-owned、
+runtime-only 的 `public.cleanup_performance_cell_fixture` 在同一事务中清理。函数核验报告 checksum、
+合成租户记录和 reservation 状态；未过期 active lease 会 fail-closed，已过期/已释放记录会在重算节点
+容量计数后删除。函数返回下面九张 Cell 表的逐表计数：`cell_effect_receipts`、`cell_effect_ledger`、
+`cell_tool_intents`、`cell_approval_nonces`、`cell_placement_reservations`、`cell_branch_heads`、
+`cell_events`、`agent_cells`、`agent_capsules`。未过期 active reservation 会 fail-closed，已过期/已释放
+reservation 由清理边界处理。清理不删除 schema、其他租户或 Compose volume：
 
 ```powershell
 $fixture = Get-Content $fixtureReport -Raw | ConvertFrom-Json
@@ -784,7 +791,10 @@ Worker。报告只保存聚合指标、ID、hash 和安全元数据，不保存�
 ### 7. 精确清理与保留卷
 
 无论正式门禁通过还是失败，只能用同一份 fixture 报告中的身份清理；清理前不要删除报告。
-清理会验证报告 checksum、tenant ownership 和固定表 allowlist：
+清理会验证报告 checksum、tenant ownership 和固定表 allowlist；Cell 表额外通过
+`cleanup_performance_cell_fixture` 校验精确租户与 reservation 状态，并核对九张 Cell 表的返回计数：
+`cell_effect_receipts`、`cell_effect_ledger`、`cell_tool_intents`、`cell_approval_nonces`、
+`cell_placement_reservations`、`cell_branch_heads`、`cell_events`、`agent_cells`、`agent_capsules`。
 
 ```powershell
 .venv\Scripts\python.exe scripts/performance_fixture.py cleanup --execute `

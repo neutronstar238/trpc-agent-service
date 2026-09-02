@@ -69,3 +69,23 @@ spec:
               value: "2"
             - name: TRPC_SERVICE_RECOVERY_POLL_SECONDS
               value: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trpc-backlog-exporter
+spec:
+  template:
+    spec:
+      nodeSelector:
+        trpc-role: workload
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trpc-schema-migration
+spec:
+  template:
+    spec:
+      nodeSelector:
+        trpc-role: workload

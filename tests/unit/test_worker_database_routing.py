@@ -4,6 +4,10 @@ import pytest
 
 import trpc_service._cli as cli
 from trpc_service.config import LocalSecretProvider, Role, SecretRef, ServiceSettings
+from trpc_service.database_contract import (
+    RUNTIME_FORBIDDEN_CELL_PRIVILEGES,
+    WORKER_FORBIDDEN_CELL_PRIVILEGES,
+)
 
 
 def _settings(*, worker_ref: bool = True, worker_user: str = "trpc_worker") -> ServiceSettings:
@@ -65,6 +69,7 @@ class _Connection:
         *,
         bypasses_rls: bool,
         function_grants: bool = True,
+        forbidden_table_grants: bool = False,
         can_login: bool = True,
         owned_rls_tables: int = 0,
     ) -> None:
@@ -78,11 +83,23 @@ class _Connection:
             "schema_usage": True,
         }
         self.function_grants = function_grants
+        self.forbidden_table_grants = forbidden_table_grants
+        self.privilege_checks: list[tuple[str, str]] = []
 
     async def fetchrow(self, _query: str):
         return self.identity
 
-    async def fetchval(self, _query: str, *_args):
+    async def fetchval(self, query: str, *args):
+        if "has_table_privilege" in query:
+            table, privilege = str(args[0]), str(args[1])
+            self.privilege_checks.append((table, privilege))
+            forbidden = (
+                WORKER_FORBIDDEN_CELL_PRIVILEGES
+                if self.identity["bypasses_rls"]
+                else RUNTIME_FORBIDDEN_CELL_PRIVILEGES
+            )
+            if (table.removeprefix("public."), privilege) in forbidden:
+                return self.forbidden_table_grants
         return self.function_grants
 
 
@@ -112,7 +129,12 @@ class _Repository:
 
 @pytest.mark.asyncio
 async def test_identity_requires_worker_bypassrls_and_explicit_grants() -> None:
-    await cli._validate_database_identity(_Repository(_Connection(bypasses_rls=True)), Role.WORKER)
+    worker = _Connection(bypasses_rls=True)
+    await cli._validate_database_identity(_Repository(worker), Role.WORKER)
+    assert ("public.agent_capsules", "SELECT") in worker.privilege_checks
+    assert ("public.cell_events", "SELECT,INSERT") in worker.privilege_checks
+    assert ("public.cell_effect_ledger", "UPDATE") in worker.privilege_checks
+    assert ("public.cell_placement_reservations", "SELECT") in worker.privilege_checks
     await cli._validate_database_identity(_Repository(_Connection(bypasses_rls=False)), Role.ADMIN)
     wrong_bypass = _Connection(bypasses_rls=False)
     wrong_bypass.identity.update(current_user="trpc_worker", session_user="trpc_worker")
@@ -121,6 +143,16 @@ async def test_identity_requires_worker_bypassrls_and_explicit_grants() -> None:
     with pytest.raises(RuntimeError, match="lacks EXECUTE"):
         await cli._validate_database_identity(
             _Repository(_Connection(bypasses_rls=True, function_grants=False)),
+            Role.WORKER,
+        )
+    with pytest.raises(RuntimeError, match="forbidden"):
+        await cli._validate_database_identity(
+            _Repository(
+                _Connection(
+                    bypasses_rls=True,
+                    forbidden_table_grants=True,
+                )
+            ),
             Role.WORKER,
         )
 

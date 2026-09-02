@@ -643,6 +643,11 @@ def _augment_runtime_report(
 
 
 def _prerequisite_manifest() -> dict[str, Any]:
+    # The official PostgreSQL image creates POSTGRES_USER as a superuser.  It
+    # is therefore an ephemeral bootstrap identity only; the schema/migration
+    # owner is created explicitly below with the same least-privilege contract
+    # used by production provisioning.
+    bootstrap_password = _secret_value(18)
     migration_password = _secret_value(18)
     runtime_password = _secret_value(18)
     worker_password = _secret_value(18)
@@ -654,6 +659,13 @@ def _prerequisite_manifest() -> dict[str, Any]:
         """
 DO $$
 BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_migration') THEN
+    CREATE ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS
+      PASSWORD '__MIGRATION_PASSWORD__';
+  ELSE
+    ALTER ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS
+      PASSWORD '__MIGRATION_PASSWORD__';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_runtime') THEN
     CREATE ROLE trpc_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS
       PASSWORD '__RUNTIME_PASSWORD__';
@@ -669,9 +681,16 @@ BEGIN
       PASSWORD '__WORKER_PASSWORD__';
   END IF;
 END $$;
+ALTER DATABASE trpc_service OWNER TO trpc_migration;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS vector;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO trpc_migration;
+GRANT CONNECT ON DATABASE trpc_service TO trpc_migration;
 GRANT CONNECT ON DATABASE trpc_service TO trpc_runtime;
 GRANT CONNECT ON DATABASE trpc_service TO trpc_worker;
-""".replace("__RUNTIME_PASSWORD__", runtime_password)
+""".replace("__MIGRATION_PASSWORD__", migration_password)
+        .replace("__RUNTIME_PASSWORD__", runtime_password)
         .replace("__WORKER_PASSWORD__", worker_password)
         .strip()
     )
@@ -731,7 +750,7 @@ GRANT CONNECT ON DATABASE trpc_service TO trpc_worker;
             "metadata": {"name": "trpc-gate-dependency-secrets"},
             "type": "Opaque",
             "stringData": {
-                "POSTGRES_PASSWORD": migration_password,
+                "POSTGRES_PASSWORD": bootstrap_password,
                 "REDIS_PASSWORD": redis_password,
             },
         },
@@ -765,7 +784,7 @@ GRANT CONNECT ON DATABASE trpc_service TO trpc_worker;
                                 "image": "pgvector/pgvector:pg16",
                                 "env": [
                                     {"name": "POSTGRES_DB", "value": "trpc_service"},
-                                    {"name": "POSTGRES_USER", "value": "trpc_migration"},
+                                    {"name": "POSTGRES_USER", "value": "trpc_gate_bootstrap"},
                                     {
                                         "name": "POSTGRES_PASSWORD",
                                         "valueFrom": {

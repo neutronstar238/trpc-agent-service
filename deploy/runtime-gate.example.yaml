@@ -37,6 +37,7 @@ kubernetes:
     postgres_host_path: /srv/trpc/support/postgres
     redis_host_path: /srv/trpc/support/redis
     minio_host_path: /srv/trpc/support/minio
+    external_metric_compatibility_namespaces: []
   # Zero-cost functional recovery uses this same support image block and the
   # immutable candidate lock above. It creates a temporary emptyDir-only
   # namespace; set TRPC_DR_FUNCTIONAL_ENABLED=true only for that drill. The
@@ -101,8 +102,8 @@ kubernetes:
     worker_concurrency: 50
   node:
     name: replace-with-dedicated-node
-    label: trpc-runtime-gate=acceptance
-    drain_confirmation: I_UNDERSTAND_ISOLATED_NODE_DRAIN
+    label: trpc-cell-fabric-owner=innovation
+    drain_confirmation: I_UNDERSTAND_HARD_NODE_FAILURE_PDB_BYPASS
   hpa:
     driver: ../scripts/kubernetes_hpa_load_driver.py
     kubeconfig: C:/secure/hpa-driver.kubeconfig

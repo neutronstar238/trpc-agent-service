@@ -273,11 +273,29 @@ async def test_governed_tool_passes_lease_identity_and_rejects_invalid_identity(
         def __init__(self):
             self.kwargs = None
 
+        def key_for(self, _context, **_kwargs):
+            return "effect-key-a"
+
         async def execute(self, _context, **kwargs):
             self.kwargs = kwargs
             return "synthetic-result"
 
+    class Observer:
+        def __init__(self):
+            self.calls = []
+
+        async def intent_created(self, context, **kwargs):
+            self.calls.append(("intent", context.tenant_id, kwargs))
+            return "cell-intent-token"
+
+        async def policy_decided(self, token, **kwargs):
+            self.calls.append(("policy", token, kwargs))
+
+        async def effect_completed(self, token, **kwargs):
+            self.calls.append(("effect", token, kwargs))
+
     executor = Executor()
+    observer = Observer()
     governed = GovernedTool(
         FunctionTool(write),
         config=_config(),
@@ -287,6 +305,7 @@ async def test_governed_tool_passes_lease_identity_and_rejects_invalid_identity(
             ConfirmationTokenService(b"t" * 32, InMemoryConfirmationLedger()),
         ),
         executor=executor,
+        observer=observer,
     )
     metadata = {
         "tenant_id": "tenant-a",
@@ -314,6 +333,10 @@ async def test_governed_tool_passes_lease_identity_and_rejects_invalid_identity(
     )
     assert executor.kwargs["owner_id"] == "worker-a"
     assert executor.kwargs["fencing_token"] == 7
+    assert [call[0] for call in observer.calls] == ["intent", "policy", "effect"]
+    assert observer.calls[0][2]["arguments_hash"]
+    assert observer.calls[0][2]["effect_key"] == "effect-key-a"
+    assert observer.calls[2][2]["result_hash"]
 
     for invalid in (
         {"lease_owner": "worker-a"},

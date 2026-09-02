@@ -1,21 +1,38 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Run deterministic substitutes for production-only acceptance environments."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# A direct ``python scripts/mock_production_gate.py`` launch puts the
+# ``scripts`` directory (rather than this checkout) at ``sys.path[0]``.  An
+# operator may also have another checkout on ``PYTHONPATH``.  Pin the package
+# lookup to the checkout that owns this file before importing any sibling
+# helper; this keeps direct-file and ``python -m`` launches equivalent.
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+_REPO_IMPORT_ROOT_STR = str(_REPO_IMPORT_ROOT)
+while _REPO_IMPORT_ROOT_STR in sys.path:
+    sys.path.remove(_REPO_IMPORT_ROOT_STR)
+sys.path.insert(0, _REPO_IMPORT_ROOT_STR)
+
+from scripts.evidence_lineage import SOURCE_FINGERPRINT_ROOTS, source_fingerprint
 from scripts.performance_gate import MAX_CONCURRENCY
 from scripts.report_io import atomic_write_json
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = _REPO_IMPORT_ROOT
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 SCENARIOS = {
     "multinode_load": {
@@ -74,7 +91,66 @@ SCENARIOS = {
             "recorded frames and fake clients replace provider accounts and rate limits"
         ),
     },
+    "cell_fabric": {
+        "emulates": (
+            "signed Capsule admission, deterministic Cell placement, causal replay/fork, "
+            "Intent/Effect confirmation and exactly-once-by-intent"
+        ),
+        "selectors": (
+            "tests/unit/test_cell_capsule_scheduler.py",
+            "tests/unit/test_cell_causal_replay.py",
+            "tests/unit/test_cell_intent_effect.py",
+            "tests/unit/test_cell_runtime.py",
+            "tests/unit/test_cell_worker_journal.py",
+            "tests/unit/test_cell_branch_completion.py",
+            "tests/unit/test_cell_postgres_contract.py",
+            "tests/unit/test_cell_postgres_adapters.py",
+            "tests/unit/test_cell_postgres_effects.py",
+            "tests/unit/test_cell_fabric_contract.py",
+        ),
+        "production_gap": (
+            "real PostgreSQL locks/triggers/RLS, external KMS, multi-node projection and "
+            "provider effect semantics are not exercised by deterministic fakes"
+        ),
+    },
 }
+
+
+def _git_sha(root: Path) -> str | None:
+    """Return the checkout SHA when the environment exposes a valid one."""
+
+    for variable in ("GITHUB_SHA", "CI_COMMIT_SHA"):
+        value = os.environ.get(variable, "").strip()
+        if _GIT_SHA_RE.fullmatch(value):
+            return value.lower()
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed git argv and local checkout
+            [git_executable, "rev-parse", "--verify", "HEAD"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    if completed.returncode == 0 and _GIT_SHA_RE.fullmatch(value):
+        return value.lower()
+    return None
+
+
+def _generated_at() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _source_fingerprint() -> dict[str, Any]:
+    """Fingerprint the source and selectors represented by this mock report."""
+
+    return source_fingerprint(ROOT, (*SOURCE_FINGERPRINT_ROOTS, "tests/unit"))
 
 
 def _pytest(selectors: tuple[str, ...]) -> dict[str, Any]:
@@ -89,11 +165,15 @@ def _pytest(selectors: tuple[str, ...]) -> dict[str, Any]:
     )
     combined = f"{completed.stdout}\n{completed.stderr}"
     summaries = re.findall(r"\d+ passed(?:, \d+ skipped)?", combined)
-    if completed.returncode:
+    passed_matches = re.findall(r"(\d+) passed", combined)
+    passed_count = int(passed_matches[-1]) if passed_matches else 0
+    passed = completed.returncode == 0 and passed_count > 0
+    if not passed:
         print(combined[-4000:], file=sys.stderr)
     return {
-        "status": "pass" if completed.returncode == 0 else "fail",
+        "status": "pass" if passed else "fail",
         "exit_code": completed.returncode,
+        "passed_count": passed_count,
         "duration_seconds": time.perf_counter() - started,
         "summary": summaries[-1] if summaries else "pytest did not report a pass summary",
     }
@@ -103,7 +183,8 @@ def _performance(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     completed = subprocess.run(  # noqa: S603 - fixed local script and interpreter
         [
             sys.executable,
-            str(ROOT / "scripts" / "performance_gate.py"),
+            "-m",
+            "scripts.performance_gate",
             "--callbacks",
             "500",
             "--turns",
@@ -172,8 +253,15 @@ def main() -> int:
         "migration between independent live source and target backends was not executed",
         "Kubernetes rollout/HPA/eviction was not executed by a real control plane",
         "real WeCom and Feishu provider credentials and quotas were not exercised",
+        "Cell trust roots, PostgreSQL CAS and external effect providers were not exercised",
     ]
+    git_sha = _git_sha(ROOT)
+    candidate_source = _source_fingerprint()
     result = {
+        "generated_at": _generated_at(),
+        "git_sha": git_sha,
+        "git_sha_status": "available" if git_sha is not None else "unavailable",
+        "source_fingerprint": candidate_source,
         "baseline": {
             "required_simulations": list(SCENARIOS),
             "all_simulations_must_pass": True,

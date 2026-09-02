@@ -4,9 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from typing import Protocol
 
 from trpc_service.storage.models import OutboxRecord
 from trpc_service.storage.protocols import ProjectionStore, RuntimeRepository, SessionStore
+
+
+class TurnCommitReconciler(Protocol):
+    async def reconcile_committed_turn(
+        self,
+        tenant_id: str,
+        turn_id: str,
+        *,
+        up_to_sequence: int,
+    ) -> bool: ...
 
 
 class PostTurnProjector:
@@ -19,11 +30,13 @@ class PostTurnProjector:
         *,
         owner_id: str,
         session_store: SessionStore | None = None,
+        cell_reconciler: TurnCommitReconciler | None = None,
     ) -> None:
         self._repository = repository
         self._session_projection = session_projection
         self._owner_id = owner_id
         self._session_store = session_store
+        self._cell_reconciler = cell_reconciler
 
     async def project_once(self, *, stop_event: asyncio.Event | None = None) -> int:
         if stop_event is not None and stop_event.is_set():
@@ -55,6 +68,12 @@ class PostTurnProjector:
                     sequence=snapshot.next_sequence - 1,
                     value=snapshot.model_dump(mode="json"),
                 )
+                if self._cell_reconciler is not None:
+                    await self._cell_reconciler.reconcile_committed_turn(
+                        record.tenant_id,
+                        str(record.payload["turn_id"]),
+                        up_to_sequence=int(record.payload["up_to_sequence"]),
+                    )
                 await self._repository.mark_outbox_published(
                     record.tenant_id, record.outbox_id, owner_id=self._owner_id
                 )
@@ -110,4 +129,4 @@ class PostTurnProjector:
                         pass
 
 
-__all__ = ["PostTurnProjector"]
+__all__ = ["PostTurnProjector", "TurnCommitReconciler"]

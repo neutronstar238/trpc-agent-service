@@ -369,6 +369,7 @@ async def test_individual_role_wiring(monkeypatch) -> None:
     for target in (
         "trpc_service.agent.factory.ProductionAgentLoader",
         "trpc_service.agent.worker.AgentWorker",
+        "trpc_service.cell.worker_journal.PostgresCellRuntimeJournal",
         "trpc_service.queue.redis_streams.RedisStreamQueue",
         "trpc_service.queue.worker_consumer.WorkerConsumer",
         "trpc_service.queue.session_ready.SessionReadyQueue",

@@ -95,9 +95,11 @@ class _DatabaseConnection:
         self.error = error
         self.closed = False
 
-    async def fetchval(self, _query: str, *_args: object) -> int:
+    async def fetchval(self, query: str, *_args: object) -> int | bool:
         if self.error is not None:
             raise self.error
+        if "bool_or" in query:
+            return False
         return self.value
 
     async def fetchrow(self, _query: str) -> dict[str, object]:
@@ -142,10 +144,17 @@ class _S3Connection:
 
 
 class _IdentityConnection(_DatabaseConnection):
-    def __init__(self, *, schema_usage: bool = True, table_privileges: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        schema_usage: bool = True,
+        table_privileges: bool = True,
+        forbidden_privileges: bool = False,
+    ) -> None:
         super().__init__()
         self.schema_usage = schema_usage
         self.table_privileges = table_privileges
+        self.forbidden_privileges = forbidden_privileges
 
     async def fetchrow(self, _query: str) -> dict[str, object]:
         return {
@@ -161,6 +170,8 @@ class _IdentityConnection(_DatabaseConnection):
     async def fetchval(self, query: str, *_args: object) -> int | bool:
         if "bool_and" in query:
             return self.table_privileges
+        if "bool_or" in query:
+            return self.forbidden_privileges
         if "has_function_privilege" in query:
             return True
         return 1
@@ -276,19 +287,26 @@ async def test_artifact_gc_probe_requires_database_and_object_store(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("schema_usage", "table_privileges", "expected"),
-    [(True, True, True), (False, True, False), (True, False, False)],
+    ("schema_usage", "table_privileges", "forbidden_privileges", "expected"),
+    [
+        (True, True, False, True),
+        (False, True, False, False),
+        (True, False, False, False),
+        (True, True, True, False),
+    ],
 )
 async def test_lightweight_worker_probe_preserves_role_privilege_checks(
     monkeypatch,
     schema_usage: bool,
     table_privileges: bool,
+    forbidden_privileges: bool,
     expected: bool,
 ) -> None:
     _probe_environment(monkeypatch)
     database = _IdentityConnection(
         schema_usage=schema_usage,
         table_privileges=table_privileges,
+        forbidden_privileges=forbidden_privileges,
     )
     redis = _RedisConnection(True)
 

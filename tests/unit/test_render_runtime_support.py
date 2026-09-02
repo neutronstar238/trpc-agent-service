@@ -27,6 +27,21 @@ def _support() -> SimpleNamespace:
     )
 
 
+def _provider_config(namespace: str) -> SimpleNamespace:
+    support = _support()
+    support.namespace = namespace
+    support.minio_image = "registry.example/minio@sha256:" + "c" * 64
+    support.minio_client_image = "registry.example/mc@sha256:" + "d" * 64
+    support.prometheus_image = "registry.example/prometheus@sha256:" + "e" * 64
+    support.prometheus_adapter_image = "registry.example/adapter@sha256:" + "f" * 64
+    support.external_metric_compatibility_namespaces = ()
+    return SimpleNamespace(
+        support=support,
+        image_pull_secret="runtime-pull",
+        performance=SimpleNamespace(namespace="trpc-service"),
+    )
+
+
 def _write_templates(tmp_path: Path) -> tuple[Path, Path, str, str]:
     support_template = tmp_path / "ack-runtime-support.yaml"
     minio_template = tmp_path / "ack-runtime-minio.yaml"
@@ -180,6 +195,330 @@ def test_redis_without_a_volume_gets_a_data_host_path() -> None:
     assert pod_spec["containers"][0]["volumeMounts"] == [{"name": "data", "mountPath": "/data"}]
 
 
+def test_ack_support_template_has_explicit_backend_ingress_sources() -> None:
+    documents = renderer._read_documents(renderer.DEFAULT_SUPPORT_TEMPLATE)
+    policies = {
+        document["metadata"]["name"]: document
+        for document in documents
+        if isinstance(document, dict) and document.get("kind") == "NetworkPolicy"
+    }
+
+    assert set(policies) == {
+        "trpc-support-postgres-ingress",
+        "trpc-support-redis-ingress",
+    }
+
+    bootstrap = next(
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "Job"
+        and document.get("metadata", {}).get("name") == "postgres-bootstrap"
+    )
+    bootstrap_script = bootstrap["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    assert "\n SQL\n" not in bootstrap_script
+    assert bootstrap_script.count("\nSQL\n") == 2
+
+    redis = next(
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "redis"
+    )
+    redis_capabilities = redis["spec"]["template"]["spec"]["containers"][0]["securityContext"][
+        "capabilities"
+    ]
+    assert redis_capabilities["drop"] == ["ALL"]
+    assert set(redis_capabilities["add"]) == {"CHOWN", "SETGID", "SETUID"}
+    expected_namespaces = [
+        {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "trpc-cell-fabric"}}},
+        {
+            "namespaceSelector": {
+                "matchLabels": {"kubernetes.io/metadata.name": "trpc-runtime-support"}
+            }
+        },
+        {
+            "namespaceSelector": {
+                "matchLabels": {"kubernetes.io/metadata.name": "trpc-runtime-driver"}
+            }
+        },
+        {
+            "namespaceSelector": {
+                "matchLabels": {"trpc.io/managed-by": "trpc-kubernetes-runtime-gate"}
+            }
+        },
+    ]
+    expected = {
+        "trpc-support-postgres-ingress": ("trpc-runtime-postgres", 5432),
+        "trpc-support-redis-ingress": ("trpc-runtime-redis", 6379),
+    }
+    for name, (pod_label, port) in expected.items():
+        policy = policies[name]
+        assert policy["metadata"]["namespace"] == "trpc-runtime-support"
+        assert policy["spec"] == {
+            "podSelector": {"matchLabels": {"app": pod_label}},
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": expected_namespaces,
+                    "ports": [{"protocol": "TCP", "port": port}],
+                }
+            ],
+        }
+    assert "trpc-service" not in json.dumps(policies, sort_keys=True)
+
+    support = _support()
+    support.namespace = "trpc-cell-fabric-support"
+    rendered = renderer.render_documents(documents, support)
+    rendered_policies = {
+        document["metadata"]["name"]: document
+        for document in rendered
+        if isinstance(document, dict) and document.get("kind") == "NetworkPolicy"
+    }
+    for policy in rendered_policies.values():
+        assert policy["metadata"]["namespace"] == "trpc-cell-fabric-support"
+        sources = policy["spec"]["ingress"][0]["from"]
+        assert sources[1] == {
+            "namespaceSelector": {
+                "matchLabels": {"kubernetes.io/metadata.name": "trpc-cell-fabric-support"}
+            }
+        }
+        assert sources[0] == expected_namespaces[0]
+        assert sources[2:] == expected_namespaces[2:]
+
+
+def test_provider_names_stage_cutover_and_original_scrape_are_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_dir = tmp_path / "default"
+    monkeypatch.setattr(
+        renderer,
+        "_load_runtime_gate_config",
+        lambda _path: _provider_config("trpc-runtime-support"),
+    )
+    default_support, _ = renderer.render_runtime_support(
+        tmp_path / "runtime-gate.yaml",
+        output_dir=default_dir,
+        mode="full",
+    )
+
+    custom_namespace = "trpc-cell-fabric-support"
+    stage_dir = tmp_path / "stage"
+    monkeypatch.setattr(
+        renderer,
+        "_load_runtime_gate_config",
+        lambda _path: _provider_config(custom_namespace),
+    )
+    staged_support, _ = renderer.render_runtime_support(
+        tmp_path / "runtime-gate.yaml",
+        output_dir=stage_dir,
+        mode="stage",
+    )
+
+    def documents(path: Path) -> list[dict[str, object]]:
+        return [
+            document
+            for document in yaml.safe_load_all(path.read_text(encoding="utf-8"))
+            if isinstance(document, dict)
+        ]
+
+    provider_kinds = {"ClusterRole", "ClusterRoleBinding", "RoleBinding"}
+    default_documents = documents(default_support)
+    stage_documents = documents(staged_support)
+    default_resources = [
+        document
+        for document in default_documents
+        if document.get("kind") in provider_kinds
+        and document.get("metadata", {}).get("name", "").startswith("trpc-runtime-prometheus")
+    ]
+    stage_resources = [
+        document
+        for document in stage_documents
+        if document.get("kind") in provider_kinds
+        and document.get("metadata", {}).get("labels", {}).get(renderer._PROVIDER_LABEL_KEY)
+        == renderer._PROVIDER_LABEL_VALUE
+    ]
+    default_names = {document["metadata"]["name"] for document in default_resources}
+    stage_names = {document["metadata"]["name"] for document in stage_resources}
+    assert default_names.isdisjoint(stage_names)
+    assert len(stage_resources) == len(renderer._PROVIDER_RESOURCE_BASES)
+    assert all(
+        len(name) <= 63 and renderer._NAMESPACE_RE.fullmatch(name) is not None
+        for name in stage_names
+    )
+    assert stage_names == {
+        renderer._provider_resource_name(custom_namespace, base_name)
+        for _kind_name, base_name in renderer._PROVIDER_RESOURCE_BASES
+    }
+    for resource in stage_resources:
+        labels = resource["metadata"]["labels"]
+        assert labels["app.kubernetes.io/managed-by"] == renderer._PROVIDER_MANAGED_BY
+        assert labels[renderer._PROVIDER_LABEL_KEY] == renderer._PROVIDER_LABEL_VALUE
+        assert labels[renderer._PROVIDER_NAMESPACE_LABEL_KEY] == custom_namespace
+    discovery_binding = next(
+        resource
+        for resource in stage_resources
+        if resource["metadata"]["name"]
+        == renderer._provider_resource_name(custom_namespace, "trpc-runtime-prometheus-discovery")
+        and resource["kind"] == "ClusterRoleBinding"
+    )
+    assert discovery_binding["roleRef"]["name"] == renderer._provider_resource_name(
+        custom_namespace, "trpc-runtime-prometheus-discovery"
+    )
+
+    assert all(document.get("kind") != "APIService" for document in stage_documents)
+    cutover_documents = documents(stage_dir / "runtime-support-cutover.yaml")
+    assert len(cutover_documents) == 1
+    cutover = cutover_documents[0]
+    assert cutover["kind"] == "APIService"
+    assert cutover["metadata"]["name"] == "v1beta1.external.metrics.k8s.io"
+    assert cutover["spec"]["service"] == {
+        "name": "prometheus-adapter",
+        "namespace": custom_namespace,
+        "port": 443,
+    }
+    default_api_services = [
+        document for document in default_documents if document.get("kind") == "APIService"
+    ]
+    assert len(default_api_services) == 1
+    assert all(document.get("kind") != "APIService" for document in stage_documents)
+    config_map = next(
+        document
+        for document in stage_documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "prometheus-config"
+    )
+    prometheus = yaml.safe_load(config_map["data"]["prometheus.yml"])
+    production = next(
+        job
+        for job in prometheus["scrape_configs"]
+        if job["job_name"] == "trpc-session-ready-backlog-production"
+    )
+    assert production["static_configs"][0]["targets"] == [
+        "trpc-backlog-exporter.trpc-service.svc:9100"
+    ]
+
+
+def test_render_rebinds_support_namespace_and_preserves_external_namespace() -> None:
+    support = _support()
+    support.namespace = "cell-runtime-support"
+    documents = [
+        {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "trpc-runtime-support"},
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "postgres", "namespace": "trpc-runtime-support"},
+            "spec": {"template": {"metadata": {"labels": {"component": "postgres"}}, "spec": {}}},
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "auth-reader", "namespace": "kube-system"},
+            "subjects": [
+                {"kind": "ServiceAccount", "name": "adapter", "namespace": "trpc-runtime-support"},
+                {"kind": "ServiceAccount", "name": "system", "namespace": "kube-system"},
+            ],
+        },
+        {
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {"name": "v1beta1.external.metrics.k8s.io"},
+            "spec": {
+                "service": {"name": "prometheus-adapter", "namespace": "trpc-runtime-support"}
+            },
+        },
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "allow-support"},
+            "spec": {
+                "ingress": [
+                    {
+                        "from": [
+                            {
+                                "namespaceSelector": {
+                                    "matchLabels": {
+                                        "kubernetes.io/metadata.name": "trpc-runtime-support"
+                                    }
+                                }
+                            },
+                            {
+                                "namespaceSelector": {
+                                    "matchLabels": {"kubernetes.io/metadata.name": "kube-system"}
+                                }
+                            },
+                        ]
+                    }
+                ]
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "connection"},
+            "data": {
+                "url": "http://postgres.trpc-runtime-support.svc.cluster.local:5432",
+                "external": "kube-system.svc.cluster.local",
+            },
+        },
+    ]
+
+    rendered = renderer.render_documents(documents, support)
+
+    assert documents[0]["metadata"]["name"] == "trpc-runtime-support"
+    assert rendered[0]["metadata"]["name"] == "cell-runtime-support"
+    assert rendered[1]["metadata"]["namespace"] == "cell-runtime-support"
+    assert "namespace" not in rendered[1]["spec"]["template"]["metadata"]
+    assert rendered[2]["metadata"]["namespace"] == "kube-system"
+    assert [subject["namespace"] for subject in rendered[2]["subjects"]] == [
+        "cell-runtime-support",
+        "kube-system",
+    ]
+    assert rendered[3]["spec"]["service"]["namespace"] == "cell-runtime-support"
+    selectors = rendered[4]["spec"]["ingress"][0]["from"]
+    assert selectors[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] == (
+        "cell-runtime-support"
+    )
+    assert selectors[1]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] == (
+        "kube-system"
+    )
+    assert (
+        rendered[5]["data"]["url"] == "http://postgres.cell-runtime-support.svc.cluster.local:5432"
+    )
+    assert rendered[5]["data"]["external"] == "kube-system.svc.cluster.local"
+
+
+def test_legacy_synthetic_backlog_resources_are_removed_from_nested_lists() -> None:
+    documents = [
+        {
+            "apiVersion": "v1",
+            "kind": "List",
+            "items": [
+                {"kind": "ConfigMap", "metadata": {"name": "backlog-metric-source"}},
+                {"kind": "Service", "metadata": {"name": "backlog-metric-source"}},
+                {"kind": "ServiceAccount", "metadata": {"name": "backlog-observer"}},
+                {
+                    "kind": "ClusterRole",
+                    "metadata": {"name": "trpc-runtime-backlog-observer"},
+                },
+                {"kind": "ConfigMap", "metadata": {"name": "keep-me"}},
+            ],
+        },
+        {"kind": "Deployment", "metadata": {"name": "backlog-metric-source"}},
+        {"kind": "Service", "metadata": {"name": "keep-me"}},
+    ]
+
+    renderer._drop_synthetic_backlog_resources(documents)
+
+    assert [item["metadata"]["name"] for item in documents[0]["items"]] == ["keep-me"]
+    assert [item["metadata"]["name"] for item in documents[1:]] == ["keep-me"]
+
+
 def test_render_binds_support_provider_images_pull_secret_and_prometheus_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -296,6 +635,7 @@ spec:
     support.minio_client_image = "registry.example/mc@sha256:" + "d" * 64
     support.prometheus_image = "registry.example/prometheus@sha256:" + "e" * 64
     support.prometheus_adapter_image = "registry.example/adapter@sha256:" + "f" * 64
+    support.external_metric_compatibility_namespaces = ("trpc-service-legacy",)
     config = SimpleNamespace(
         support=support,
         image_pull_secret="runtime-pull",
@@ -321,7 +661,6 @@ spec:
         if isinstance(document, dict) and document.get("kind") == "Deployment"
     }
     assert deployment_images == {
-        "backlog-metric-source": "registry.example/trpc-agent-service@sha256:" + "a" * 64,
         "prometheus": "registry.example/prometheus@sha256:" + "e" * 64,
         "prometheus-adapter": "registry.example/adapter@sha256:" + "f" * 64,
         "minio": "registry.example/minio@sha256:" + "c" * 64,
@@ -364,15 +703,108 @@ spec:
     assert production_jobs == [
         {
             "job_name": "trpc-session-ready-backlog-production",
-            "static_configs": [{"targets": ["trpc-backlog-exporter.trpc-service.svc:9100"]}],
+            "static_configs": [
+                {
+                    "targets": [
+                        "trpc-backlog-exporter.trpc-service.svc:9100",
+                        "trpc-backlog-exporter.trpc-service-legacy.svc:9100",
+                    ]
+                }
+            ],
+            "metric_relabel_configs": [
+                {
+                    "source_labels": ["__name__"],
+                    "regex": "^trpc_session_ready_backlog$",
+                    "action": "keep",
+                }
+            ],
         }
     ]
-    synthetic = next(
-        job for job in prometheus["scrape_configs"] if job["job_name"] == "trpc-runtime-backlog"
+    assert all(
+        "backlog-metric-source" not in json.dumps(document, sort_keys=True)
+        for document in rendered_support
     )
-    assert synthetic["metric_relabel_configs"] == [
-        {"source_labels": ["namespace"], "regex": "^trpc\\-service$", "action": "drop"}
+    assert not any(
+        document.get("metadata", {}).get("name") == "backlog-metric-source"
+        for document in rendered_support
+        if isinstance(document, dict)
+    )
+    dynamic = next(
+        job
+        for job in prometheus["scrape_configs"]
+        if job["job_name"] == "trpc-runtime-gate-backlog"
+    )
+    assert dynamic["kubernetes_sd_configs"] == [{"role": "endpoints"}]
+    relabels = dynamic["relabel_configs"]
+    assert {
+        "source_labels": ["__meta_kubernetes_namespace"],
+        "regex": "^trpc-runtime-gate-[0-9a-f]{10}$",
+        "action": "keep",
+    } in relabels
+    assert {
+        "source_labels": ["__meta_kubernetes_service_name"],
+        "regex": "^trpc-backlog-exporter$",
+        "action": "keep",
+    } in relabels
+    assert {
+        "source_labels": ["__meta_kubernetes_service_label_trpc_io_managed_by"],
+        "regex": "^trpc-kubernetes-runtime-gate$",
+        "action": "keep",
+    } in relabels
+    assert {
+        "source_labels": ["__meta_kubernetes_service_label_trpc_io_run_nonce"],
+        "regex": "^[0-9a-f]{32}$",
+        "action": "keep",
+    } in relabels
+    assert {
+        "source_labels": ["__meta_kubernetes_service_label_trpc_io_cluster_fingerprint"],
+        "regex": "^[0-9a-f]{63}$",
+        "action": "keep",
+    } in relabels
+    assert dynamic["metric_relabel_configs"] == [
+        {
+            "source_labels": ["__name__"],
+            "regex": "^trpc_session_ready_backlog$",
+            "action": "keep",
+        }
     ]
+    assert not any(
+        "replacement" in relabel for relabel in relabels + dynamic["metric_relabel_configs"]
+    )
+    prometheus_sa = next(
+        document
+        for document in rendered_support
+        if isinstance(document, dict)
+        and document.get("kind") == "ServiceAccount"
+        and document.get("metadata", {}).get("name") == "prometheus"
+    )
+    assert prometheus_sa["metadata"]["namespace"] == "trpc-runtime-support"
+    discovery_role = next(
+        document
+        for document in rendered_support
+        if isinstance(document, dict)
+        and document.get("kind") == "ClusterRole"
+        and document.get("metadata", {}).get("name") == "trpc-runtime-prometheus-discovery"
+    )
+    assert discovery_role["rules"] == [
+        {
+            "apiGroups": [""],
+            "resources": ["namespaces", "services", "endpoints", "pods"],
+            "verbs": ["get", "list", "watch"],
+        }
+    ]
+    assert not any(
+        resource in discovery_role["rules"][0]["resources"] for resource in ("jobs", "secrets")
+    )
+    prometheus_deployment = next(
+        document
+        for document in rendered_support
+        if isinstance(document, dict)
+        and document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "prometheus"
+    )
+    assert renderer._pod_specs(prometheus_deployment)[0]["serviceAccountName"] == "prometheus"
+    assert renderer._pod_specs(prometheus_deployment)[0]["automountServiceAccountToken"] is True
     adapter_config = next(
         document
         for document in rendered_support
@@ -515,6 +947,8 @@ def test_render_performance_overlay_binds_config_image_and_namespace(
         },
     )
     config = SimpleNamespace(
+        support=SimpleNamespace(namespace="cell-runtime-support"),
+        node_name="ack-workload-0",
         performance=performance,
         object_store_endpoint="http://minio.trpc-runtime-support.svc.cluster.local:9000",
         object_store_bucket="trpc-artifacts",
@@ -545,7 +979,7 @@ def test_render_performance_overlay_binds_config_image_and_namespace(
     assert config_patch["data"]["TRPC_SERVICE_OTLP_ENDPOINT"] == ""
     assert config_patch["data"]["TRPC_SERVICE_PROMETHEUS_ENABLED"] == "false"
     assert config_patch["data"]["TRPC_SERVICE_S3_ENDPOINT"] == (
-        "http://minio.trpc-runtime-support.svc.cluster.local:9000"
+        "http://minio.cell-runtime-support.svc.cluster.local:9000"
     )
     assert config_patch["data"]["TRPC_SERVICE_S3_BUCKET"] == "trpc-artifacts"
     workload_documents = list(
@@ -555,7 +989,20 @@ def test_render_performance_overlay_binds_config_image_and_namespace(
         item["metadata"]["name"]: item for item in workload_documents if isinstance(item, dict)
     }
     assert workload_by_name["trpc-gateway"]["spec"]["template"]["spec"]["nodeSelector"] == {
-        "trpc-role": "workload"
+        "kubernetes.io/hostname": "ack-workload-0",
+        "trpc-role": "workload",
+    }
+    assert workload_by_name["trpc-backlog-exporter"]["spec"]["template"]["spec"][
+        "nodeSelector"
+    ] == {
+        "kubernetes.io/hostname": "ack-workload-0",
+        "trpc-role": "workload",
+    }
+    assert workload_by_name["trpc-schema-migration"]["spec"]["template"]["spec"][
+        "nodeSelector"
+    ] == {
+        "kubernetes.io/hostname": "ack-workload-0",
+        "trpc-role": "workload",
     }
     assert workload_by_name["trpc-gateway"]["spec"]["template"]["spec"]["containers"][0]["env"] == [
         {"name": "TRPC_SERVICE_DATABASE_POOL_MIN_SIZE", "value": "5"},
@@ -588,6 +1035,14 @@ def test_render_performance_overlay_binds_config_image_and_namespace(
     }
     assert (output / "performance-network-policy.yaml").is_file()
     assert (output / "base" / "kustomization.yaml").is_file()
+
+    for policy_path in (
+        output / "performance-network-policy.yaml",
+        output / "base" / "network-policy.yaml",
+    ):
+        policy_text = policy_path.read_text(encoding="utf-8")
+        assert "kubernetes.io/metadata.name: cell-runtime-support" in policy_text
+        assert "kubernetes.io/metadata.name: trpc-runtime-support" not in policy_text
 
 
 def test_render_performance_overlay_requires_explicit_enablement(

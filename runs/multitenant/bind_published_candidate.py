@@ -20,10 +20,26 @@ if str(ROOT) not in sys.path:
 
 from scripts.candidate_lock import create_candidate_lock
 from scripts.evidence_lineage import current_release_binding, source_fingerprint
-from scripts.registry_image import registry_reference, validate_repository, validate_tag
+from scripts.registry_image import (
+    RegistryImageError,
+    _docker,
+    _source_label,
+    _verify_container_source,
+    registry_reference,
+    validate_repository,
+    validate_tag,
+)
 from scripts.report_io import atomic_write_json
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _verify_published_image(reference: str, *, source: str) -> None:
+    """Pull and re-attest one immutable candidate image before binding it."""
+
+    _docker(("pull", "--platform", "linux/amd64", reference))
+    _source_label(reference, source=source)
+    _verify_container_source(reference, source=source)
 
 
 def bind_published_candidate(
@@ -58,6 +74,8 @@ def bind_published_candidate(
     source = source_fingerprint(root)
     if source.get("status") != "available" or source.get("value") != source_value:
         raise ValueError("checkout source fingerprint does not match the published images")
+    _verify_published_image(initial_reference, source=source_value)
+    _verify_published_image(upgrade_reference, source=source_value)
     binding: dict[str, Any] = {
         "schema_version": 1,
         "kind": "registry_candidate_binding",
@@ -107,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             lock_output=args.lock_output,
         )
-    except (OSError, UnicodeError, ValueError) as error:
+    except (OSError, UnicodeError, ValueError, RegistryImageError) as error:
         parser.error(str(error))
     print(
         json.dumps(

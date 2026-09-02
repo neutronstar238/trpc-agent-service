@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from trpc_service.cell import events as event_module
+from trpc_service.cell.capsule import AssetRef
 from trpc_service.cell.events import (
     GENESIS_HASH,
     AppendOnlyViolation,
@@ -252,7 +253,7 @@ def test_branch_can_switch_capsule_without_crossing_tenant_or_cell_scope() -> No
     result = ProjectionReplayer(store).replay(target, reducer, initial_state=[])
     assert result.state == [11, 12, 99]
 
-    with pytest.raises(NamespaceViolation):
+    with pytest.raises(BranchNotFound):
         store.append(
             tenant_id="tenant-b",
             cell_id=source.cell_id,
@@ -263,6 +264,49 @@ def test_branch_can_switch_capsule_without_crossing_tenant_or_cell_scope() -> No
             payload={"delta": 1000},
             event_id=child.event_id,
         )
+
+
+def test_child_branch_can_causate_a_visible_parent_event() -> None:
+    store = InMemoryEventStore()
+    source = address()
+    parent_event = append_message(store, source, 1, value=11)
+    store.fork(
+        source,
+        1,
+        new_branch_id="candidate-capsule",
+        target_capsule_digest="sha256:capsule-v2",
+    )
+    target = CellAddress(
+        tenant_id=source.tenant_id,
+        app_id=source.app_id,
+        cell_id=source.cell_id,
+        session_id=source.session_id,
+        capsule_digest="sha256:capsule-v2",
+        branch_id="candidate-capsule",
+    )
+
+    child = store.append(
+        EventDraft(
+            tenant_id=target.tenant_id,
+            app_id=target.app_id,
+            cell_id=target.cell_id,
+            session_id=target.session_id,
+            capsule_digest=target.capsule_digest,
+            branch_id=target.branch_id,
+            event_type=EventType.REPLY_PREPARED,
+            payload={"text": "counterfactual"},
+            event_id="child-reply",
+            causation_id=parent_event.event_id,
+            correlation_id="corr-child",
+            trace_id="trace-child",
+            request_id="request-child",
+            occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+
+    assert child.causation_id == parent_event.event_id
+    assert store.read(target)[-1] == child
+    store.verify_chain(target)
 
 
 def test_branch_from_genesis_and_nested_branch_are_supported() -> None:
@@ -300,16 +344,18 @@ def test_streams_are_isolated_by_tenant_and_cell_scope() -> None:
         event_id="shared-event-id",
     )
     assert store.read(tenant_b) == ()
-    with pytest.raises(NamespaceViolation):
-        store.append(
-            tenant_id=tenant_b.tenant_id,
-            cell_id=tenant_b.cell_id,
-            session_id=tenant_b.session_id,
-            capsule_digest=tenant_b.capsule_digest,
-            event_type="message.accepted",
-            payload={"tenant": "b"},
-            event_id="shared-event-id",
-        )
+    tenant_b_event = store.append(
+        tenant_id=tenant_b.tenant_id,
+        cell_id=tenant_b.cell_id,
+        session_id=tenant_b.session_id,
+        capsule_digest=tenant_b.capsule_digest,
+        event_type="message.accepted",
+        payload={"tenant": "b"},
+        event_id="shared-event-id",
+    )
+    assert tenant_b_event.tenant_id == "tenant-b"
+    assert store.read(tenant_a)[0].payload == {"tenant": "a"}
+    assert store.read(tenant_b)[0].payload == {"tenant": "b"}
 
     other_cell = CellAddress(
         tenant_id="tenant-a",
@@ -344,8 +390,12 @@ def test_projection_replay_is_deterministic_and_supports_checkpointed_ranges() -
     assert tail.state == [1, 2, 3]
     assert tail.first_sequence == 2
 
+    calls = 0
+
     def nondeterministic(state: list[int], event) -> list[int]:
-        return [*state, id(event)]
+        nonlocal calls
+        calls += 1
+        return [*state, calls]
 
     with pytest.raises(DeterminismViolation):
         replayer.assert_deterministic(stream, nondeterministic, initial_state=[])
@@ -428,6 +478,23 @@ def test_identifier_json_and_timestamp_validation() -> None:
         store.append(EventDraft(**{**common, "payload": cast(object, ["not", "object"])}))
     event = store.append(EventDraft(**{**common, "payload": {"items": (1, 2, 3)}}))
     assert event.payload == {"items": [1, 2, 3]}
+
+
+def test_asset_ref_distinguishes_digest_and_logical_uri_without_rejecting_schemes() -> None:
+    logical = AssetRef.parse("policy://governance/v8")
+    digest = AssetRef.parse("sha256:" + "a" * 64)
+
+    assert logical.kind == "logical"
+    assert logical.logical_ref == "policy://governance/v8"
+    assert logical.digest is None
+    assert digest.kind == "digest"
+    assert digest.digest == "sha256:" + "a" * 64
+    assert digest.logical_ref is None
+
+    with pytest.raises(ValueError, match="explicit scheme"):
+        AssetRef.parse("policy://governance/v8 with-space")
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        AssetRef.parse("sha256:" + "A" * 64)
 
 
 def test_event_serialisation_and_integrity_failure_modes() -> None:

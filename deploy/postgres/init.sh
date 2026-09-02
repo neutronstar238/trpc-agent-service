@@ -3,8 +3,10 @@ set -eu
 
 cleanup_passwords() {
     unset runtime_password migration_password worker_password metrics_password \
+        hpa_password \
         TRPC_INIT_RUNTIME_PASSWORD TRPC_INIT_MIGRATION_PASSWORD \
-        TRPC_INIT_WORKER_PASSWORD TRPC_INIT_METRICS_PASSWORD
+        TRPC_INIT_WORKER_PASSWORD TRPC_INIT_METRICS_PASSWORD \
+        TRPC_INIT_HPA_PASSWORD
 }
 trap cleanup_passwords EXIT
 
@@ -24,6 +26,13 @@ if [ -r "$metrics_password_file" ]; then
     export TRPC_INIT_METRICS_PASSWORD="$metrics_password"
     metrics_password_set=true
 fi
+hpa_password_file=/run/secrets/hpa_database_password
+hpa_password_set=false
+if [ -r "$hpa_password_file" ]; then
+    hpa_password="$(tr -d '\r\n' <"$hpa_password_file")"
+    export TRPC_INIT_HPA_PASSWORD="$hpa_password"
+    hpa_password_set=true
+fi
 
 # Keep passwords out of psql's argv.  psql imports them from the environment
 # while the SQL itself is supplied on stdin.
@@ -39,11 +48,16 @@ export TRPC_INIT_MIGRATION_PASSWORD="$migration_password"
     if [ "$metrics_password_set" = true ]; then
         printf '%s\n' '\getenv metrics_password TRPC_INIT_METRICS_PASSWORD'
     fi
+    if [ "$hpa_password_set" = true ]; then
+        printf '%s\n' '\getenv hpa_password TRPC_INIT_HPA_PASSWORD'
+    fi
     cat <<'SQL'
 DO $block$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_migration') THEN
-        CREATE ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+        CREATE ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+    ELSE
+        ALTER ROLE trpc_migration LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_runtime') THEN
         CREATE ROLE trpc_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
@@ -60,6 +74,11 @@ BEGIN
     ELSE
         ALTER ROLE trpc_metrics LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_hpa') THEN
+        CREATE ROLE trpc_hpa LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+    ELSE
+        ALTER ROLE trpc_hpa LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+    END IF;
 END
 $block$;
 SELECT format('ALTER ROLE trpc_runtime PASSWORD %L', :'runtime_password') \gexec
@@ -68,6 +87,7 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO trpc_runtime', current_database()
 SELECT format('GRANT CONNECT ON DATABASE %I TO trpc_migration', current_database()) \gexec
 SELECT format('GRANT CONNECT ON DATABASE %I TO trpc_worker', current_database()) \gexec
 SELECT format('GRANT CONNECT ON DATABASE %I TO trpc_metrics', current_database()) \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO trpc_hpa', current_database()) \gexec
 -- Extension installation is an owner/bootstrap responsibility.  The migration
 -- role is intentionally non-owner and must not need elevated database rights.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -85,6 +105,11 @@ SQL
     if [ "$metrics_password_set" = true ]; then
         cat <<'SQL'
 SELECT format('ALTER ROLE trpc_metrics PASSWORD %L', :'metrics_password') \gexec
+SQL
+    fi
+    if [ "$hpa_password_set" = true ]; then
+        cat <<'SQL'
+SELECT format('ALTER ROLE trpc_hpa PASSWORD %L', :'hpa_password') \gexec
 SQL
     fi
 } | psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"

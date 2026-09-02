@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_ROOT_STR = str(ROOT)
+while _ROOT_STR in sys.path:
+    sys.path.remove(_ROOT_STR)
+sys.path.insert(0, _ROOT_STR)
 
 try:  # Keep both ``python -m`` and the documented script-path invocation usable.
     from scripts.evidence_lineage import build_evidence

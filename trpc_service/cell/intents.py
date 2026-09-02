@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -40,6 +41,8 @@ class PolicyDecision(StrEnum):
     def parse(cls, value: PolicyDecision | str) -> PolicyDecision:
         if isinstance(value, cls):
             return value
+        if not isinstance(value, str):
+            raise ValueError(f"unsupported policy decision: {value!r}")
         normalized = value.strip().lower().replace("-", "_")
         if normalized == "needs_confirmation":
             normalized = "require_confirmation"
@@ -69,6 +72,8 @@ class IntentRisk(StrEnum):
     def parse(cls, value: IntentRisk | str) -> IntentRisk:
         if isinstance(value, cls):
             return value
+        if not isinstance(value, str):
+            raise ValueError(f"unsupported intent risk: {value!r}")
         normalized = value.strip().lower().replace("-", "_")
         try:
             return cls(normalized)
@@ -78,6 +83,10 @@ class IntentRisk(StrEnum):
 
 # A readable alias for callers that think in terms of a generic risk level.
 RiskLevel = IntentRisk
+
+
+class IntentIntegrityError(ValueError):
+    """Raised when a ToolIntent changed after its content was fingerprinted."""
 
 
 _HIGH_RISK = frozenset(
@@ -102,10 +111,9 @@ def _canonical_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, Mapping):
-        return {
-            str(key): _canonical_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("mapping keys must be strings")
+        return {key: _canonical_value(item) for key, item in sorted(value.items())}
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
@@ -124,6 +132,41 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _freeze_value(value: Any) -> Any:
+    """Return a recursively immutable copy of a JSON-like value.
+
+    ``MappingProxyType`` is intentionally used only after copying the input
+    mapping.  A proxy around a caller-owned dictionary would still allow the
+    caller to mutate the intent through the original reference.  Sequences
+    and sets are copied as well so an intent remains a stable value even when
+    the model/runtime reuses its input object later.
+    """
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("mapping keys must be strings")
+        return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    raise TypeError(f"intent values contain unsupported value: {type(value).__name__}")
+
+
+def _is_frozen_value(value: Any) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, MappingProxyType):
+        return all(_is_frozen_value(item) for item in value.values())
+    if isinstance(value, tuple):
+        return all(_is_frozen_value(item) for item in value)
+    if isinstance(value, frozenset):
+        return all(_is_frozen_value(item) for item in value)
+    return False
+
+
 def arguments_hash(arguments: Mapping[str, Any]) -> str:
     """Hash arguments without depending on dictionary insertion order."""
 
@@ -138,6 +181,7 @@ def stable_effect_key(
     tool_name: str | None = None,
     arguments: Mapping[str, Any] | None = None,
     *,
+    app_id: str | None = "default",
     branch_id: str | None = "main",
     principal_id: str | None = None,
     capsule_digest: str | None = None,
@@ -164,6 +208,7 @@ def stable_effect_key(
             "intent_id": intent.intent_id,
             "tool_name": intent.tool_name,
             "arguments_hash": intent.arguments_hash,
+            "app_id": intent.app_id,
             "branch_id": intent.branch_id,
             "principal_id": intent.principal_id or "",
             "capsule_digest": intent.capsule_digest or "",
@@ -176,6 +221,7 @@ def stable_effect_key(
             "intent_id": intent_id,
             "tool_name": tool_name,
             "arguments": arguments,
+            "app_id": app_id,
             "branch_id": branch_id,
             "principal_id": principal_id,
             "capsule_digest": capsule_digest,
@@ -189,12 +235,15 @@ def stable_effect_key(
                 "intent_id",
                 "tool_name",
                 "arguments",
+                "app_id",
                 "branch_id",
             )
             if values[name] is None
         ]
         if missing:
             raise ValueError(f"effect key fields are missing: {', '.join(missing)}")
+        if not isinstance(app_id, str) or not app_id:
+            raise ValueError("app_id must be a non-empty string")
         if not isinstance(branch_id, str) or not branch_id:
             raise ValueError("branch_id must be a non-empty string")
         material = {
@@ -204,6 +253,7 @@ def stable_effect_key(
             "intent_id": intent_id,
             "tool_name": tool_name,
             "arguments_hash": arguments_hash(arguments or {}),
+            "app_id": app_id,
             "branch_id": branch_id,
             "principal_id": principal_id or "",
             "capsule_digest": capsule_digest or "",
@@ -219,13 +269,15 @@ def stable_effect_key(
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationScope:
-    """A narrowly scoped approval for one exact tool invocation.
+    """A narrowly scoped *description* for one exact tool invocation.
 
     Every identity and argument component is checked by ``matches``.  In
     particular, an approval cannot be transferred to another tenant, Cell,
     Session, principal, tool, or changed argument set.  ``effect_key`` is
     included so a manual replay cannot accidentally approve a different
-    logical intent that happens to use the same tool.
+    logical intent that happens to use the same tool.  This value is not proof
+    of approval; the effect executor requires a credential from an injected
+    approval verifier as well.
     """
 
     tenant_id: str
@@ -239,6 +291,7 @@ class ConfirmationScope:
     approved_by: str = ""
     approval_id: str = ""
     expires_at: datetime | None = None
+    app_id: str = "default"
 
     @classmethod
     def for_intent(
@@ -249,6 +302,7 @@ class ConfirmationScope:
         approval_id: str = "",
         ttl_seconds: int = 300,
     ) -> ConfirmationScope:
+        intent.validate_integrity()
         if ttl_seconds <= 0:
             raise ValueError("confirmation TTL must be positive")
         return cls(
@@ -260,6 +314,7 @@ class ConfirmationScope:
             arguments_hash=intent.arguments_hash,
             effect_key=intent.effect_key,
             branch_id=intent.branch_id,
+            app_id=intent.app_id,
             approved_by=approved_by,
             approval_id=approval_id,
             expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
@@ -270,31 +325,45 @@ class ConfirmationScope:
     from_intent = for_intent
 
     def matches(self, intent: ToolIntent, *, now: datetime | None = None) -> bool:
+        try:
+            intent.validate_integrity()
+        except IntentIntegrityError:
+            return False
         current = now or datetime.now(UTC)
         expires_at = self.expires_at
         if expires_at is not None:
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-            if expires_at <= current:
+            try:
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=UTC)
+                if expires_at <= current:
+                    return False
+            except (AttributeError, TypeError, ValueError):
                 return False
-        return (
-            hmac.compare_digest(self.tenant_id, intent.tenant_id)
-            and hmac.compare_digest(self.cell_id, intent.cell_id)
-            and hmac.compare_digest(self.session_id, intent.session_id)
-            and hmac.compare_digest(self.principal_id, intent.principal_id or "")
-            and hmac.compare_digest(self.tool_name, intent.tool_name)
-            and hmac.compare_digest(self.arguments_hash, intent.arguments_hash)
-            and hmac.compare_digest(self.effect_key, intent.effect_key)
-            and hmac.compare_digest(self.branch_id, intent.branch_id)
-        )
+        try:
+            return (
+                hmac.compare_digest(self.tenant_id, intent.tenant_id)
+                and hmac.compare_digest(self.cell_id, intent.cell_id)
+                and hmac.compare_digest(self.session_id, intent.session_id)
+                and hmac.compare_digest(self.principal_id, intent.principal_id or "")
+                and hmac.compare_digest(self.tool_name, intent.tool_name)
+                and hmac.compare_digest(self.arguments_hash, intent.arguments_hash)
+                and hmac.compare_digest(self.effect_key, intent.effect_key)
+                and hmac.compare_digest(self.branch_id, intent.branch_id)
+                and hmac.compare_digest(self.app_id, intent.app_id)
+            )
+        except (TypeError, ValueError):
+            return False
 
     def is_expired(self, *, now: datetime | None = None) -> bool:
         if self.expires_at is None:
             return False
         expires_at = self.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        return expires_at <= (now or datetime.now(UTC))
+        try:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            return expires_at <= (now or datetime.now(UTC))
+        except (AttributeError, TypeError, ValueError):
+            return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,7 +384,9 @@ class ToolIntent:
     arguments: Mapping[str, Any] = field(default_factory=dict)
     intent_id: str = ""
     branch_id: str = "main"
-    policy_decision: PolicyDecision | str = PolicyDecision.ALLOW
+    # ``None`` is accepted as an explicitly ungoverned value and normalized to
+    # DENY in ``__post_init__``.  The public default is visibly fail-closed.
+    policy_decision: PolicyDecision | str | None = PolicyDecision.DENY
     risk: IntentRisk | str = IntentRisk.UNKNOWN
     principal_id: str | None = None
     request_id: str | None = None
@@ -324,21 +395,42 @@ class ToolIntent:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     decision: PolicyDecision | str | None = field(default=None, repr=False, compare=False)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC), compare=False)
+    app_id: str = "default"
     arguments_hash: str = field(init=False)
+    metadata_hash: str = field(init=False)
+    policy_hash: str = field(init=False)
     effect_key: str = field(init=False)
 
     def __post_init__(self) -> None:
-        for field_name in ("tenant_id", "cell_id", "session_id", "tool_name", "branch_id"):
+        for field_name in (
+            "tenant_id",
+            "cell_id",
+            "session_id",
+            "tool_name",
+            "branch_id",
+            "app_id",
+        ):
             if not isinstance(getattr(self, field_name), str) or not getattr(self, field_name):
                 raise ValueError(f"{field_name} must be a non-empty string")
         if not isinstance(self.arguments, Mapping):
             raise TypeError("arguments must be a mapping")
-        normalized_arguments = dict(self.arguments)
-        normalized_metadata = dict(self.metadata)
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
+        normalized_arguments = _freeze_value(self.arguments)
+        normalized_metadata = _freeze_value(self.metadata)
         argument_digest = arguments_hash(normalized_arguments)
+        metadata_digest = arguments_hash(normalized_metadata)
         selected_decision = self.policy_decision if self.decision is None else self.decision
+        if selected_decision is None:
+            selected_decision = PolicyDecision.DENY
         normalized_decision = PolicyDecision.parse(selected_decision)
         normalized_risk = IntentRisk.parse(self.risk)
+        policy_digest = arguments_hash(
+            {
+                "policy_decision": normalized_decision.value,
+                "risk": normalized_risk.value,
+            }
+        )
         supplied_intent_id = self.intent_id
         if not supplied_intent_id:
             seed = _canonical_json(
@@ -347,6 +439,7 @@ class ToolIntent:
                     "cell_id": self.cell_id,
                     "session_id": self.session_id,
                     "tool_name": self.tool_name,
+                    "app_id": self.app_id,
                     "branch_id": self.branch_id,
                     "arguments_hash": argument_digest,
                     "principal_id": self.principal_id or "",
@@ -364,7 +457,48 @@ class ToolIntent:
         object.__setattr__(self, "intent_id", supplied_intent_id)
         object.__setattr__(self, "decision", normalized_decision)
         object.__setattr__(self, "arguments_hash", argument_digest)
+        object.__setattr__(self, "metadata_hash", metadata_digest)
+        object.__setattr__(self, "policy_hash", policy_digest)
         object.__setattr__(self, "effect_key", stable_effect_key(self))
+
+    def validate_integrity(self) -> bool:
+        """Verify the immutable proposal has not been tampered with.
+
+        Normal callers cannot mutate the recursively frozen arguments or
+        metadata.  The explicit check still matters at the trust boundary:
+        storage deserializers, test doubles, or hostile Python code can bypass
+        a frozen dataclass with ``object.__setattr__``.  Effects must call this
+        before looking up or claiming a ledger row.
+        """
+
+        try:
+            if not _is_frozen_value(self.arguments):
+                raise ValueError("intent arguments are not recursively immutable")
+            if not _is_frozen_value(self.metadata):
+                raise ValueError("intent metadata is not recursively immutable")
+            current_arguments_hash = arguments_hash(self.arguments)
+            current_metadata_hash = arguments_hash(self.metadata)
+            current_decision = self.policy_decision
+            if current_decision is None:
+                raise ValueError("policy decision is missing")
+            current_policy_hash = arguments_hash(
+                {
+                    "policy_decision": PolicyDecision.parse(current_decision).value,
+                    "risk": IntentRisk.parse(self.risk).value,
+                }
+            )
+            current_effect_key = stable_effect_key(self)
+        except (TypeError, ValueError) as exc:
+            raise IntentIntegrityError(f"intent contents are no longer valid: {exc}") from exc
+        if not hmac.compare_digest(current_arguments_hash, self.arguments_hash):
+            raise IntentIntegrityError("intent arguments hash drifted")
+        if not hmac.compare_digest(current_metadata_hash, self.metadata_hash):
+            raise IntentIntegrityError("intent metadata hash drifted")
+        if not hmac.compare_digest(current_policy_hash, self.policy_hash):
+            raise IntentIntegrityError("intent policy hash drifted")
+        if not hmac.compare_digest(current_effect_key, self.effect_key):
+            raise IntentIntegrityError("intent effect key drifted")
+        return True
 
     @property
     def args_hash(self) -> str:
@@ -399,6 +533,7 @@ class ToolIntent:
 
 __all__ = [
     "ConfirmationScope",
+    "IntentIntegrityError",
     "IntentRisk",
     "PolicyDecision",
     "RiskLevel",

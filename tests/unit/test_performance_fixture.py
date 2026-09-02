@@ -60,8 +60,10 @@ class FakeConnection:
         self.calls.append((query, args))
         return "DELETE 1" if query.startswith("DELETE") else "SELECT 1"
 
-    async def fetchval(self, query: str, *args: Any) -> int:
+    async def fetchval(self, query: str, *args: Any) -> object:
         self.calls.append((query, args))
+        if "cleanup_performance_cell_fixture" in query:
+            return json.dumps({table: 1 for table in fixture.CELL_CLEANUP_TABLES})
         return self.ownership_result
 
 
@@ -253,13 +255,19 @@ def test_cleanup_uses_only_literal_allowlist_and_sets_rls(tmp_path: Path) -> Non
     assert "admin_idempotency" not in ownership_queries[0]
     assert "audit.user_id=$3" in ownership_queries[0]
     assert "audit.trace_id=$6" in ownership_queries[0]
+    cell_cleanup_queries = [
+        query for query in queries if "cleanup_performance_cell_fixture" in query
+    ]
+    assert len(cell_cleanup_queries) == 1
     delete_queries = [query for query in queries if query.startswith("DELETE FROM ")]
-    assert len(delete_queries) == len(fixture.CLEANUP_TABLES)
+    assert len(delete_queries) == len(fixture._DIRECT_CLEANUP_TABLES)
     assert all(
         query.startswith("DELETE FROM ") and " WHERE tenant_id=$1" in query
         for query in delete_queries
     )
-    assert all(query.split()[2] in fixture.CLEANUP_TABLES for query in delete_queries)
+    assert all(query.split()[2] in fixture._DIRECT_CLEANUP_TABLES for query in delete_queries)
+    assert all(result["deleted_rows"][table] == 1 for table in fixture.CELL_CLEANUP_TABLES)
+    assert result["deleted_rows"]["cell_placement_reservations"] == 1
     assert result["deleted_rows"]["tenants"] == 1
     assert pool.closed
 
@@ -346,6 +354,14 @@ def test_cleanup_allowlist_is_child_before_parent_for_all_foreign_keys() -> None
         ("channel_bindings", "agent_apps"),
         ("session_mailboxes", "tenants"),
         ("sessions", "agent_apps"),
+        ("cell_effect_receipts", "cell_effect_ledger"),
+        ("cell_effect_receipts", "cell_tool_intents"),
+        ("cell_effect_ledger", "cell_tool_intents"),
+        ("cell_tool_intents", "cell_events"),
+        ("cell_placement_reservations", "agent_cells"),
+        ("cell_branch_heads", "agent_cells"),
+        ("cell_events", "agent_cells"),
+        ("agent_cells", "agent_capsules"),
     )
     assert all(position[child] < position[parent] for child, parent in edges)
 

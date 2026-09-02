@@ -11,6 +11,7 @@ business leases, BUSY retries, or long-running heartbeats.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from redis.exceptions import ResponseError
 
 from trpc_service.metrics.prometheus import (
@@ -41,6 +42,7 @@ _SESSION_READY_FIELDS = (
     "generation",
     "priority",
     "trace_id",
+    "trace_headers",
     "created_at",
 )
 
@@ -60,7 +62,18 @@ class SessionReady(BaseModel):
     generation: int = Field(ge=1)
     priority: int = Field(ge=0)
     trace_id: str = Field(min_length=1, max_length=512)
+    trace_headers: dict[str, str] = Field(default_factory=dict)
     created_at: datetime
+
+    @field_validator("trace_headers")
+    @classmethod
+    def validate_trace_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        allowed = {"traceparent", "tracestate", "baggage"}
+        if set(value).difference(allowed):
+            raise ValueError("unsupported SessionReady trace header")
+        if len(value) > 3 or any(len(key) > 64 or len(item) > 512 for key, item in value.items()):
+            raise ValueError("SessionReady trace headers are too large")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +101,12 @@ class SessionReadyCodec:
             "generation": str(message.generation),
             "priority": str(message.priority),
             "trace_id": message.trace_id,
+            "trace_headers": json.dumps(
+                message.trace_headers,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
             "created_at": created_at.isoformat().replace("+00:00", "Z"),
         }
 
@@ -112,6 +131,7 @@ class SessionReadyCodec:
                 generation=int(normalized["generation"]),
                 priority=int(normalized["priority"]),
                 trace_id=normalized["trace_id"],
+                trace_headers=json.loads(normalized["trace_headers"]),
                 created_at=datetime.fromisoformat(normalized["created_at"].replace("Z", "+00:00")),
             )
         except (TypeError, ValueError) as exc:

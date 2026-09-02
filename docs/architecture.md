@@ -7,6 +7,97 @@
 
 ---
 
+## 🧩 平台总图：控制面、运行面与适配面
+
+下面的总图按题目点名的边界命名组件。**Agent Cell 是逻辑身份，Agent Worker 是短生命周期宿主**；
+Channel Adapter 处理供应商协议，Storage Adapter 处理租户后端选择，Telemetry Collector 只接收
+脱敏后的指标/trace。Admin API 只改变带版本的控制面对象，不直接驱动一次模型执行。
+
+```mermaid
+flowchart TB
+    subgraph IM[外部触达]
+        WECOM[企业微信 AI Bot]
+        FEISHU[飞书应用机器人]
+        AGUI[AG-UI / A2A]
+    end
+
+    subgraph Edge[接入面]
+        CA[Channel Adapter<br/>验签 / 解密 / 限流 / 去重]
+        GW[Agent Gateway<br/>binding → tenant → session]
+        DISPATCH[Channel Dispatcher<br/>outbound outbox / retry / rate limit]
+    end
+
+    subgraph Control[平台控制面]
+        ADMIN[Admin API<br/>租户 / 配置 / 发布 / 回滚]
+        REG[Capsule Registry<br/>manifest / digest / signature]
+        SCHED[Cell Scheduler<br/>SLO / locality / capability / region / cost]
+    end
+
+    subgraph Runtime[Agent 运行面]
+        MB[Session Mailbox<br/>PG lease + fencing]
+        WORKER[Agent Worker<br/>无状态 Cell Host]
+        RUNNER[tRPC-Agent Runner<br/>Graph / Team / Model]
+        FILTER[Filter / Policy Judge<br/>工具 / 预算 / 脱敏 / 确认]
+        EFFECT[Intent / Effect Executor<br/>幂等副作用]
+    end
+
+    subgraph Data[数据适配面]
+        SA[Storage Adapter<br/>Session / Memory / Knowledge / Artifact]
+        PG[(PostgreSQL<br/>事实源 / RLS / Inbox / Outbox)]
+        REDIS[(Redis<br/>SessionReady / projection cache)]
+        VECTOR[(pgvector / 远端向量库)]
+        OBJECT[(S3 / MinIO)]
+    end
+
+    subgraph Observe[观测面]
+        TC[Telemetry Collector<br/>OTel traces / metrics]
+        TRACE[(OTel / Prometheus / Jaeger)]
+        AUDIT[(Audit Log)]
+    end
+
+    WECOM --> CA
+    FEISHU --> CA
+    AGUI --> GW
+    CA --> GW
+    GW --> MB
+    ADMIN --> REG
+    REG --> SCHED
+    MB --> REDIS
+    REDIS --> SCHED
+    SCHED --> WORKER
+    WORKER --> MB
+    WORKER --> RUNNER
+    RUNNER --> FILTER
+    FILTER --> EFFECT
+    EFFECT --> MB
+    GW --> SA
+    WORKER --> SA
+    SA --> PG
+    SA --> VECTOR
+    SA --> OBJECT
+    MB --> PG
+    PG -->|outbox relay| REDIS
+    PG -->|outbound outbox| DISPATCH
+    RUNNER -. sanitized spans .-> TC
+    FILTER -. decisions .-> TC
+    EFFECT -. receipts .-> TC
+    GW -. callback span .-> TC
+    TC --> TRACE
+    SA --> AUDIT
+    DISPATCH --> CA
+    CA --> WECOM
+    CA --> FEISHU
+```
+
+当前默认消息路径是 `Channel Adapter → Agent Gateway → PostgreSQL Mailbox/Outbox → Redis
+唤醒 → Agent Worker → tRPC-Agent Runner → Governance/ToolExecutor → Storage Adapter → Channel
+Adapter`；Worker 在 turn 边界把真实执行投影到 PostgreSQL Cell Journal，提交后的缺口由
+`post_turn.ready` Outbox 驱动的 Projector 补齐。图中的 Semantic Cell Scheduler、
+原生 Cell Effect Executor 和反事实 Judge 是目标生产路径：实现与数据库预留协议已提供，但尚未成为
+默认 Worker 热路径。Redis 只是可重建通知；租户、Session、事件、Memory/Summary 事实、审计和投递状态的
+权威读写仍由 Storage Adapter 选择并落实到 PostgreSQL/对应后端。Telemetry Collector（图中 `TC`）
+不得接收原文、Secret 或未脱敏 arguments。
+
 ## 🧭 设计结论
 
 本服务把 **PostgreSQL Session Mailbox** 作为调度和执行权的唯一权威，把 Redis
@@ -84,22 +175,31 @@ sequenceDiagram
     accDescr: A verified callback commits PostgreSQL mailbox work before a relay publishes a wake-up. A worker claims once, acknowledges the Redis notice, then executes and commits one fenced turn.
 
     participant im_user as IM user
-    participant gateway as Gateway
+    participant channel as Channel Adapter
+    participant gateway as Agent Gateway
+    participant storage as Storage Adapter
     participant postgres as PostgreSQL
     participant relay as Outbox relay
     participant redis as Redis SessionReady
-    participant worker as Worker
+    participant worker as Agent Worker
     participant runner as Agent runner
-    participant provider as Model / tool
+    participant filter as Filter / Policy
+    participant provider as Model / Tool
+    participant telemetry as Telemetry Collector
 
-    im_user->>gateway: callback
-    gateway->>gateway: verify, decrypt, resolve binding
-    gateway->>postgres: BEGIN; lock session_mailbox
+    im_user->>channel: provider callback
+    channel->>channel: verify / decrypt / dedupe
+    channel->>gateway: verified envelope + binding_id
+    gateway->>gateway: resolve binding, tenant, session and immutable revision
+    gateway->>storage: resolve tenant/session + pinned revision
+    storage->>postgres: BEGIN; lock session_mailbox
     postgres->>postgres: dedupe inbound; append sequence
     postgres->>postgres: IDLE -> QUEUED; generation + 1 when needed
     postgres->>postgres: write session.ready.v2 outbox
-    postgres-->>gateway: COMMIT
-    gateway-->>im_user: 2xx acknowledgement
+    postgres-->>storage: COMMIT
+    storage-->>gateway: durable acceptance
+    gateway-->>channel: accepted
+    channel-->>im_user: 2xx acknowledgement
 
     relay->>postgres: claim unpublished session.ready.v2 outbox
     relay->>redis: XADD SessionReady
@@ -107,18 +207,26 @@ sequenceDiagram
 
     worker->>worker: reserve Executor permit
     worker->>redis: XREADGROUP ... > (count=1)
-    worker->>postgres: claim_session_ready once
+    worker->>storage: claim_session_ready once
     alt claimed
-        postgres-->>worker: RUNNING + lease_epoch
+        storage-->>worker: RUNNING + lease_epoch
         worker->>redis: bounded XACK
-        worker->>postgres: hydrate session and inbound
+        worker->>storage: hydrate Session + Memory + Summary
         worker->>runner: execute one Agent turn
-        runner->>provider: model / tool HTTPS
+        runner->>provider: model request (trace_id/request_id)
         provider-->>runner: result
+        runner->>filter: governed Tool call + keyed audit projection
+        filter->>provider: legacy fenced ToolExecutor call
+        provider-->>filter: effect result / ambiguous + stable effect key
         runner-->>worker: buffered events and final reply
-        worker->>postgres: fenced commit; events, state, outbound, next status
+        worker->>storage: fenced commit; events, state, outbound
+        worker->>storage: post-commit best-effort Memory/Summary
+        storage->>storage: post_turn.ready repairs missing Cell effect/commit facts
+        worker-.>>telemetry: sanitized spans / metrics
+        gateway-.>>telemetry: callback span
+        storage-.>>telemetry: backend latency
     else stale, already running, or empty
-        postgres-->>worker: STALE / RUNNING / EMPTY
+        storage-->>worker: STALE / RUNNING / EMPTY
         worker->>redis: bounded XACK
         worker->>worker: release permit; no BUSY sleep
     else database error

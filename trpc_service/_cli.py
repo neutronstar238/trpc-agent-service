@@ -27,6 +27,12 @@ from trpc_service.config import (
     SchedulerVersion,
     ServiceSettings,
 )
+from trpc_service.database_contract import (
+    RUNTIME_FORBIDDEN_CELL_PRIVILEGES,
+    WORKER_CELL_FUNCTIONS,
+    WORKER_FORBIDDEN_CELL_PRIVILEGES,
+    WORKER_TABLE_PRIVILEGES,
+)
 from trpc_service.log import configure_logging
 from trpc_service.version import __version__
 
@@ -67,6 +73,7 @@ _DATABASE_FUNCTIONS: dict[Role, tuple[str, ...]] = {
     # subset, keeping role grants stable across rolling releases.
     Role.WORKER: (
         "public.resolve_channel_binding(text)",
+        *WORKER_CELL_FUNCTIONS,
         *_GLOBAL_WORKER_FUNCTIONS,
     ),
     Role.OUTBOX_DISPATCHER: ("public.claim_outbox_events(text,text,integer,integer)",),
@@ -87,43 +94,6 @@ _DATABASE_FUNCTIONS: dict[Role, tuple[str, ...]] = {
     ),
     Role.ARTIFACT_GC: (),
 }
-_WORKER_TABLES = (
-    "tenants",
-    "agent_apps",
-    "config_revisions",
-    "storage_profiles",
-    "tenant_policies",
-    "admin_idempotency",
-    "channel_bindings",
-    "channel_identities",
-    "inbound_messages",
-    "outbound_messages",
-    "delivery_attempts",
-    "sessions",
-    "session_turns",
-    "turn_intents",
-    "session_events",
-    "session_summaries",
-    "memories",
-    "artifacts",
-    "knowledge_items",
-    "knowledge_embeddings",
-    "outbox_events",
-    "dead_letters",
-    "tool_executions",
-    "confirmation_challenges",
-    "audit_logs",
-    "tenant_budget_usage",
-    "fault_stage_controls",
-    "session_mailboxes",
-    "session_mailbox_items",
-    "agent_capsules",
-    "agent_cells",
-    "cell_events",
-    "cell_tool_intents",
-    "cell_effect_ledger",
-    "cell_effect_receipts",
-)
 
 
 @app.callback()
@@ -441,6 +411,7 @@ async def _serve_worker(
     from trpc_service.agent.factory import DevelopmentAgentLoader, ProductionAgentLoader
     from trpc_service.agent.mailbox_runtime import MailboxClaimExecutor, MailboxReadyClaimer
     from trpc_service.agent.worker import AgentWorker
+    from trpc_service.cell.worker_journal import PostgresCellRuntimeJournal
     from trpc_service.channels.feishu import FeishuAdapter
     from trpc_service.channels.media_locator import WeComMediaLocatorCipher
     from trpc_service.channels.wecom import WeComMediaDownloader
@@ -461,6 +432,11 @@ async def _serve_worker(
     runtime_repository, fault_stages = _worker_fault_stage_runtime(settings, secrets, repository)
     worker_id = f"worker-{os.getenv('HOSTNAME') or uuid4()}"
     root_key = _secret_bytes(secrets.resolve(settings.session_hmac_ref))
+    cell_journal = PostgresCellRuntimeJournal(
+        runtime_repository.pool,
+        capsule_signing_key=_derive_key(root_key, b"cell-capsule-signing"),
+        privacy_hash_key=_derive_key(root_key, b"cell-private-hash"),
+    )
     confirmations = ConfirmationTokenService(
         _derive_key(root_key, b"tool-confirmation"),
         PostgresConfirmationLedger(runtime_repository.pool),
@@ -482,6 +458,7 @@ async def _serve_worker(
         secrets,
         tools=test_tools,
         governance=governance,
+        tool_observer=cell_journal,
         tool_executor=ToolExecutor(
             _derive_key(root_key, b"tool-execution"),
             PostgresExecutionLedger(runtime_repository.pool),
@@ -536,6 +513,7 @@ async def _serve_worker(
                 settings.workspace_root,
                 key=_derive_key(root_key, b"workspace-path"),
             ),
+            cell_journal=cell_journal,
         )
         if settings.scheduler_version == SchedulerVersion.V2:
             from trpc_service.queue.session_ready import (
@@ -732,11 +710,18 @@ async def _serve_projector(
     from trpc_service.storage.redis_projection import RedisProjectionStore
     from trpc_service.storage.services import PostgresSessionStore
 
+    cell_reconciler = None
+    if callable(getattr(getattr(repository, "pool", None), "acquire", None)):
+        from trpc_service.cell.worker_journal import PostgresCellCommitReconciler
+
+        cell_reconciler = PostgresCellCommitReconciler(repository.pool)
+
     await PostTurnProjector(
         repository,
         RedisProjectionStore(redis),
         owner_id=f"projector-{uuid4()}",
         session_store=PostgresSessionStore(repository),
+        cell_reconciler=cell_reconciler,
     ).run(stop_event=stop_event)
 
 
@@ -985,19 +970,33 @@ async def _validate_database_identity(repository: Any, role: Role) -> None:
             if not granted:
                 raise RuntimeError(f"database role {expected_role} lacks EXECUTE on {signature}")
         if role in _WORKER_DATABASE_ROLES:
-            for table in _WORKER_TABLES:
+            for table, privileges in WORKER_TABLE_PRIVILEGES.items():
                 granted = await connection.fetchval(
                     """
                     SELECT has_table_privilege(
-                        current_user, $1, 'SELECT,INSERT,UPDATE,DELETE'
+                        current_user, $1, $2
                     )
                     """,
                     f"public.{table}",
+                    privileges,
                 )
                 if not granted:
                     raise RuntimeError(
-                        f"database role {expected_role} lacks tenant table privileges on {table}"
+                        f"database role {expected_role} lacks {privileges} on tenant table {table}"
                     )
+            forbidden_privileges = WORKER_FORBIDDEN_CELL_PRIVILEGES
+        else:
+            forbidden_privileges = RUNTIME_FORBIDDEN_CELL_PRIVILEGES
+        for table, privilege in forbidden_privileges:
+            granted = await connection.fetchval(
+                "SELECT has_table_privilege(current_user, $1, $2)",
+                f"public.{table}",
+                privilege,
+            )
+            if granted:
+                raise RuntimeError(
+                    f"database role {expected_role} has forbidden {privilege} on Cell table {table}"
+                )
 
 
 def _secret_provider(settings: ServiceSettings) -> LocalSecretProvider:

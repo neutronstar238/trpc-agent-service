@@ -3,9 +3,35 @@
 *本文定义 Mailbox v2 的权威数据、SessionReady 唤醒、租约 fencing 和重放语义。*
 
 Agent Cell Fabric 不改变这些正确性边界：Mailbox 仍决定哪个 Worker 可以执行；Cell Causal Log 记录
-该执行产生了什么。生产 branch 的 Cell event 与原有 turn/event/outbound 在同一 fenced commit 中提交；
-候选 branch 只能追加到自己的 branch_id，不能取得生产副作用权限。`cell_effect_ledger` 独立保护外部
-副作用，即使 IM、模型或 Worker 重试，也只有一个 effect key 可以进入执行态。
+该执行产生了什么。默认 Worker 在 Session commit 前用同一 Session owner/epoch 对 Cell append 做独立
+fence，数据库 trigger 再校验这份 lease proof；Session/event/outbound 仍由原有单一事务权威提交。
+Cell 投影不是跨表“伪原子事务”：提交事务同时产生 `post_turn.ready` Outbox，Projector 只有在
+`session_turns=committed` 且同一 stream 已有 `reply.prepared` 的 committed-turn proof 下才能补齐缺失的
+effect/turn commit 事实，既不重放 Agent，也不会把投影失败误判成业务未提交。候选 branch 只能追加到
+自己的 `branch_id`，不能取得生产副作用权限。
+当前真实 Tool 热路径仍由原有 fenced `PostgresExecutionLedger` 保护，稳定 execution key 被映射为 Cell
+`effect_key`；原生 `cell_effect_ledger`/`ExactlyOnceEffectExecutor` 已实现但尚未替换默认 ToolExecutor。
+
+`0018_cell_namespace_and_reservations` 将 Cell 的并发边界收紧为完整地址
+`(tenant_id, app_id, cell_id, session_id, capsule_digest, branch_id)`。`cell_branch_heads` 是每个 branch
+的 sequence/hash/lease CAS 头，`cell_node_capacity` 与 `cell_placement_reservations` 在数据库事务内
+预留 CPU、内存和 Cell 槽位；Scheduler 的本地评分不是最终容量权威。reservation 对普通租户启用 RLS
+但不 `FORCE`，仅允许表 owner 的受控调度函数跨租户回收过期行并修正全局容量计数。这样两个 Gateway
+即使读取到同一个旧节点快照，也只能有一个 reservation 成功，失败者必须重新放置。
+
+`0019_cell_branch_head_lock` 将 branch-head 的 `FOR UPDATE` 收敛到 tenant-bound
+`SECURITY DEFINER` 函数；Worker 只获得该函数的 `EXECUTE`，仍没有表级 `UPDATE`。`0020/0021` 不改变
+正常 Session/Cell 的一致性模型：它只允许 `trpc_runtime` 在 checksum、合成租户记录及租约条件成立时，
+事务性清理本次性能 fixture。未过期 active reservation 会阻止清理；过期 active 行先转为 expired，
+已释放/过期行删除后再从所有剩余 active reservation 重算节点计数，并返回逐表删除计数。
+
+`0022_cell_node_snapshot_generation` 把 producer-owned `observed_generation` 与数据库本地 fence 分开。
+该值没有默认值，必须来自 Kubernetes resource version、持久 leader epoch/counter 等跨进程重启仍单调的
+控制面来源，不能使用进程内自增计数。节点行只接受严格更大的 observation；重复或迟到的遥测是成功
+no-op，只返回当前数据库 generation，因此不能把旧容量、健康或 draining 状态写回新快照之上。
+旧 7 参数 SQL 签名在滚动窗口内保留，但固定以 SQLSTATE `0A000` fail-closed，不具备写能力；升级必须
+先暂停 Semantic Scheduler 的快照写入，执行迁移并部署 8 参数 adapter 后再恢复。当前默认部署没有
+Semantic Scheduler 进程，因此该生产切换证据保持 `not_run`。
 
 ---
 
@@ -19,7 +45,7 @@ Agent Cell Fabric 不改变这些正确性边界：Mailbox 仍决定哪个 Worke
 | 入站消息和外部幂等 | PostgreSQL `inbound_messages` | 强一致事务 | `(tenant_id, channel, account_id, external_message_id)` 去重 |
 | Session 待处理顺序 | PostgreSQL `session_mailboxes` | 单 Session 串行 | `accepted_sequence > resolved_sequence` 表示仍有工作 |
 | Session 业务快照 | PostgreSQL `sessions` | fenced commit | mailbox lease 成功后读取；与 mailbox 按固定锁顺序更新 |
-| 事件、turn 和最终状态 | PostgreSQL | 强一致、连续 sequence | 只接受当前 `lease_owner + lease_epoch` 的提交 |
+| 事件、turn 和最终状态 | PostgreSQL | 强一致、连续 sequence | 运行时事实只接受当前 lease proof；提交后 terminal 投影只接受 committed-turn proof |
 | SessionReady outbox | PostgreSQL `outbox_events` | 事务内持久 | 先提交，再由 relay 至少一次发布 |
 | SessionReady Stream | Redis `trpc:session-ready:v2` | 至少一次、可重复 | 只作唤醒；不保存 inbound 正文或业务锁 |
 | Redis PEL | Redis consumer group | 短交接窗口 | 只由 Reclaimer 恢复 Claim/ACK 未完成的通知 |
@@ -29,6 +55,10 @@ Agent Cell Fabric 不改变这些正确性边界：Mailbox 仍决定哪个 Worke
 | Memory / Summary / Knowledge | PostgreSQL 事实记录 + 投影 | 事实强一致、向量最终一致 | 投影落后回退 PostgreSQL；禁止 sequence 倒退 |
 | Artifact bytes | S3/MinIO | 元数据提交后可见 | staging、checksum、提交元数据、孤儿清理 |
 | InMemory adapter | 当前进程 | 单节点开发/测试 | 不作为多节点生产权威 |
+
+表中 Memory/Knowledge/Artifact 是内置 PostgreSQL profile 的一致性语义；Redis、InMemory、远端向量库
+或外部 Memory 作为替代后端时，需要通过 `ProfileServiceFactory` 注入预注册适配器。仓库未把所有组合
+实现或验证为生产后端，真实迁移/恢复证据在验收矩阵中保持 `not_run`。
 
 `sessions` 中的 lease 字段是与旧运行时和业务快照配套的镜像；Mailbox v2 的调度判断以
 `session_mailboxes` 为准。清理两处 lease 时必须同时匹配旧的 `lease_owner` 和

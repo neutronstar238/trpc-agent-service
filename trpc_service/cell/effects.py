@@ -5,15 +5,22 @@ failure and an unknown provider outcome.  A normal exception from an effect
 call means the process cannot prove whether the provider applied the request,
 so the receipt becomes ``ambiguous`` and a later automatic retry is refused.
 Only :class:`KnownEffectFailure` is eligible for an automatic retry.  A human
-can explicitly replay an ambiguous intent with an exact
-:class:`~trpc_service.cell.intents.ConfirmationScope`.
+can explicitly replay an ambiguous intent with a one-time signed approval
+credential scoped to the exact intent.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import hmac
 import inspect
-from collections.abc import Awaitable, Callable
+import json
+import secrets
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -21,9 +28,13 @@ from typing import Any, Protocol
 
 from trpc_service.cell.intents import (
     ConfirmationScope,
+    IntentIntegrityError,
     PolicyDecision,
     ToolIntent,
 )
+
+DEFAULT_WAIT_TIMEOUT_SECONDS = 30.0
+MAX_POLICY_AUTHORIZATIONS = 4096
 
 
 class EffectStatus(StrEnum):
@@ -159,7 +170,7 @@ class ConfirmationRequired(EffectExecutionError):
     """Raised by :meth:`execute_or_raise` when policy approval is missing."""
 
     def __init__(self, receipt: EffectReceipt) -> None:
-        super().__init__("effect requires an exact confirmation scope")
+        super().__init__("effect requires an exact approval credential")
         self.receipt = receipt
 
 
@@ -169,6 +180,281 @@ class EffectKeyConflict(EffectExecutionError):
 
 class EffectLeaseConflict(EffectExecutionError):
     """A stale worker attempted to finish a newer effect attempt."""
+
+
+class ApprovalError(EffectExecutionError):
+    """Base class for malformed, expired, or already consumed approvals."""
+
+
+class InvalidApproval(ApprovalError):
+    """An approval credential failed cryptographic or scope validation."""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ApprovalCredential:
+    """Opaque, one-time credential issued by a trusted approval authority.
+
+    The token is intentionally not included in ``repr`` so accidental object
+    logging does not publish a credential that can authorize a side effect.
+    A caller may pass either this object or its string token to the executor.
+    """
+
+    token: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, str) or not self.token:
+            raise ValueError("approval token must be a non-empty string")
+
+
+class ApprovalVerifier(Protocol):
+    """Injection point for a platform approval service.
+
+    Implementations must atomically verify scope and consume a credential.
+    Returning ``False`` is intentionally indistinguishable from an invalid or
+    already-used token at the effect boundary.
+    """
+
+    async def verify_and_consume(
+        self,
+        credential: ApprovalCredential | str,
+        intent: ToolIntent,
+        *,
+        expected_scope: ConfirmationScope | None = None,
+    ) -> bool: ...
+
+
+class PolicyAuthority(Protocol):
+    """Trusted policy decision provider used before an effect is claimed."""
+
+    def decide(
+        self, intent: ToolIntent
+    ) -> PolicyDecision | str | Awaitable[PolicyDecision | str]: ...
+
+
+PolicyJudge = Callable[[ToolIntent], PolicyDecision | str | Awaitable[PolicyDecision | str]]
+
+
+class ApprovalLedger(Protocol):
+    """Atomic one-time nonce store for :class:`CellApprovalAuthority`."""
+
+    async def issue(self, nonce: str, expires_at: float, scope_digest: str) -> None: ...
+
+    async def consume(self, nonce: str, expires_at: float, scope_digest: str) -> bool: ...
+
+
+class InMemoryApprovalLedger:
+    """Process-local nonce store for tests and development.
+
+    Production deployments should provide a shared implementation backed by a
+    conditional SQL update or Redis ``SETNX``/Lua transaction.
+    """
+
+    def __init__(self) -> None:
+        self._records: dict[str, tuple[float, str, bool]] = {}
+        self._lock = asyncio.Lock()
+
+    async def issue(self, nonce: str, expires_at: float, scope_digest: str) -> None:
+        async with self._lock:
+            if nonce in self._records:
+                raise ValueError("approval nonce already exists")
+            self._records[nonce] = (expires_at, scope_digest, False)
+
+    async def consume(self, nonce: str, expires_at: float, scope_digest: str) -> bool:
+        async with self._lock:
+            record = self._records.get(nonce)
+            if record is None:
+                return False
+            stored_expiry, stored_digest, consumed = record
+            now = time.time()
+            if (
+                consumed
+                or stored_expiry <= now
+                or expires_at != stored_expiry
+                or not hmac.compare_digest(stored_digest, scope_digest)
+            ):
+                return False
+            self._records[nonce] = (stored_expiry, stored_digest, True)
+            return True
+
+
+def _approval_b64(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _approval_unb64(value: str) -> bytes:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    if not value or any(character not in alphabet for character in value):
+        raise InvalidApproval("approval token encoding is invalid")
+    try:
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise InvalidApproval("approval token encoding is invalid") from exc
+
+
+def _approval_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _approval_scope(
+    intent: ToolIntent,
+    approved_by: str,
+    approval_id: str,
+) -> dict[str, str]:
+    return {
+        "tenant_id": intent.tenant_id,
+        "app_id": intent.app_id,
+        "cell_id": intent.cell_id,
+        "session_id": intent.session_id,
+        "principal_id": intent.principal_id or "",
+        "tool_name": intent.tool_name,
+        "arguments_hash": intent.arguments_hash,
+        "effect_key": intent.effect_key,
+        "branch_id": intent.branch_id,
+        "approved_by": approved_by,
+        "approval_id": approval_id,
+    }
+
+
+def _approval_scope_digest(scope: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_approval_json(scope)).hexdigest()
+
+
+class CellApprovalAuthority:
+    """Mint and atomically consume signed, exact-scope Cell approvals.
+
+    ``ConfirmationScope.for_intent`` remains a useful *description* for UI
+    and compatibility, but it is not a credential.  Only a token minted by
+    this authority (or an injected compatible ``ApprovalVerifier``) can cross
+    the executor's high-risk boundary.
+    """
+
+    def __init__(
+        self,
+        signing_key: bytes,
+        ledger: ApprovalLedger | None = None,
+        *,
+        ttl_seconds: int = 300,
+    ) -> None:
+        if not isinstance(signing_key, bytes) or len(signing_key) < 32:
+            raise ValueError("approval signing key must contain at least 32 bytes")
+        if ttl_seconds <= 0:
+            raise ValueError("approval TTL must be positive")
+        self._signing_key = signing_key
+        self.ledger = ledger or InMemoryApprovalLedger()
+        self.ttl_seconds = ttl_seconds
+
+    async def issue(
+        self,
+        intent: ToolIntent,
+        *,
+        approved_by: str,
+        approval_id: str,
+        ttl_seconds: int | None = None,
+    ) -> ApprovalCredential:
+        intent.validate_integrity()
+        if not approved_by or not approval_id:
+            raise ValueError("approved_by and approval_id are required")
+        ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
+        if ttl <= 0:
+            raise ValueError("approval TTL must be positive")
+        expires_at = time.time() + ttl
+        nonce = secrets.token_urlsafe(18)
+        scope = _approval_scope(intent, approved_by, approval_id)
+        payload = {
+            "v": 1,
+            "nonce": nonce,
+            "exp": expires_at,
+            "scope": scope,
+        }
+        encoded = _approval_b64(_approval_json(payload))
+        signature = _approval_b64(
+            hmac.new(self._signing_key, encoded.encode("ascii"), hashlib.sha256).digest()
+        )
+        await self.ledger.issue(nonce, expires_at, _approval_scope_digest(scope))
+        return ApprovalCredential(f"{encoded}.{signature}")
+
+    # Explicit aliases make the trust boundary discoverable without changing
+    # the compact primary API.
+    issue_approval = issue
+    mint = issue
+
+    async def verify_and_consume(
+        self,
+        credential: ApprovalCredential | str,
+        intent: ToolIntent,
+        *,
+        expected_scope: ConfirmationScope | None = None,
+    ) -> bool:
+        try:
+            intent.validate_integrity()
+            token = credential.token if isinstance(credential, ApprovalCredential) else credential
+            if not isinstance(token, str):
+                return False
+            parts = token.split(".")
+            if len(parts) != 2:
+                return False
+            encoded, supplied_signature = parts
+            expected_signature = _approval_b64(
+                hmac.new(
+                    self._signing_key,
+                    encoded.encode("ascii"),
+                    hashlib.sha256,
+                ).digest()
+            )
+            if not hmac.compare_digest(expected_signature, supplied_signature):
+                return False
+            payload = json.loads(_approval_unb64(encoded))
+            if not isinstance(payload, dict) or payload.get("v") != 1:
+                return False
+            nonce = payload.get("nonce")
+            expires_at = payload.get("exp")
+            scope = payload.get("scope")
+            if (
+                not isinstance(nonce, str)
+                or not isinstance(expires_at, (int, float))
+                or not isinstance(scope, dict)
+                or expires_at <= time.time()
+            ):
+                return False
+            expected = _approval_scope(
+                intent,
+                str(scope.get("approved_by", "")),
+                str(scope.get("approval_id", "")),
+            )
+            if scope != expected:
+                return False
+            if expected_scope is not None:
+                if not expected_scope.matches(intent):
+                    return False
+                if (
+                    expected_scope.approved_by
+                    and expected_scope.approved_by != scope["approved_by"]
+                ):
+                    return False
+                if (
+                    expected_scope.approval_id
+                    and expected_scope.approval_id != scope["approval_id"]
+                ):
+                    return False
+            return await self.ledger.consume(
+                nonce,
+                float(expires_at),
+                _approval_scope_digest(scope),
+            )
+        except (
+            InvalidApproval,
+            TypeError,
+            ValueError,
+            KeyError,
+            UnicodeError,
+            json.JSONDecodeError,
+        ):
+            return False
 
 
 EffectCallable = Callable[[], Awaitable[Any] | Any]
@@ -230,6 +516,7 @@ def _intent_fingerprint(intent: ToolIntent) -> str:
     return ":".join(
         (
             intent.tenant_id,
+            intent.app_id,
             intent.cell_id,
             intent.session_id,
             intent.intent_id,
@@ -272,6 +559,30 @@ class InMemoryEffectLedger:
         if receipt.is_terminal:
             self._event_for(receipt.effect_key).set()
 
+    def _expire_if_needed_locked(
+        self,
+        effect_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> EffectReceipt | None:
+        current = self.records.get(effect_key)
+        if (
+            current is None
+            or current.status != EffectStatus.RUNNING
+            or current.lease_expires_at is None
+            or current.lease_expires_at > (now or datetime.now(UTC))
+        ):
+            return current
+        ambiguous = replace(
+            current,
+            status=EffectStatus.AMBIGUOUS,
+            error_type="effect_lease_expired",
+            completed_at=now or datetime.now(UTC),
+            lease_expires_at=None,
+        )
+        self._append(ambiguous)
+        return ambiguous
+
     @staticmethod
     def _ensure_identity(current: EffectReceipt | None, intent: ToolIntent) -> None:
         if current is not None and current.intent_fingerprint not in {
@@ -284,6 +595,16 @@ class InMemoryEffectLedger:
         async with self._lock:
             return self.records.get(effect_key)
 
+    @staticmethod
+    def _validate_intent(intent: ToolIntent) -> None:
+        try:
+            intent.validate_integrity()
+        except IntentIntegrityError as exc:
+            # Keep the ledger's historical key-conflict vocabulary for direct
+            # storage callers, while the executor exposes the more precise
+            # integrity error before it reaches this layer.
+            raise EffectKeyConflict("intent integrity validation failed") from exc
+
     async def claim(
         self,
         intent: ToolIntent,
@@ -295,6 +616,7 @@ class InMemoryEffectLedger:
     ) -> EffectClaim:
         if lease_seconds <= 0:
             raise ValueError("effect lease must be positive")
+        self._validate_intent(intent)
         async with self._lock:
             current = self.records.get(intent.effect_key)
             self._ensure_identity(current, intent)
@@ -311,6 +633,7 @@ class InMemoryEffectLedger:
                             status=EffectStatus.AMBIGUOUS,
                             error_type="effect_lease_expired",
                             completed_at=now,
+                            lease_expires_at=None,
                         )
                         self._append(ambiguous)
                         return EffectClaim(ambiguous, False)
@@ -364,6 +687,7 @@ class InMemoryEffectLedger:
             EffectStatus.REQUIRE_CONFIRMATION,
         }:
             raise ValueError("policy records must be denied, simulated, or confirmation-required")
+        self._validate_intent(intent)
         async with self._lock:
             current = self.records.get(intent.effect_key)
             self._ensure_identity(current, intent)
@@ -400,6 +724,7 @@ class InMemoryEffectLedger:
             EffectStatus.UNKNOWN,
         }:
             raise ValueError("effect completion must be succeeded, failed, or unknown")
+        self._validate_intent(intent)
         async with self._lock:
             current = self.records.get(intent.effect_key)
             self._ensure_identity(current, intent)
@@ -415,13 +740,29 @@ class InMemoryEffectLedger:
                 raise EffectLeaseConflict("effect attempt is fenced")
             if worker_id is not None and current.worker_id not in {None, worker_id}:
                 raise EffectLeaseConflict("effect worker is fenced")
+            lease_expires_at = current.lease_expires_at
+            now = datetime.now(UTC)
+            if lease_expires_at is not None and lease_expires_at <= now:
+                # Never accept a result after the worker's fence expired.  The
+                # provider may have applied the operation, so the only safe
+                # durable outcome is ambiguous and manual review is required.
+                ambiguous = replace(
+                    current,
+                    status=EffectStatus.AMBIGUOUS,
+                    result=None,
+                    error_type="effect_lease_expired",
+                    completed_at=now,
+                    lease_expires_at=None,
+                )
+                self._append(ambiguous)
+                raise EffectLeaseConflict("effect lease expired before completion")
             receipt = replace(
                 current,
                 status=status,
                 result=result if status == EffectStatus.SUCCEEDED else None,
                 error_type=error_type,
                 worker_id=worker_id or current.worker_id,
-                completed_at=datetime.now(UTC),
+                completed_at=now,
                 lease_expires_at=None,
             )
             self._append(receipt)
@@ -433,19 +774,23 @@ class InMemoryEffectLedger:
         *,
         timeout: float | None = None,  # noqa: ASYNC109
     ) -> EffectReceipt | None:
+        if timeout is None:
+            timeout = DEFAULT_WAIT_TIMEOUT_SECONDS
+        elif timeout < 0:
+            raise ValueError("wait timeout must be non-negative")
+        deadline = asyncio.get_running_loop().time() + timeout
         while True:
             async with self._lock:
-                current = self.records.get(effect_key)
+                current = self._expire_if_needed_locked(effect_key)
                 if current is None or current.is_terminal:
                     return current
                 event = self._event_for(effect_key)
             try:
-                if timeout is None:
-                    await event.wait()
-                else:
-                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                await asyncio.wait_for(event.wait(), timeout=remaining)
             except TimeoutError:
-                return await self.get(effect_key)
+                async with self._lock:
+                    return self._expire_if_needed_locked(effect_key)
 
 
 class ExactlyOnceEffectExecutor:
@@ -462,18 +807,58 @@ class ExactlyOnceEffectExecutor:
         *,
         lease_seconds: float = 60.0,
         worker_id: str = "cell-effect-worker",
+        wait_timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+        approval_verifier: ApprovalVerifier | None = None,
+        approval_authority: ApprovalVerifier | None = None,
+        policy_judge: PolicyJudge | None = None,
+        policy_authority: PolicyAuthority | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("effect lease must be positive")
         if not worker_id:
             raise ValueError("worker_id must be non-empty")
+        if wait_timeout_seconds <= 0:
+            raise ValueError("wait timeout must be positive")
+        if approval_verifier is not None and approval_authority is not None:
+            raise TypeError("provide approval_verifier or approval_authority, not both")
+        if policy_judge is not None and policy_authority is not None:
+            raise TypeError("provide policy_judge or policy_authority, not both")
         self.ledger = ledger or InMemoryEffectLedger()
         self.lease_seconds = lease_seconds
         self.worker_id = worker_id
+        self.wait_timeout_seconds = wait_timeout_seconds
+        self.approval_verifier = approval_verifier or approval_authority
+        self.policy_judge = policy_judge
+        self.policy_authority = policy_authority
+        self._policy_authorizations: dict[str, tuple[ToolIntent, str | None]] = {}
 
     @staticmethod
     def effect_key_for(intent: ToolIntent) -> str:
         return intent.effect_key
+
+    async def authorize(
+        self,
+        intent: ToolIntent,
+    ) -> tuple[ToolIntent, str | None]:
+        """Resolve policy once and return an executor-bound decision.
+
+        The returned intent is not a bearer token by itself.  ``execute``
+        accepts it only when this same executor previously produced and cached
+        the exact value, so a caller cannot manufacture an ALLOW replacement
+        and bypass the policy authority.  The cache also lets a runtime record
+        the decision before invoking the effect without evaluating policy a
+        second time.
+        """
+
+        intent.validate_integrity()
+        effective_intent, policy_error = await self._resolve_policy(intent)
+        if len(self._policy_authorizations) >= MAX_POLICY_AUTHORIZATIONS:
+            self._policy_authorizations.pop(next(iter(self._policy_authorizations)))
+        self._policy_authorizations[intent.effect_key] = (
+            effective_intent,
+            policy_error,
+        )
+        return effective_intent, policy_error
 
     async def execute(
         self,
@@ -484,6 +869,9 @@ class ExactlyOnceEffectExecutor:
         simulate: EffectCallable | None = None,
         confirmation_scope: ConfirmationScope | None = None,
         confirmation: ConfirmationScope | None = None,
+        approval_credential: ApprovalCredential | str | None = None,
+        approval_token: ApprovalCredential | str | None = None,
+        authorized_intent: ToolIntent | None = None,
         manual_replay: bool = False,
         wait: bool = True,
         wait_timeout: float | None = None,
@@ -498,10 +886,16 @@ class ExactlyOnceEffectExecutor:
         before deciding whether to ask for human approval.
         """
 
+        intent.validate_integrity()
         if effect is not None and call is not None:
             raise TypeError("provide effect or call, not both")
+        if confirmation_scope is not None and confirmation is not None:
+            raise TypeError("provide confirmation_scope or confirmation, not both")
+        if approval_credential is not None and approval_token is not None:
+            raise TypeError("provide approval_credential or approval_token, not both")
         effect_fn = effect or call
         scope = confirmation_scope or confirmation
+        credential = approval_credential or approval_token
         owner = worker_id or self.worker_id
         existing = await self.ledger.get(intent.effect_key)
 
@@ -512,17 +906,36 @@ class ExactlyOnceEffectExecutor:
             EffectStatus.SIMULATED,
             EffectStatus.DENIED,
         }:
+            if authorized_intent is not None:
+                self._policy_authorizations.pop(intent.effect_key, None)
             return existing
 
-        if intent.policy_decision == PolicyDecision.DENY:
+        if authorized_intent is None:
+            effective_intent, policy_error = await self._resolve_policy(intent)
+        else:
+            try:
+                authorized_intent.validate_integrity()
+                cached = self._policy_authorizations.pop(intent.effect_key, None)
+                if (
+                    cached is None
+                    or cached[0] != authorized_intent
+                    or authorized_intent.effect_key != intent.effect_key
+                ):
+                    raise ValueError("authorization is not bound to this executor and intent")
+                effective_intent, policy_error = cached
+            except (IntentIntegrityError, ValueError):
+                effective_intent = replace_intent_decision(intent, PolicyDecision.DENY)
+                policy_error = "policy_authorization_invalid"
+
+        if effective_intent.policy_decision == PolicyDecision.DENY:
             return await self.ledger.record_policy(
-                intent,
+                effective_intent,
                 status=EffectStatus.DENIED,
-                error_type="policy_denied",
+                error_type=policy_error or "policy_denied",
                 worker_id=owner,
             )
 
-        if intent.policy_decision == PolicyDecision.SIMULATE_ONLY:
+        if effective_intent.policy_decision == PolicyDecision.SIMULATE_ONLY:
             if existing is not None and existing.status == EffectStatus.REQUIRE_CONFIRMATION:
                 # A previous policy decision cannot be bypassed by changing
                 # only the caller's function; the intent is immutable.
@@ -532,20 +945,34 @@ class ExactlyOnceEffectExecutor:
                 simulation_result = await _call_effect(simulate)
             return (
                 await self.ledger.record_policy(
-                    replace_intent_decision(intent, PolicyDecision.SIMULATE_ONLY),
+                    replace_intent_decision(effective_intent, PolicyDecision.SIMULATE_ONLY),
                     status=EffectStatus.SIMULATED,
                     worker_id=owner,
                 )
                 if simulate is None
                 else await self._record_simulation_result(
-                    intent,
+                    effective_intent,
                     simulation_result,
                     owner,
                 )
             )
 
-        confirmation_valid = scope is not None and scope.matches(intent)
-        if intent.requires_confirmation and not confirmation_valid:
+        if effect_fn is None:
+            raise ValueError("an effect callable is required for an allow decision")
+
+        needs_approval = effective_intent.requires_confirmation or (
+            manual_replay
+            and existing is not None
+            and existing.status in {EffectStatus.AMBIGUOUS, EffectStatus.UNKNOWN}
+        )
+        confirmation_valid = False
+        if needs_approval:
+            confirmation_valid = await self._verify_approval(
+                credential,
+                effective_intent,
+                expected_scope=scope,
+            )
+        if needs_approval and not confirmation_valid:
             if existing is not None and existing.status in {
                 EffectStatus.AMBIGUOUS,
                 EffectStatus.UNKNOWN,
@@ -553,17 +980,14 @@ class ExactlyOnceEffectExecutor:
             }:
                 return existing
             return await self.ledger.record_policy(
-                intent,
+                effective_intent,
                 status=EffectStatus.REQUIRE_CONFIRMATION,
-                error_type="confirmation_required",
+                error_type="approval_required",
                 worker_id=owner,
             )
 
-        if effect_fn is None:
-            raise ValueError("an effect callable is required for an allow decision")
-
         claim = await self.ledger.claim(
-            intent,
+            effective_intent,
             manual_replay=manual_replay,
             confirmation_valid=confirmation_valid,
             lease_seconds=self.lease_seconds,
@@ -571,7 +995,15 @@ class ExactlyOnceEffectExecutor:
         )
         if not claim.acquired:
             if claim.receipt.status == EffectStatus.RUNNING and wait:
-                waited = await self.ledger.wait(intent.effect_key, timeout=wait_timeout)
+                effective_wait_timeout = (
+                    self.wait_timeout_seconds if wait_timeout is None else wait_timeout
+                )
+                if effective_wait_timeout < 0:
+                    raise ValueError("wait timeout must be non-negative")
+                waited = await self.ledger.wait(
+                    effective_intent.effect_key,
+                    timeout=effective_wait_timeout,
+                )
                 return waited or claim.receipt
             return claim.receipt
 
@@ -579,8 +1011,8 @@ class ExactlyOnceEffectExecutor:
         try:
             result = await _call_effect(effect_fn)
         except KnownEffectFailure as exc:
-            return await self.ledger.complete(
-                intent,
+            return await self._complete_safely(
+                effective_intent,
                 attempt=attempt,
                 status=EffectStatus.FAILED,
                 error_type=type(exc).__name__,
@@ -589,13 +1021,18 @@ class ExactlyOnceEffectExecutor:
         except asyncio.CancelledError:
             # Cancellation can happen after the provider accepted the request;
             # persist ambiguity before propagating cancellation to the worker.
-            await self.ledger.complete(
-                intent,
-                attempt=attempt,
-                status=EffectStatus.AMBIGUOUS,
-                error_type="CancelledError",
-                worker_id=owner,
-            )
+            try:
+                await self._complete_safely(
+                    effective_intent,
+                    attempt=attempt,
+                    status=EffectStatus.AMBIGUOUS,
+                    error_type="CancelledError",
+                    worker_id=owner,
+                )
+            except EffectLeaseConflict:
+                # Cancellation must retain its cancellation semantics even if
+                # the worker lost its lease while trying to fence the result.
+                pass
             raise
         except Exception as exc:
             # The safe default is ambiguous, including ordinary network
@@ -603,20 +1040,101 @@ class ExactlyOnceEffectExecutor:
             # ``KnownEffectFailure`` only when it has a definitive negative
             # acknowledgement.
             error_type = type(exc).__name__
-            return await self.ledger.complete(
-                intent,
+            return await self._complete_safely(
+                effective_intent,
                 attempt=attempt,
                 status=EffectStatus.AMBIGUOUS,
                 error_type=error_type,
                 worker_id=owner,
             )
-        return await self.ledger.complete(
-            intent,
+        return await self._complete_safely(
+            effective_intent,
             attempt=attempt,
             status=EffectStatus.SUCCEEDED,
             result=result,
             worker_id=owner,
         )
+
+    async def _resolve_policy(self, intent: ToolIntent) -> tuple[ToolIntent, str | None]:
+        """Resolve caller-provided policy through a trusted authority.
+
+        A caller-supplied ALLOW is only a proposal.  Without an injected
+        authority it is converted to DENY, and an authority failure is also a
+        deny decision.  Explicit DENY and SIMULATE_ONLY decisions are already
+        fail-safe and do not need an authority call.
+        """
+
+        if intent.policy_decision != PolicyDecision.ALLOW:
+            return intent, None
+        evaluator: PolicyJudge | None = self.policy_judge
+        if self.policy_authority is not None:
+            evaluator = self.policy_authority.decide
+        if evaluator is None:
+            return replace_intent_decision(intent, PolicyDecision.DENY), "policy_unverified"
+        try:
+            decision = await _call_policy(evaluator, intent)
+            normalized = PolicyDecision.parse(decision)
+        except Exception:
+            return replace_intent_decision(intent, PolicyDecision.DENY), "policy_judge_error"
+        return replace_intent_decision(intent, normalized), None
+
+    async def _verify_approval(
+        self,
+        credential: ApprovalCredential | str | None,
+        intent: ToolIntent,
+        *,
+        expected_scope: ConfirmationScope | None,
+    ) -> bool:
+        """Verify and consume a one-time approval at the effect boundary."""
+
+        if credential is None or self.approval_verifier is None:
+            # A plain ConfirmationScope is deliberately not sufficient: it is
+            # an easily forgeable value object, not proof of human approval.
+            return False
+        if expected_scope is not None and not expected_scope.matches(intent):
+            return False
+        try:
+            return bool(
+                await self.approval_verifier.verify_and_consume(
+                    credential,
+                    intent,
+                    expected_scope=expected_scope,
+                )
+            )
+        except Exception:
+            # An unavailable or malformed approval service must fail closed.
+            return False
+
+    async def _complete_safely(
+        self,
+        intent: ToolIntent,
+        *,
+        attempt: int,
+        status: EffectStatus,
+        result: Any = None,
+        error_type: str | None = None,
+        worker_id: str | None = None,
+    ) -> EffectReceipt:
+        """Fence late completions without losing the durable ambiguity row."""
+
+        try:
+            return await self.ledger.complete(
+                intent,
+                attempt=attempt,
+                status=status,
+                result=result,
+                error_type=error_type,
+                worker_id=worker_id,
+            )
+        except EffectLeaseConflict:
+            current = await self.ledger.get(intent.effect_key)
+            if (
+                current is not None
+                and current.attempt == attempt
+                and current.status in {EffectStatus.AMBIGUOUS, EffectStatus.UNKNOWN}
+            ):
+                return current
+            raise
 
     async def _record_simulation_result(
         self,
@@ -656,15 +1174,24 @@ class ExactlyOnceEffectExecutor:
         intent: ToolIntent,
         effect: EffectCallable,
         *,
-        confirmation_scope: ConfirmationScope,
+        confirmation_scope: ConfirmationScope | None = None,
+        approval_credential: ApprovalCredential | str | None = None,
+        approval_token: ApprovalCredential | str | None = None,
         **kwargs: Any,
     ) -> EffectReceipt:
-        """Explicitly replay an ambiguous intent after exact approval."""
+        """Explicitly replay an ambiguous intent after verified approval.
+
+        ``confirmation_scope`` is retained as a compatibility hint and is
+        never accepted as authorization by itself.  Pass a credential issued
+        by :class:`CellApprovalAuthority` (or another injected verifier).
+        """
 
         return await self.execute(
             intent,
             effect,
             confirmation_scope=confirmation_scope,
+            approval_credential=approval_credential,
+            approval_token=approval_token,
             manual_replay=True,
             **kwargs,
         )
@@ -682,6 +1209,16 @@ async def _call_effect(effect: EffectCallable) -> Any:
     return value
 
 
+async def _call_policy(
+    policy: PolicyJudge,
+    intent: ToolIntent,
+) -> PolicyDecision | str:
+    value = policy(intent)
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 def replace_intent_decision(intent: ToolIntent, decision: PolicyDecision) -> ToolIntent:
     """Return an equivalent intent with a different immutable policy decision.
 
@@ -693,6 +1230,7 @@ def replace_intent_decision(intent: ToolIntent, decision: PolicyDecision) -> Too
 
     return ToolIntent(
         tenant_id=intent.tenant_id,
+        app_id=intent.app_id,
         cell_id=intent.cell_id,
         session_id=intent.session_id,
         tool_name=intent.tool_name,
@@ -712,6 +1250,11 @@ def replace_intent_decision(intent: ToolIntent, decision: PolicyDecision) -> Too
 
 __all__ = [
     "AmbiguousEffectOutcome",
+    "ApprovalCredential",
+    "ApprovalError",
+    "ApprovalLedger",
+    "ApprovalVerifier",
+    "CellApprovalAuthority",
     "ConfirmationRequired",
     "EffectCallable",
     "EffectClaim",
@@ -724,8 +1267,12 @@ __all__ = [
     "EffectStatus",
     "ExactlyOnceEffectExecutor",
     "ExecutionStatus",
+    "InMemoryApprovalLedger",
     "InMemoryEffectLedger",
+    "InvalidApproval",
     "KnownEffectFailure",
+    "PolicyAuthority",
+    "PolicyJudge",
     "ToolEffectExecutor",
     "UnknownEffectOutcome",
 ]

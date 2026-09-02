@@ -47,6 +47,7 @@ class SessionReadyOutboxQueue:
                 generation=generation,
                 priority=priority,
                 trace_id=trace_id,
+                trace_headers=record.trace_headers,
                 created_at=created_at,
             )
         )

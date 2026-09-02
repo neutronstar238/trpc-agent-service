@@ -253,9 +253,7 @@ class ProbeConfig:
                 "TRPC_IM_PROBE_RUNNER_TIMEOUT_SECONDS is outside the safe range"
             )
         try:
-            driver_timeout = float(
-                os.getenv("TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS", str(timeout))
-            )
+            driver_timeout = float(os.getenv("TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS", str(timeout)))
         except ValueError as error:
             raise ProbeConfigurationError(
                 "TRPC_IM_PROBE_DRIVER_TIMEOUT_SECONDS is invalid"

@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location E:\trpc-agent-service
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+Set-Location -LiteralPath $projectRoot
 $env:COMPOSE_DISABLE_ENV_FILE = "1"
 
 function Get-DockerInspectDocument {

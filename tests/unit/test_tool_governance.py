@@ -150,6 +150,18 @@ async def test_tool_execution_retries_only_idempotent_operations() -> None:
     ).context
     ledger = InMemoryExecutionLedger()
     executor = ToolExecutor(KEY, ledger)
+    other_app_context = context.model_copy(update={"app_id": "another-app"})
+    assert executor.key_for(
+        context,
+        turn_id="turn",
+        tool_name="charge",
+        arguments={"amount": 1},
+    ) != executor.key_for(
+        other_app_context,
+        turn_id="turn",
+        tool_name="charge",
+        arguments={"amount": 1},
+    )
     calls = 0
 
     async def uncertain():

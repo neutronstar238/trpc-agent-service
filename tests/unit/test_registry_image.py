@@ -50,6 +50,19 @@ def test_publish_candidate_builds_two_pinned_images_and_writes_binding(
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
+        if command[1] == "run":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "algorithm": "sha256",
+                        "status": "available",
+                        "value": source,
+                    }
+                ),
+                "",
+            )
         if command[1] == "image" and command[2] == "inspect":
             if "Config.Labels" in command[-1]:
                 return subprocess.CompletedProcess(
@@ -101,6 +114,53 @@ def test_publish_candidate_builds_two_pinned_images_and_writes_binding(
     assert all("--provenance=false" in command for command in builds)
     assert all("--platform" in command and "linux/amd64" in command for command in builds)
     assert any("io.trpc.agent-service.release-role=upgrade" in command for command in builds[1])
+    container_checks = [command for command in commands if command[1] == "run"]
+    assert len(container_checks) == 2
+    assert all("--pull=never" in command for command in container_checks)
+    assert all("--network=none" in command for command in container_checks)
+    assert all("--read-only" in command for command in container_checks)
+    assert all("--cap-drop=ALL" in command for command in container_checks)
+    assert all("--security-opt=no-new-privileges" in command for command in container_checks)
+    assert all("--entrypoint=/opt/venv/bin/python" in command for command in container_checks)
+    assert all("--env" not in command and "--secret" not in command for command in container_checks)
+    assert all("scripts.evidence_lineage" in command[-1] for command in container_checks)
+    for check in container_checks:
+        push = next(
+            command for command in commands if command[1] == "push" and command[2] == check[10]
+        )
+        assert commands.index(check) < commands.index(push)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "error"),
+    (
+        (
+            0,
+            json.dumps({"algorithm": "sha256", "status": "available", "value": "f" * 64}),
+            "does not match",
+        ),
+        (0, json.dumps({"algorithm": "sha256", "status": "available"}), "malformed"),
+        (0, "not-json", "not valid JSON"),
+        (17, "", "docker run failed with exit code 17"),
+    ),
+)
+def test_container_source_fingerprint_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: str,
+    error: str,
+) -> None:
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(command, returncode, stdout, "")
+
+    monkeypatch.setattr(registry_image.shutil, "which", lambda _: "docker")
+    monkeypatch.setattr(registry_image.subprocess, "run", fake_run)
+
+    with pytest.raises(registry_image.RegistryImageError, match=error):
+        registry_image._verify_container_source(
+            "registry.example/acme/service:candidate", source="a" * 64
+        )
 
 
 def test_push_falls_back_to_repo_digest_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,6 +194,8 @@ def test_publish_rejects_same_initial_and_upgrade_digest(
             0,
             json.dumps({registry_image.SOURCE_LABEL: "f" * 64})
             if command[1] == "image" and "Config.Labels" in command[-1]
+            else json.dumps({"algorithm": "sha256", "status": "available", "value": "f" * 64})
+            if command[1] == "run"
             else f"digest: {digest}\n",
             "",
         ),
@@ -174,6 +236,13 @@ def test_publish_rejects_checkout_changed_during_push(
                 json.dumps({registry_image.SOURCE_LABEL: source})
                 if "Config.Labels" in command[-1]
                 else json.dumps([f"repo@{_digest('d')}"]),
+                "",
+            )
+        if command[1] == "run":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"algorithm": "sha256", "status": "available", "value": source}),
                 "",
             )
         if command[1] == "push":

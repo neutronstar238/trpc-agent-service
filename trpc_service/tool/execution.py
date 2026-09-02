@@ -144,6 +144,7 @@ class ToolExecutor:
         canonical = json.dumps(
             [
                 context.tenant_id,
+                context.app_id,
                 context.session_id,
                 turn_id,
                 tool_name,

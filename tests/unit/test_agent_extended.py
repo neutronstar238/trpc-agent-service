@@ -460,6 +460,84 @@ async def test_worker_rechecks_acceptance_after_another_worker_commits() -> None
     assert result.status == ProcessStatus.DUPLICATE
 
 
+class RecordingCellJournal:
+    def __init__(self, *, fail_commit: bool = False) -> None:
+        self.calls: list[tuple[str, object]] = []
+        self.fail_commit = fail_commit
+
+    async def begin_turn(self, acceptance, config, lease):
+        token = {"turn_id": lease.turn_id}
+        self.calls.append(("begin", acceptance.inbound_id))
+        return token
+
+    async def record_agent_event(self, turn, event):
+        self.calls.append(("event", event.id))
+
+    async def prepare_reply(self, turn, outbound):
+        self.calls.append(("prepare", outbound.outbound_id))
+
+    async def commit_turn(self, turn, result):
+        self.calls.append(("commit", result.outbound_id))
+        if self.fail_commit:
+            raise RuntimeError("cell journal unavailable after commit")
+
+    async def fail_turn(self, turn, *, error_type):
+        self.calls.append(("fail", error_type))
+
+    async def mark_reconcile_required(self, turn, *, error_type):
+        self.calls.append(("reconcile", error_type))
+
+
+@pytest.mark.asyncio
+async def test_worker_journals_real_runner_events_around_fenced_commit() -> None:
+    repo = repository()
+    accepted = await TenantRuntime(repo, routing_key=b"cell-journal" * 3).accept(
+        "binding-unpredictable-a", envelope(message_id="cell-journal-1")
+    )
+    journal = RecordingCellJournal()
+
+    async def load_agent(_config):
+        return DeterministicAgent(name="cell-journal-agent", response="journalled")
+
+    result = await AgentWorker(
+        repo,
+        worker_id="cell-journal-worker",
+        agent_loader=load_agent,
+        cell_journal=journal,
+    ).process(accepted)
+
+    assert result.status == ProcessStatus.COMMITTED
+    assert [name for name, _value in journal.calls] == [
+        "begin",
+        "event",
+        "prepare",
+        "commit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_never_replays_committed_turn_when_cell_projection_needs_reconcile() -> None:
+    repo = repository()
+    accepted = await TenantRuntime(repo, routing_key=b"cell-reconcile" * 3).accept(
+        "binding-unpredictable-a", envelope(message_id="cell-journal-2")
+    )
+    journal = RecordingCellJournal(fail_commit=True)
+
+    async def load_agent(_config):
+        return DeterministicAgent(name="cell-journal-agent", response="journalled")
+
+    result = await AgentWorker(
+        repo,
+        worker_id="cell-journal-worker",
+        agent_loader=load_agent,
+        cell_journal=journal,
+    ).process(accepted)
+
+    assert result.status == ProcessStatus.COMMITTED
+    assert [name for name, _value in journal.calls][-2:] == ["commit", "reconcile"]
+    assert not any(name == "fail" for name, _value in journal.calls)
+
+
 @pytest.mark.asyncio
 async def test_worker_heartbeat_failure_is_fenced(monkeypatch) -> None:
     repo = repository()

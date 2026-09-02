@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from trpc_agent_sdk.agents import BaseAgent
+from trpc_agent_sdk.events import Event
 
 from trpc_service.agent.media import MediaExtractor, MediaLimits
 from trpc_service.agent.registry import RevisionRegistry
@@ -67,6 +68,34 @@ class MediaDownloader(Protocol):
     ) -> DownloadedMedia: ...
 
 
+class CellTurnJournal(Protocol):
+    """Durable causal journal attached to the real Worker/Runner path.
+
+    The journal is intentionally expressed as a narrow Worker boundary instead
+    of making the Agent layer depend on a particular Cell database adapter.
+    Implementations stage causal events while the fenced Session turn runs,
+    prepare the reply before the Session commit, and mark it committed only
+    after the authoritative Session/Outbox transaction succeeds.
+    """
+
+    async def begin_turn(
+        self,
+        acceptance: Acceptance,
+        config: TenantConfig,
+        lease: SessionLease,
+    ) -> object: ...
+
+    async def record_agent_event(self, turn: object, event: Event) -> None: ...
+
+    async def prepare_reply(self, turn: object, outbound: OutboundEnvelope) -> None: ...
+
+    async def commit_turn(self, turn: object, result: CommitResult) -> None: ...
+
+    async def fail_turn(self, turn: object, *, error_type: str) -> None: ...
+
+    async def mark_reconcile_required(self, turn: object, *, error_type: str) -> None: ...
+
+
 class ProcessStatus(StrEnum):
     COMMITTED = "committed"
     BUSY = "busy"
@@ -93,6 +122,7 @@ class AgentWorker:
         media_extractor: MediaExtractor | None = None,
         workspace_manager: WorkspaceManager | None = None,
         query_embedding_provider: QueryEmbeddingProvider | None = None,
+        cell_journal: CellTurnJournal | None = None,
         max_turn_attempts: int = 3,
     ) -> None:
         if max_turn_attempts < 1:
@@ -107,6 +137,7 @@ class AgentWorker:
         self._media_extractor = media_extractor or MediaExtractor()
         self._workspace_manager = workspace_manager
         self._query_embedding_provider = query_embedding_provider
+        self._cell_journal = cell_journal
         self._max_turn_attempts = max_turn_attempts
 
     async def process(self, acceptance: Acceptance) -> WorkerResult:
@@ -213,6 +244,8 @@ class AgentWorker:
         current = lease
         heartbeat_error: BaseException | None = None
         stop_heartbeat = asyncio.Event()
+        cell_turn: object | None = None
+        session_committed = False
 
         async def heartbeat() -> None:
             nonlocal current, heartbeat_error
@@ -262,7 +295,7 @@ class AgentWorker:
         try:
 
             async def run_turn() -> tuple[TenantRunner, str, TenantDataServices | None]:
-                nonlocal current
+                nonlocal current, cell_turn
                 if mailbox_runtime and not current.snapshot_hydrated:
                     anchor = current.snapshot
                     snapshot = await self._repository.get_session_snapshot(
@@ -295,6 +328,8 @@ class AgentWorker:
                     acceptance.context.app_id,
                     acceptance.context.config_version,
                 )
+                if self._cell_journal is not None:
+                    cell_turn = await self._cell_journal.begin_turn(acceptance, config, current)
                 services = (
                     await self._service_factory.for_context(acceptance.context, config)
                     if self._service_factory is not None
@@ -321,6 +356,8 @@ class AgentWorker:
                     acceptance.envelope,
                     **run_options,
                 ):
+                    if self._cell_journal is not None and cell_turn is not None:
+                        await self._cell_journal.record_agent_event(cell_turn, event)
                     _record_usage(event, acceptance.context.tenant_id)
                     if event.visible and event.is_final_response() and event.get_text():
                         final_text = event.get_text()
@@ -360,6 +397,8 @@ class AgentWorker:
                 in_reply_to=acceptance.envelope.external_message_id,
                 trace_headers=_trace_headers(),
             )
+            if self._cell_journal is not None and cell_turn is not None:
+                await self._cell_journal.prepare_reply(cell_turn, outbound)
             turn_commit = TurnCommit(
                 context=acceptance.context,
                 lease=current,
@@ -372,6 +411,23 @@ class AgentWorker:
                 if mailbox_runtime
                 else await self._repository.commit(turn_commit)
             )
+            session_committed = True
+            if self._cell_journal is not None and cell_turn is not None:
+                try:
+                    await self._cell_journal.commit_turn(cell_turn, result)
+                except BaseException as error:
+                    # The Session/Outbox transaction is already authoritative.
+                    # Never replay the Agent turn merely because the derived
+                    # causal projection needs reconciliation.
+                    _LOGGER.error(
+                        "cell turn commit requires reconciliation: %s",
+                        type(error).__name__,
+                    )
+                    with contextlib.suppress(BaseException):
+                        await self._cell_journal.mark_reconcile_required(
+                            cell_turn,
+                            error_type=_safe_error_type(error),
+                        )
             await self._post_commit_context(
                 acceptance,
                 current,
@@ -385,6 +441,12 @@ class AgentWorker:
                 turn_task.cancel()
                 await asyncio.gather(turn_task, return_exceptions=True)
             await stop_heartbeat_task()
+            if not session_committed and self._cell_journal is not None and cell_turn is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cell_journal.fail_turn(
+                        cell_turn,
+                        error_type=_safe_error_type(error),
+                    )
             if mailbox_runtime:
                 await self._release_mailbox_failure(current, error)
             else:
@@ -783,6 +845,7 @@ async def _audit_media(
 
 __all__ = [
     "AgentWorker",
+    "CellTurnJournal",
     "DownloadedMedia",
     "MediaDownloader",
     "ProcessStatus",

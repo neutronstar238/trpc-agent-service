@@ -9,6 +9,8 @@ from scripts.session_ready_backlog_exporter import (
     BACKLOG_QUERY,
     DATABASE_DSN_ENV,
     NAMESPACE_ENV,
+    TENANT_BACKLOG_QUERY,
+    TENANT_ID_ENV,
     BacklogExporter,
     ExporterConfig,
     _configuration,
@@ -21,9 +23,11 @@ class _Connection:
         self.value = value
         self.error = error
         self.queries: list[str] = []
+        self.arguments: list[tuple[Any, ...]] = []
 
-    async def fetchval(self, query: str) -> Any:
+    async def fetchval(self, query: str, *arguments: Any) -> Any:
         self.queries.append(query)
+        self.arguments.append(arguments)
         if self.error is not None:
             raise self.error
         return self.value
@@ -70,6 +74,21 @@ def test_configuration_reads_only_dsn_and_namespace(monkeypatch: pytest.MonkeyPa
 
     assert config.database_dsn == "postgresql://metrics@db/service"
     assert config.namespace == "trpc-service"
+    assert config.tenant_id is None
+
+
+def test_configuration_accepts_only_nonce_bounded_hpa_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(DATABASE_DSN_ENV, "postgresql://metrics@db/service")
+    monkeypatch.setenv(NAMESPACE_ENV, "trpc-runtime-gate-1234567890")
+    monkeypatch.setenv(TENANT_ID_ENV, "hpa-" + "a" * 32)
+
+    assert _configuration().tenant_id == "hpa-" + "a" * 32
+
+    monkeypatch.setenv(TENANT_ID_ENV, "tenant-production")
+    with pytest.raises(ValueError, match=TENANT_ID_ENV):
+        _configuration()
 
 
 @pytest.mark.parametrize(
@@ -98,6 +117,25 @@ async def test_read_backlog_uses_fixed_function_and_accepts_nonnegative_int() ->
 
     assert await exporter.read_backlog() == 17
     assert connection.queries == [BACKLOG_QUERY]
+    assert connection.arguments == [()]
+
+
+@pytest.mark.asyncio
+async def test_read_backlog_uses_tenant_scoped_function_for_runtime_gate() -> None:
+    connection = _Connection(11)
+    tenant_id = "hpa-" + "a" * 32
+    exporter = BacklogExporter(
+        ExporterConfig(
+            database_dsn="postgresql://metrics@example.invalid/service",
+            namespace="trpc-runtime-gate-1234567890",
+            tenant_id=tenant_id,
+        ),
+        pool=_Pool(connection),
+    )
+
+    assert await exporter.read_backlog() == 11
+    assert connection.queries == [TENANT_BACKLOG_QUERY]
+    assert connection.arguments == [(tenant_id,)]
 
 
 @pytest.mark.asyncio

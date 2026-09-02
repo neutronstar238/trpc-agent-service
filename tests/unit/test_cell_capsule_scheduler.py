@@ -46,6 +46,7 @@ def make_node(node_id: str, **overrides: object) -> NodeSnapshot:
         "node_id": node_id,
         "region": "cn-east-1",
         "capacity_cpu_millis": 4_000,
+        "observed_generation": 1,
         "used_cpu_millis": 500,
         "capacity_memory_mb": 8_192,
         "used_memory_mb": 1_024,

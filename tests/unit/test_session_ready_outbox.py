@@ -40,6 +40,7 @@ def record(**payload_updates: object) -> OutboxRecord:
         event_type=SESSION_READY_EVENT_V2,
         aggregate_id="session-a",
         payload=payload,
+        trace_headers={"traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"},
     )
 
 
@@ -58,6 +59,9 @@ async def test_outbox_adapter_emits_only_authoritative_scheduler_fields() -> Non
             generation=7,
             priority=0,
             trace_id="trace-a",
+            trace_headers={
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+            },
             created_at=datetime(2026, 8, 23, 12, 0, tzinfo=UTC),
         )
     ]

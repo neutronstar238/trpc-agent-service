@@ -20,7 +20,8 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from typing import Any, Literal, Self
+from dataclasses import dataclass
+from typing import Any, ClassVar, Literal, Self
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -31,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+_LOGICAL_REF_RE = re.compile(r"^[a-z][a-z0-9+.-]*://[^\s]+$")
 
 
 class CapsuleVerificationError(ValueError):
@@ -43,6 +45,54 @@ class CapsuleDigestMismatch(CapsuleVerificationError):
 
 class CapsuleSignatureError(CapsuleVerificationError):
     """The signature is absent, malformed, or not trusted."""
+
+
+@dataclass(frozen=True, slots=True)
+class AssetRef:
+    """A validated reference to an immutable asset or a logical registry item.
+
+    ``digest`` is a content address and must be a complete lowercase
+    ``sha256:<64 hex>`` value.  Logical references are intentionally explicit
+    URI-like names (for example ``policy://governance/v8``); they are not
+    silently mistaken for content digests.  ``parse`` is the strict boundary
+    for control-plane input.  The manifest model keeps accepting historical
+    bare identifiers so existing offline examples remain readable, but
+    callers registering production capsules should call
+    :meth:`CapsuleSpec.validate_asset_refs`.
+    """
+
+    value: str
+    kind: Literal["digest", "logical"]
+
+    @classmethod
+    def parse(
+        cls,
+        value: str,
+        *,
+        expected: Literal["digest", "logical", "any"] = "any",
+    ) -> AssetRef:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("asset reference cannot be empty")
+        value = value.strip()
+        if value.startswith("sha256:"):
+            if not _DIGEST_RE.fullmatch(value):
+                raise ValueError("content asset digest must use sha256:<64 lowercase hex>")
+            kind: Literal["digest", "logical"] = "digest"
+        elif _LOGICAL_REF_RE.fullmatch(value):
+            kind = "logical"
+        else:
+            raise ValueError("logical asset reference must use an explicit scheme://name form")
+        if expected != "any" and kind != expected:
+            raise ValueError(f"asset reference must be a {expected}, got {kind}")
+        return cls(value=value, kind=kind)
+
+    @property
+    def digest(self) -> str | None:
+        return self.value if self.kind == "digest" else None
+
+    @property
+    def logical_ref(self) -> str | None:
+        return self.value if self.kind == "logical" else None
 
 
 class _ImmutableModel(BaseModel):
@@ -145,6 +195,54 @@ class CapsuleSpec(_ImmutableModel):
     def canonicalize_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _sorted_unique(value)
 
+    def asset_ref(self, field_name: str) -> AssetRef:
+        """Parse one manifest reference at the strict control-plane boundary.
+
+        The returned value records whether the reference is a content digest
+        or a logical registry URI.  Keeping this operation explicit preserves
+        compatibility with older bare demo identifiers while making it hard
+        for a production registry to accidentally accept ``sha256:short``.
+        """
+
+        aliases = {
+            "modelPolicy": "model_policy",
+            "toolManifest": "tool_manifest",
+            "governancePolicy": "governance_policy",
+            "knowledgeSnapshot": "knowledge_snapshot",
+            "storageProfile": "storage_profile",
+        }
+        field_name = aliases.get(field_name, field_name)
+        if field_name not in {
+            "graph",
+            "prompt",
+            "model_policy",
+            "tool_manifest",
+            "governance_policy",
+            "knowledge_snapshot",
+            "storage_profile",
+        }:
+            raise ValueError(f"unknown capsule asset field: {field_name}")
+        value = getattr(self, field_name)
+        if value is None:
+            raise ValueError(f"{field_name} is not configured")
+        return AssetRef.parse(value)
+
+    def validate_asset_refs(self) -> tuple[AssetRef, ...]:
+        """Strictly validate all configured references and return their kinds."""
+
+        fields = (
+            "graph",
+            "prompt",
+            "model_policy",
+            "tool_manifest",
+            "governance_policy",
+            "storage_profile",
+        )
+        refs = tuple(self.asset_ref(field_name) for field_name in fields)
+        if self.knowledge_snapshot is not None:
+            refs += (self.asset_ref("knowledge_snapshot"),)
+        return refs
+
 
 class CapsuleSignature(_ImmutableModel):
     """An Ed25519 signature over the canonical unsigned manifest."""
@@ -200,6 +298,11 @@ class AgentCapsule(_ImmutableModel):
     digest: str | None = None
     signature: CapsuleSignature | None = None
 
+    SIGNING_SEMANTICS: ClassVar[str] = (
+        "Ed25519 signs canonical UTF-8 JSON of apiVersion/kind/metadata/spec; "
+        "digest and signature envelope fields are excluded"
+    )
+
     @field_validator("api_version")
     @classmethod
     def validate_api_version(cls, value: str) -> str:
@@ -222,6 +325,11 @@ class AgentCapsule(_ImmutableModel):
             exclude_none=False,
         )
 
+    def signing_payload(self) -> dict[str, Any]:
+        """Return the exact envelope-independent payload being signed."""
+
+        return self._unsigned_payload()
+
     def canonical_bytes(self) -> bytes:
         """Serialize the unsigned manifest using a stable UTF-8 JSON form."""
 
@@ -232,6 +340,11 @@ class AgentCapsule(_ImmutableModel):
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+
+    def signing_bytes(self) -> bytes:
+        """Return the golden-vector input for digest and Ed25519 signing."""
+
+        return self.canonical_bytes()
 
     def compute_digest(self) -> str:
         """Compute the content address of this manifest."""
@@ -261,7 +374,7 @@ class AgentCapsule(_ImmutableModel):
         digest = self.compute_digest()
         signature = CapsuleSignature(
             key_id=key_id,
-            value=_encode_base64url(signer.sign(self.canonical_bytes())),
+            value=_encode_base64url(signer.sign(self.signing_bytes())),
         )
         return self.model_copy(update={"digest": digest, "signature": signature})
 
@@ -284,7 +397,7 @@ class AgentCapsule(_ImmutableModel):
             public_key = _public_key(trusted_keys[self.signature.key_id])
             public_key.verify(
                 _decode_base64url(self.signature.value),
-                self.canonical_bytes(),
+                self.signing_bytes(),
             )
         except CapsuleVerificationError:
             # Preserve actionable trust-map/key-shape errors raised by the
@@ -361,6 +474,7 @@ Capsule = AgentCapsule
 
 __all__ = [
     "AgentCapsule",
+    "AssetRef",
     "Capsule",
     "CapsuleDigestMismatch",
     "CapsuleManifest",

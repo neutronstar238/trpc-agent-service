@@ -86,20 +86,22 @@ def test_performance_overlay_locks_four_workers_at_fifty_turns_each() -> None:
 
 def test_performance_overlay_pins_runtime_roles_to_workload_node() -> None:
     patches = _documents("performance-workload-patch.yaml")
-    expected = {
+    expected_roles = {
         "trpc-gateway": "gateway",
         "trpc-worker": "worker",
         "trpc-outbox-dispatcher": "outbox-dispatcher",
         "trpc-session-recovery": "session-recovery",
     }
-    assert {
-        item["metadata"]["name"]: item["spec"]["template"]["spec"] for item in patches
-    }.keys() == expected.keys()
-    for name, container_name in expected.items():
-        spec = next(
-            item["spec"]["template"]["spec"] for item in patches if item["metadata"]["name"] == name
-        )
+    by_name = {item["metadata"]["name"]: item["spec"]["template"]["spec"] for item in patches}
+    assert set(by_name) == {
+        *expected_roles,
+        "trpc-backlog-exporter",
+        "trpc-schema-migration",
+    }
+    for spec in by_name.values():
         assert spec["nodeSelector"] == {"trpc-role": "workload"}
+    for name, container_name in expected_roles.items():
+        spec = by_name[name]
         assert spec["containers"][0]["name"] == container_name
         assert all(entry["value"] for entry in spec["containers"][0]["env"])
 

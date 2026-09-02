@@ -25,8 +25,8 @@ Required environment for a live run:
   dedicated, namespace-scoped kubeconfig that is distinct from the gate's
   administrative kubeconfig)
 * ``TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT`` (the dedicated service-account
-   username; the gate creates a temporary RoleBinding only in its random
-   acceptance namespace)
+   username; its namespace is the isolated Job namespace where the gate
+   creates and later removes nonce-scoped Role/RoleBinding/NetworkPolicy)
 * ``TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT`` (the explicit context used by the
   dedicated driver kubeconfig; it must not be inferred from the gate context)
 * ``TRPC_K8S_RUNTIME_HPA_JOB_COMMAND`` (a JSON argument array implemented by
@@ -73,6 +73,7 @@ import yaml
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from runs.multitenant.project_kubernetes_secrets import project_secrets
 from scripts.deployment_preflight import build_preflight
 from scripts.evidence_lineage import build_evidence, runtime_fingerprint
 from scripts.report_io import atomic_write_json
@@ -121,8 +122,58 @@ HPA_DRIVER_OWNER_VALUE = "bounded-job-driver"
 HPA_DRIVER_RUN_LABEL = "trpc.io/hpa-run"
 HPA_DRIVER_PHASE_LABEL = "trpc.io/hpa-phase"
 HPA_DRIVER_CLUSTER_LABEL = "trpc.io/hpa-cluster"
+HPA_DRIVER_NODE_NAME_ENV = "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_NODE_NAME"
+HPA_DRIVER_NODE_LABEL_ENV = "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_NODE_LABEL"
+HPA_DRIVER_TAINT_KEY_ENV = "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_KEY"
+HPA_DRIVER_TAINT_VALUE_ENV = "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_VALUE"
+HPA_DRIVER_TAINT_EFFECT_ENV = "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_EFFECT"
 SCHEMA_HEAD_CHECK_JOB_NAME = "trpc-schema-head-check"
 _HPA_DRIVER_ROLE_NAME = "trpc-hpa-load-driver"
+_HPA_DRIVER_NETWORK_POLICY_NAME = "trpc-hpa-load-driver-egress"
+_HPA_CLEANUP_TABLES = (
+    "cell_effect_receipts",
+    "cell_effect_ledger",
+    "cell_tool_intents",
+    "cell_branch_heads",
+    "cell_placement_reservations",
+    "cell_approval_nonces",
+    "cell_events",
+    "agent_cells",
+    "agent_capsules",
+    "session_mailbox_items",
+    "delivery_attempts",
+    "outbox_events",
+    "turn_intents",
+    "session_events",
+    "session_summaries",
+    "tool_executions",
+    "session_turns",
+    "inbound_messages",
+    "outbound_messages",
+    "memories",
+    "artifacts",
+    "knowledge_embeddings",
+    "knowledge_items",
+    "dead_letters",
+    "confirmation_challenges",
+    "audit_logs",
+    "tenant_budget_usage",
+    "fault_stage_controls",
+    "migration_write_barriers",
+    "migration_leases",
+    "migration_checkpoints",
+    "admin_idempotency",
+    "channel_identities",
+    "channel_bindings",
+    "config_revisions",
+    "storage_profiles",
+    "tenant_policies",
+    "session_mailboxes",
+    "sessions",
+    "agent_apps",
+    "migration_scope_manifests",
+    "tenants",
+)
 _HPA_DRIVER_IDENTITY_RULES = frozenset(
     {
         ("authorization.k8s.io", "selfsubjectaccessreviews", "create"),
@@ -154,6 +205,20 @@ RUNTIME_NAMESPACE_OWNER_VALUE = "trpc-kubernetes-runtime-gate"
 RUNTIME_NAMESPACE_RUN_LABEL = "trpc.io/run-nonce"
 RUNTIME_NAMESPACE_EXPIRY_LABEL = "trpc.io/expires-at"
 RUNTIME_NAMESPACE_CLUSTER_LABEL = "trpc.io/cluster-fingerprint"
+HPA_DRIVER_NAMESPACE_OWNER_LABEL = RUNTIME_NAMESPACE_OWNER_LABEL
+HPA_DRIVER_NAMESPACE_OWNER_VALUE = RUNTIME_NAMESPACE_OWNER_VALUE
+HPA_DRIVER_DATABASE_SECRET_NAME = "trpc-hpa-secrets"  # noqa: S105 - Kubernetes Secret name, not a credential
+_HPA_DRIVER_NAMESPACE_WORKLOAD_RESOURCES = (
+    "deployments",
+    "statefulsets",
+    "daemonsets",
+    "replicasets",
+    "cronjobs",
+    "jobs",
+    "replicationcontrollers",
+    "pods",
+)
+_HPA_DRIVER_NAMESPACE_DEFAULT_SERVICE_ACCOUNT = "default"
 RUNTIME_NAMESPACE_MAX_CLEANUP = 10
 RUNTIME_NAMESPACE_TTL_SECONDS = 6 * 60 * 60
 
@@ -168,6 +233,10 @@ DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-channel-dispatcher", "channel-dispatcher"),
     ("trpc-post-turn-projector", "post-turn-projector"),
     ("trpc-wecom-connector", "wecom-connector"),
+)
+_RUNTIME_GATE_POD_NAMES = frozenset(
+    {name for name, _container in DEPLOYMENTS}
+    | {"trpc-schema-migration", SCHEMA_HEAD_CHECK_JOB_NAME}
 )
 _PDB_PROTECTED_DEPLOYMENTS = frozenset(
     {
@@ -184,12 +253,14 @@ _EXPECTED_SCHEDULER_VERSION = "v2"
 _EXPECTED_REDIS_STREAM = "trpc:session-ready:v2"
 _EXPECTED_REDIS_GROUP = "trpc-session-ready-v2"
 _HPA_BACKLOG_METRIC = "trpc_session_ready_backlog"
+_HPA_DRIVER_API_OBSERVATION_TIMEOUT_SECONDS = 60.0
 _EXTERNAL_METRICS_API_VERSION = "v1beta1"
 _MIN_PRODUCTION_TURN_CAPACITY = 200
 _WORKER_EVICTION_REPLICAS = 4
-_NODE_DRAIN_CONFIRMATION = "I_UNDERSTAND_ISOLATED_NODE_DRAIN"
-_NODE_LABEL_KEY = "trpc-runtime-gate"
-_DNS_1123_LABEL = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+_NODE_DRAIN_CONFIRMATION = "I_UNDERSTAND_HARD_NODE_FAILURE_PDB_BYPASS"
+_NODE_LABEL_KEY = "trpc-cell-fabric-owner"
+_NODE_LABEL_VALUE = "innovation"
+_DNS_1123_LABEL = r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
 _DNS_1123_SUBDOMAIN_RE = re.compile(rf"{_DNS_1123_LABEL}(?:\.{_DNS_1123_LABEL})*")
 
 _REQUIRED_RUNTIME_CHECKS = (
@@ -209,9 +280,11 @@ _REQUIRED_RUNTIME_CHECKS = (
     "scheduler_cutover_guard",
     "rolling_upgrade",
     "worker_scale_and_hpa",
+    "hpa_driver_namespace_preflight",
     "hpa_driver_rbac_bind",
     "hpa_driver_trust",
     "hpa_load_observation",
+    "hpa_driver_rbac_cleanup",
     "pdb_eviction",
     "node_eviction",
     "graceful_termination",
@@ -227,6 +300,7 @@ _REQUIRED_RUNTIME_ACTIONS = (
     "rolling_upgrade",
     "hpa_observed",
     "hpa_load_observed",
+    "hpa_driver_cleanup",
     "pod_eviction",
     "node_eviction",
     "graceful_termination",
@@ -267,6 +341,60 @@ def _result_payload(result: CommandResult) -> dict[str, Any]:
         # identifiers/booleans.  Never copy driver stdout into a report.
         payload["evidence"] = result.evidence
     return payload
+
+
+def _project_secret_yaml(
+    manifest_path: str,
+    *,
+    namespace: str,
+    profile: str,
+    image_pull_secret: str,
+) -> str:
+    """Render one allowlisted Secret profile without exposing its values."""
+
+    documents = project_secrets(
+        Path(manifest_path),
+        namespace,
+        profile,
+        image_pull_secret=image_pull_secret or None,
+    )
+    return cast(str, yaml.safe_dump_all(documents, sort_keys=False))
+
+
+def _apply_secret_profiles(
+    profiles: Sequence[tuple[str, str, str]],
+    *,
+    context: str | None,
+    timeout_seconds: float,
+    dry_run: bool,
+) -> CommandResult:
+    """Server-side validate or apply already projected Secret profiles."""
+
+    observed: list[dict[str, str]] = []
+    for profile, namespace, manifest in profiles:
+        arguments = ["apply", "--server-side"]
+        if dry_run:
+            arguments.append("--dry-run=server")
+        arguments.extend(["--namespace", namespace, "-f", "-"])
+        result = _kubectl(
+            arguments,
+            context=context,
+            timeout_seconds=timeout_seconds,
+            input_text=manifest,
+        )
+        if result.status != "pass":
+            return CommandResult(
+                status=result.status,
+                exit_code=result.exit_code,
+                reason=f"{profile} Secret profile {'dry-run' if dry_run else 'apply'} failed",
+                stderr="present" if result.stderr else "",
+                evidence={"values_recorded": False, "completed_profiles": observed},
+            )
+        observed.append({"profile": profile, "namespace": namespace})
+    return CommandResult(
+        status="pass",
+        evidence={"values_recorded": False, "completed_profiles": observed},
+    )
 
 
 def _validate_timeout_seconds(value: object) -> float:
@@ -320,6 +448,18 @@ def _valid_image_pull_secret_name(value: str) -> bool:
     """Return whether *value* is a bounded Kubernetes DNS subdomain name."""
 
     return len(value) <= 253 and _DNS_1123_SUBDOMAIN_RE.fullmatch(value) is not None
+
+
+def _valid_namespace_name(value: str) -> bool:
+    """Return whether *value* is a Kubernetes namespace DNS label."""
+
+    return len(value) <= 63 and re.fullmatch(_DNS_1123_LABEL, value) is not None
+
+
+def _valid_node_name(value: str) -> bool:
+    """Return whether *value* is a bounded Kubernetes node name."""
+
+    return bool(value) and len(value) <= 253 and _DNS_1123_SUBDOMAIN_RE.fullmatch(value) is not None
 
 
 def _image_pull_secret_metadata_contract(
@@ -1276,6 +1416,10 @@ def _hpa_load_observation_contract(
         elif cluster_fingerprint is not None and fingerprint != cluster_fingerprint:
             reasons.append("HPA load observation belongs to a different cluster")
 
+    # A production HPA run is bound to the dedicated load-driver node.  That
+    # placement is also the marker that the run owns the external metric
+    # namespace exclusively; local-kind fixtures intentionally omit it.
+    expected_driver_node = os.getenv(HPA_DRIVER_NODE_NAME_ENV, "").strip()
     driver_evidence = evidence.get("driver_evidence")
     if not isinstance(driver_evidence, Mapping):
         reasons.append("HPA load observation lacks bounded Job API evidence")
@@ -1292,6 +1436,15 @@ def _hpa_load_observation_contract(
                 reasons.append(f"HPA {phase} driver Job was not API observed")
             if value.get("namespace") != evidence.get("namespace"):
                 reasons.append(f"HPA {phase} driver Job namespace is not bound")
+            if value.get("target_namespace") != evidence.get("namespace"):
+                reasons.append(f"HPA {phase} driver target namespace is not bound")
+            job_namespace = value.get("job_namespace")
+            if (
+                not isinstance(job_namespace, str)
+                or not _valid_namespace_name(job_namespace)
+                or job_namespace == evidence.get("namespace")
+            ):
+                reasons.append(f"HPA {phase} driver execution namespace is not isolated")
             if value.get("run_nonce") != evidence.get("run_nonce"):
                 reasons.append(f"HPA {phase} driver Job nonce is not bound")
             if value.get("cluster_fingerprint") != (
@@ -1319,6 +1472,19 @@ def _hpa_load_observation_contract(
                 or labels.get(HPA_DRIVER_PHASE_LABEL) != "load"
             ):
                 reasons.append(f"HPA {phase} driver Job labels are not nonce bound")
+            if expected_driver_node:
+                placement = value.get("placement")
+                if not isinstance(placement, Mapping):
+                    reasons.append(f"HPA {phase} driver Job Pod placement evidence is missing")
+                else:
+                    if placement.get("expected_node_name") != expected_driver_node:
+                        reasons.append(f"HPA {phase} driver expected node is not bound")
+                    if placement.get("pod_node_name") != expected_driver_node:
+                        reasons.append(f"HPA {phase} driver Pod ran on an unexpected node")
+                    if not isinstance(placement.get("pod_name"), str) or not placement.get(
+                        "pod_name"
+                    ):
+                        reasons.append(f"HPA {phase} driver Pod name evidence is missing")
             return value
 
         load_checked = check_job(load_evidence, phase="load")
@@ -1326,8 +1492,43 @@ def _hpa_load_observation_contract(
         if isinstance(load_checked, Mapping) and isinstance(clear_checked, Mapping):
             if load_checked.get("job_uid") != clear_checked.get("job_uid"):
                 reasons.append("HPA load and clear evidence refer to different Job UIDs")
+            if load_checked.get("job_namespace") != clear_checked.get("job_namespace"):
+                reasons.append("HPA load and clear used different execution namespaces")
         if isinstance(clear_checked, Mapping) and clear_checked.get("job_deleted") is not True:
             reasons.append("HPA clear driver did not API-confirm Job deletion")
+        if expected_driver_node:
+            # Cleanup is emitted on the clear Job evidence because the
+            # bounded probe is terminated as part of that phase.  Accept a
+            # legacy top-level copy as well so old local evidence remains
+            # diagnosable, but production output is checked on clear itself.
+            cleanup = (
+                clear_checked.get("cleanup")
+                if isinstance(clear_checked, Mapping)
+                else driver_evidence.get("cleanup")
+            )
+            if not isinstance(cleanup, Mapping):
+                cleanup = driver_evidence.get("cleanup")
+            if not isinstance(cleanup, Mapping):
+                reasons.append("HPA probe cleanup proof is missing")
+            else:
+                receipt = cleanup.get("receipt")
+                residual = receipt.get("residual") if isinstance(receipt, Mapping) else None
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("status") != "pass"
+                    or receipt.get("phase") != "clear"
+                    or receipt.get("run_nonce") != evidence.get("run_nonce")
+                    or not isinstance(residual, Mapping)
+                    or set(residual) != set(_HPA_CLEANUP_TABLES)
+                    or any(residual.get(name) != 0 for name in _HPA_CLEANUP_TABLES)
+                    or cleanup.get("api_observed") is not True
+                    or cleanup.get("job_deleted") is not True
+                    or cleanup.get("job_name")
+                    != _hpa_cleanup_job_name(str(evidence.get("run_nonce", "")))
+                    or not isinstance(cleanup.get("job_uid"), str)
+                    or not cleanup.get("job_uid")
+                ):
+                    reasons.append("HPA probe cleanup proof did not confirm zero residual rows")
 
     observations: dict[str, Mapping[str, Any]] = {}
     for phase in ("before", "during", "after"):
@@ -1406,6 +1607,22 @@ def _hpa_load_observation_contract(
         )
     ):
         reasons.append("controlled backlog did not increase the observed HPA metric")
+    if expected_driver_node:
+        # The runtime overlay owns this metric for the duration of the gate.
+        # A non-zero baseline or residual after value could come from another
+        # run/tenant and would make the scale transition non-attributable.
+        if before_metric is not None and before_metric != 0:
+            reasons.append("production HPA baseline backlog must be zero")
+        if (
+            before_metric is not None
+            and during_metric is not None
+            and during_metric <= before_metric
+        ):
+            reasons.append("production HPA backlog must increase strictly under load")
+        if after_metric is not None and after_metric != 0:
+            reasons.append("production HPA backlog must return to zero after cleanup")
+        if before_metric is not None and after_metric is not None and after_metric != before_metric:
+            reasons.append("production HPA after backlog must equal the zero baseline")
     if not replicas_increased:
         reasons.append("HPA desired replicas did not increase under controlled load")
     if (
@@ -1495,12 +1712,23 @@ def _write_overlay(
     image: str,
     local_kind: bool = False,
     node_label: tuple[str, str] | None = None,
+    node_name: str | None = None,
+    support_namespace: str | None = None,
     run_nonce: str | None = None,
     cluster_fingerprint: str | None = None,
     expires_at: str | None = None,
     image_pull_secret: str | None = None,
 ) -> Path:
     image_transform = _image_transform(image)
+    if (run_nonce is None) != (cluster_fingerprint is None):
+        raise ValueError("runtime ownership labels require both run nonce and cluster fingerprint")
+    if run_nonce is not None and re.fullmatch(r"[0-9a-f]{32}", run_nonce) is None:
+        raise ValueError("runtime ownership run nonce is invalid")
+    if (
+        cluster_fingerprint is not None
+        and re.fullmatch(r"[0-9a-f]{64}", cluster_fingerprint) is None
+    ):
+        raise ValueError("runtime ownership cluster fingerprint is invalid")
 
     def resource_path(resource: Path) -> str:
         try:
@@ -1584,13 +1812,35 @@ def _write_overlay(
         f"  - path: {relative_replica_patch}",
         f"  - path: {relative_config_patch}",
     ]
+    if node_label is None and node_name is not None:
+        raise ValueError("controlled node label is required with a controlled node name")
     if node_label is not None:
+        if node_name is None:
+            raise ValueError("controlled node name is required with a controlled node label")
+        if (
+            len(node_label) != 2
+            or node_label[0] != _NODE_LABEL_KEY
+            or node_label[1] != _NODE_LABEL_VALUE
+            or not node_label[1]
+            or any(character.isspace() for character in node_label[1])
+            or not _valid_node_name(node_name)
+        ):
+            raise ValueError("controlled node label or name is invalid")
         node_label_patch = directory / "controlled-node-patch.yaml"
         node_label_patch.write_text(
-            "- op: add\n"
-            "  path: /spec/template/spec/nodeSelector\n"
-            "  value:\n"
-            f"    {node_label[0]}: {json.dumps(node_label[1])}\n",
+            yaml.safe_dump(
+                [
+                    {
+                        "op": "add",
+                        "path": "/spec/template/spec/nodeSelector",
+                        "value": {
+                            node_label[0]: node_label[1],
+                            "kubernetes.io/hostname": node_name,
+                        },
+                    }
+                ],
+                sort_keys=False,
+            ),
             encoding="utf-8",
         )
         lines.extend(
@@ -1598,6 +1848,121 @@ def _write_overlay(
                 "  - target:",
                 "      kind: Deployment",
                 "    path: controlled-node-patch.yaml",
+                "  - target:",
+                "      kind: Job",
+                "      name: trpc-schema-migration",
+                "    path: controlled-node-patch.yaml",
+            ]
+        )
+    if support_namespace is not None:
+        if not _valid_namespace_name(support_namespace):
+            raise ValueError("support namespace is invalid")
+        support_namespace_patch = directory / "support-namespace-patch.yaml"
+        support_namespace_patch.write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "op": "replace",
+                        "path": (
+                            "/spec/ingress/0/from/1/namespaceSelector/"
+                            "matchLabels/kubernetes.io~1metadata.name"
+                        ),
+                        "value": support_namespace,
+                    },
+                    {
+                        "op": "replace",
+                        "path": (
+                            "/spec/egress/0/to/1/namespaceSelector/"
+                            "matchLabels/kubernetes.io~1metadata.name"
+                        ),
+                        "value": support_namespace,
+                    },
+                ],
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        lines.extend(
+            [
+                "  - target:",
+                "      kind: NetworkPolicy",
+                "      name: trpc-allow-backlog-exporter",
+                "    path: support-namespace-patch.yaml",
+            ]
+        )
+    if run_nonce is not None and cluster_fingerprint is not None:
+        runtime_labels = {
+            RUNTIME_NAMESPACE_OWNER_LABEL: RUNTIME_NAMESPACE_OWNER_VALUE,
+            RUNTIME_NAMESPACE_RUN_LABEL: run_nonce,
+            RUNTIME_NAMESPACE_CLUSTER_LABEL: cluster_fingerprint[:63],
+        }
+        runtime_labels_patch = directory / "runtime-ownership-patch.yaml"
+        runtime_labels_patch.write_text(
+            yaml.safe_dump_all(
+                [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Service",
+                        "metadata": {
+                            "name": "trpc-backlog-exporter",
+                            "labels": runtime_labels,
+                        },
+                    },
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "trpc-backlog-exporter",
+                            "labels": runtime_labels,
+                        },
+                        "spec": {
+                            "template": {
+                                "metadata": {"labels": runtime_labels},
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "backlog-exporter",
+                                            "env": [
+                                                {
+                                                    "name": "TRPC_BACKLOG_TENANT_ID",
+                                                    "value": f"hpa-{run_nonce}",
+                                                }
+                                            ],
+                                        }
+                                    ]
+                                },
+                            }
+                        },
+                    },
+                ],
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        lines.extend(["  - path: runtime-ownership-patch.yaml"])
+        pod_ownership_patch = directory / "runtime-pod-ownership-patch.yaml"
+        pod_ownership_patch.write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "op": "add",
+                        "path": f"/spec/template/metadata/labels/{key.replace('/', '~1')}",
+                        "value": value,
+                    }
+                    for key, value in runtime_labels.items()
+                ],
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        lines.extend(
+            [
+                "  - target:",
+                "      kind: Deployment",
+                "    path: runtime-pod-ownership-patch.yaml",
+                "  - target:",
+                "      kind: Job",
+                "    path: runtime-pod-ownership-patch.yaml",
             ]
         )
     if image_pull_secret:
@@ -1736,7 +2101,12 @@ def _runtime_object_store_override(
 
 
 def _rendered_manifest_contract(
-    rendered: str, *, local_kind: bool = False
+    rendered: str,
+    *,
+    local_kind: bool = False,
+    required_node_selector: Mapping[str, str] | None = None,
+    required_runtime_labels: Mapping[str, str] | None = None,
+    support_namespace: str | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
     """Validate safety-critical resources before any live apply.
 
@@ -1759,6 +2129,140 @@ def _rendered_manifest_contract(
         metadata = document.get("metadata")
         if isinstance(metadata, Mapping):
             resources[(str(document.get("kind", "")), str(metadata.get("name", "")))] = document
+
+    if required_node_selector is not None:
+        expected_node_selector = dict(required_node_selector)
+        for deployment_name, _container_name in DEPLOYMENTS:
+            deployment = resources.get(("Deployment", deployment_name))
+            spec = deployment.get("spec") if isinstance(deployment, Mapping) else None
+            template = spec.get("template") if isinstance(spec, Mapping) else None
+            pod_spec = template.get("spec") if isinstance(template, Mapping) else None
+            node_selector = pod_spec.get("nodeSelector") if isinstance(pod_spec, Mapping) else None
+            if not isinstance(node_selector, Mapping) or any(
+                node_selector.get(key) != value for key, value in expected_node_selector.items()
+            ):
+                reasons.append(
+                    f"{deployment_name} is not pinned to the controlled runtime node selector"
+                )
+
+        migration = resources.get(("Job", "trpc-schema-migration"))
+        migration_spec = migration.get("spec") if isinstance(migration, Mapping) else None
+        migration_template = (
+            migration_spec.get("template") if isinstance(migration_spec, Mapping) else None
+        )
+        migration_pod_spec = (
+            migration_template.get("spec") if isinstance(migration_template, Mapping) else None
+        )
+        migration_selector = (
+            migration_pod_spec.get("nodeSelector")
+            if isinstance(migration_pod_spec, Mapping)
+            else None
+        )
+        if not isinstance(migration_selector, Mapping) or any(
+            migration_selector.get(key) != value for key, value in expected_node_selector.items()
+        ):
+            reasons.append("schema migration Job is not pinned to the controlled runtime node")
+
+    if required_runtime_labels is not None:
+        expected_runtime_labels = dict(required_runtime_labels)
+        for workload_kind, workload_name in (
+            *(("Deployment", name) for name, _container in DEPLOYMENTS),
+            ("Job", "trpc-schema-migration"),
+        ):
+            workload = resources.get((workload_kind, workload_name))
+            workload_spec = workload.get("spec") if isinstance(workload, Mapping) else None
+            workload_template = (
+                workload_spec.get("template") if isinstance(workload_spec, Mapping) else None
+            )
+            workload_metadata = (
+                workload_template.get("metadata")
+                if isinstance(workload_template, Mapping)
+                else None
+            )
+            workload_labels = (
+                workload_metadata.get("labels") if isinstance(workload_metadata, Mapping) else None
+            )
+            if not isinstance(workload_labels, Mapping) or any(
+                workload_labels.get(key) != value for key, value in expected_runtime_labels.items()
+            ):
+                reasons.append(
+                    f"{workload_kind} {workload_name} Pod template is missing "
+                    "runtime ownership labels"
+                )
+        service = resources.get(("Service", "trpc-backlog-exporter"))
+        service_metadata = service.get("metadata") if isinstance(service, Mapping) else None
+        service_labels = (
+            service_metadata.get("labels") if isinstance(service_metadata, Mapping) else None
+        )
+        deployment = resources.get(("Deployment", "trpc-backlog-exporter"))
+        deployment_metadata = (
+            deployment.get("metadata") if isinstance(deployment, Mapping) else None
+        )
+        deployment_labels = (
+            deployment_metadata.get("labels") if isinstance(deployment_metadata, Mapping) else None
+        )
+        deployment_spec = deployment.get("spec") if isinstance(deployment, Mapping) else None
+        template = deployment_spec.get("template") if isinstance(deployment_spec, Mapping) else None
+        template_metadata = template.get("metadata") if isinstance(template, Mapping) else None
+        template_labels = (
+            template_metadata.get("labels") if isinstance(template_metadata, Mapping) else None
+        )
+        for location, labels in (
+            ("Service", service_labels),
+            ("Deployment", deployment_labels),
+            ("backlog exporter Pod template", template_labels),
+        ):
+            if not isinstance(labels, Mapping) or any(
+                labels.get(key) != value for key, value in expected_runtime_labels.items()
+            ):
+                reasons.append(f"backlog exporter {location} is missing runtime ownership labels")
+
+    if support_namespace is not None:
+        policy = resources.get(("NetworkPolicy", "trpc-allow-backlog-exporter"))
+        policy_spec = policy.get("spec") if isinstance(policy, Mapping) else None
+        ingress = policy_spec.get("ingress") if isinstance(policy_spec, Mapping) else None
+        egress = policy_spec.get("egress") if isinstance(policy_spec, Mapping) else None
+        ingress_namespace = None
+        egress_namespace = None
+        if isinstance(ingress, list) and len(ingress) > 0:
+            ingress_from = ingress[0].get("from") if isinstance(ingress[0], Mapping) else None
+            if isinstance(ingress_from, list) and len(ingress_from) > 1:
+                namespace_selector = (
+                    ingress_from[1].get("namespaceSelector")
+                    if isinstance(ingress_from[1], Mapping)
+                    else None
+                )
+                labels = (
+                    namespace_selector.get("matchLabels")
+                    if isinstance(namespace_selector, Mapping)
+                    else None
+                )
+                if isinstance(labels, Mapping):
+                    ingress_namespace = labels.get("kubernetes.io/metadata.name")
+        if isinstance(egress, list) and len(egress) > 0:
+            egress_to = egress[0].get("to") if isinstance(egress[0], Mapping) else None
+            if isinstance(egress_to, list) and len(egress_to) > 1:
+                namespace_selector = (
+                    egress_to[1].get("namespaceSelector")
+                    if isinstance(egress_to[1], Mapping)
+                    else None
+                )
+                labels = (
+                    namespace_selector.get("matchLabels")
+                    if isinstance(namespace_selector, Mapping)
+                    else None
+                )
+                if isinstance(labels, Mapping):
+                    egress_namespace = labels.get("kubernetes.io/metadata.name")
+        if ingress_namespace != support_namespace:
+            reasons.append(
+                "backlog exporter NetworkPolicy Prometheus ingress is not bound "
+                "to the support namespace"
+            )
+        if egress_namespace != support_namespace:
+            reasons.append(
+                "backlog exporter NetworkPolicy egress is not bound to the support namespace"
+            )
 
     config = resources.get(("ConfigMap", "trpc-service-config"))
     config_data = config.get("data") if isinstance(config, Mapping) else None
@@ -1933,6 +2437,18 @@ def _rendered_manifest_contract(
                     reasons.append(
                         "trpc-backlog-exporter namespace is not sourced from metadata.namespace"
                     )
+                if required_runtime_labels is not None:
+                    expected_tenant_id = "hpa-" + str(
+                        required_runtime_labels.get(RUNTIME_NAMESPACE_RUN_LABEL, "")
+                    )
+                    tenant_scope = env_by_name.get("TRPC_BACKLOG_TENANT_ID")
+                    if (
+                        not isinstance(tenant_scope, Mapping)
+                        or tenant_scope.get("value") != expected_tenant_id
+                    ):
+                        reasons.append(
+                            "trpc-backlog-exporter is not bound to this runtime tenant backlog"
+                        )
                 ports = container.get("ports")
                 if not isinstance(ports, list) or not any(
                     isinstance(port, Mapping)
@@ -2227,6 +2743,10 @@ def _report(
                 "confirmation": _NODE_DRAIN_CONFIRMATION,
                 "label_key": _NODE_LABEL_KEY,
                 "scope": "dedicated-node-only",
+                "mode": "hard-node-failure",
+                "disable_eviction": True,
+                "pdb_bypass": True,
+                "pdb_preflight_required": True,
                 "must_uncordon_after_test": True,
             },
             "hpa_load_policy": {
@@ -2459,6 +2979,37 @@ def _runtime_attestation_contract(
         reasons.append("runtime_attestation node eviction status is invalid")
     if require_node_eviction and node_eviction_status != "pass":
         reasons.append("runtime_attestation node eviction status is not pass")
+    if require_node_eviction and node_eviction_status == "pass":
+        node_drain_policy = attestation.get("node_drain_policy")
+        if not isinstance(node_drain_policy, Mapping):
+            reasons.append("runtime_attestation node drain policy is missing")
+        else:
+            if node_drain_policy.get("mode") != "hard-node-failure":
+                reasons.append("runtime_attestation node drain mode is not hard-node-failure")
+            if node_drain_policy.get("disable_eviction") is not True:
+                reasons.append("runtime_attestation node drain did not record PDB bypass")
+            if node_drain_policy.get("pdb_bypass") is not True:
+                reasons.append("runtime_attestation node drain did not mark PDB bypass")
+            if node_drain_policy.get("pdb_preflight_required") is not True:
+                reasons.append("runtime_attestation node drain omitted the PDB preflight")
+        node_eviction_check = checks.get("node_eviction")
+        drain_evidence = (
+            node_eviction_check.get("drain") if isinstance(node_eviction_check, Mapping) else None
+        )
+        post_drain_inventory = (
+            drain_evidence.get("post_drain_inventory")
+            if isinstance(drain_evidence, Mapping)
+            else None
+        )
+        if not isinstance(post_drain_inventory, Mapping):
+            reasons.append("runtime_attestation post-drain inventory is missing")
+        else:
+            if post_drain_inventory.get("status") != "pass":
+                reasons.append("runtime_attestation post-drain inventory is not pass")
+            if post_drain_inventory.get("blocking_pod_count") != 0:
+                reasons.append("runtime_attestation post-drain inventory has blocking pods")
+            if post_drain_inventory.get("gate_namespace_pod_count") != 0:
+                reasons.append("runtime_attestation post-drain inventory retained gate pods")
     image_ids = attestation.get("image_ids")
     expected_deployments = {name for name, _container in DEPLOYMENTS}
     validated_image_ids: dict[str, dict[str, str]] = {}
@@ -2640,6 +3191,10 @@ def _hpa_job_name(run_nonce: str) -> str:
     return f"trpc-hpa-load-{run_nonce[:20]}"
 
 
+def _hpa_cleanup_job_name(run_nonce: str) -> str:
+    return f"trpc-hpa-cleanup-{run_nonce[:20]}"
+
+
 def _strict_json_object(value: str, *, description: str) -> dict[str, Any] | None:
     del description
 
@@ -2703,8 +3258,7 @@ def _hpa_driver_identity(
 def _parse_hpa_driver_subject(value: str) -> tuple[str, str] | None:
     match = re.fullmatch(
         r"system:serviceaccount:"
-        r"([a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?):"
-        r"([a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?)",
+        rf"({_DNS_1123_LABEL}):({_DNS_1123_LABEL})",
         value,
     )
     return (match.group(1), match.group(2)) if match else None
@@ -2716,56 +3270,438 @@ def _bind_hpa_driver_rbac(
     namespace: str,
     context: str | None,
     timeout_seconds: float,
+    support_namespace: str | None = None,
+    role_name: str = _HPA_DRIVER_ROLE_NAME,
 ) -> CommandResult:
     parsed = _parse_hpa_driver_subject(subject)
     if parsed is None:
         return CommandResult(status="not_run", reason="HPA driver subject is invalid")
+    if not _valid_namespace_name(role_name):
+        return CommandResult(status="not_run", reason="HPA driver Role name is invalid")
     subject_namespace, subject_name = parsed
-    manifest = yaml.safe_dump_all(
-        [
-            {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
-                "kind": "Role",
-                "metadata": {"name": _HPA_DRIVER_ROLE_NAME, "namespace": namespace},
-                "rules": [
-                    {
-                        "apiGroups": ["batch"],
-                        "resources": ["jobs"],
-                        "verbs": ["create", "get", "delete"],
-                    },
-                    {
-                        "apiGroups": [""],
-                        "resources": ["pods", "pods/log"],
-                        "verbs": ["get"],
-                    },
-                ],
-            },
-            {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
-                "kind": "RoleBinding",
-                "metadata": {"name": "trpc-hpa-load-driver", "namespace": namespace},
-                "roleRef": {
-                    "apiGroup": "rbac.authorization.k8s.io",
-                    "kind": "Role",
-                    "name": _HPA_DRIVER_ROLE_NAME,
-                },
-                "subjects": [
-                    {
-                        "kind": "ServiceAccount",
-                        "name": subject_name,
-                        "namespace": subject_namespace,
-                    }
-                ],
-            },
-        ],
-        sort_keys=True,
+    if subject_namespace != namespace:
+        return CommandResult(
+            status="not_run",
+            reason="HPA driver subject namespace must match the Job namespace",
+        )
+    network_policy_name = role_name.replace(
+        _HPA_DRIVER_ROLE_NAME, _HPA_DRIVER_NETWORK_POLICY_NAME, 1
     )
+    documents: list[dict[str, Any]] = [
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {
+                "name": role_name,
+                "namespace": namespace,
+                "labels": {HPA_DRIVER_OWNER_LABEL: HPA_DRIVER_OWNER_VALUE},
+            },
+            "rules": [
+                {
+                    "apiGroups": ["batch"],
+                    "resources": ["jobs"],
+                    "verbs": ["create", "get", "delete"],
+                },
+                {
+                    "apiGroups": [""],
+                    "resources": ["pods"],
+                    "verbs": ["get", "list"],
+                },
+                {
+                    "apiGroups": [""],
+                    "resources": ["pods/log"],
+                    "verbs": ["get"],
+                },
+            ],
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {
+                "name": role_name,
+                "namespace": namespace,
+                "labels": {HPA_DRIVER_OWNER_LABEL: HPA_DRIVER_OWNER_VALUE},
+            },
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": role_name,
+            },
+            "subjects": [
+                {
+                    "kind": "ServiceAccount",
+                    "name": subject_name,
+                    "namespace": subject_namespace,
+                }
+            ],
+        },
+    ]
+    if support_namespace is not None:
+        if not _valid_namespace_name(support_namespace):
+            return CommandResult(status="not_run", reason="HPA support namespace is invalid")
+        documents.append(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": network_policy_name,
+                    "namespace": namespace,
+                    "labels": {HPA_DRIVER_OWNER_LABEL: HPA_DRIVER_OWNER_VALUE},
+                },
+                "spec": {
+                    "podSelector": {
+                        "matchLabels": {HPA_DRIVER_OWNER_LABEL: HPA_DRIVER_OWNER_VALUE}
+                    },
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {
+                            "to": [
+                                {
+                                    "namespaceSelector": {
+                                        "matchLabels": {
+                                            "kubernetes.io/metadata.name": support_namespace
+                                        }
+                                    },
+                                    "podSelector": {
+                                        "matchLabels": {"app": "trpc-runtime-postgres"}
+                                    },
+                                }
+                            ],
+                            "ports": [{"protocol": "TCP", "port": 5432}],
+                        },
+                        {
+                            "to": [
+                                {
+                                    "namespaceSelector": {
+                                        "matchLabels": {
+                                            "kubernetes.io/metadata.name": "kube-system"
+                                        }
+                                    }
+                                }
+                            ],
+                            "ports": [
+                                {"protocol": "UDP", "port": 53},
+                                {"protocol": "TCP", "port": 53},
+                            ],
+                        },
+                    ],
+                },
+            }
+        )
+    manifest = yaml.safe_dump_all(documents, sort_keys=True)
     return _kubectl(
         ["apply", "--server-side", "--namespace", namespace, "-f", "-"],
         context=context,
         timeout_seconds=timeout_seconds,
         input_text=manifest,
     )
+
+
+def _verify_hpa_driver_control_resource_ownership(
+    *,
+    namespace: str,
+    role_name: str,
+    network_policy_name: str,
+    context: str | None,
+    timeout_seconds: float,
+) -> CommandResult:
+    """Prove dynamic HPA control objects are ours before deleting them."""
+
+    if not all(
+        _valid_namespace_name(value) for value in (namespace, role_name, network_policy_name)
+    ):
+        return CommandResult(status="not_run", reason="HPA control resource name is invalid")
+
+    resources = (
+        ("role", role_name),
+        ("rolebinding", role_name),
+        ("networkpolicy", network_policy_name),
+    )
+    observed: list[dict[str, str]] = []
+    for resource, name in resources:
+        result, payload = _json_command(
+            ["get", resource, name, "--namespace", namespace, "-o", "json"],
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.status != "pass" or payload is None:
+            # A resource deleted concurrently is safe to leave absent.  Do
+            # not turn an API/authorization failure into an unverified delete.
+            stderr = result.stderr.lower()
+            if "notfound" in stderr or "not found" in stderr:
+                observed.append({"kind": resource, "name": name, "state": "absent"})
+                continue
+            return CommandResult(
+                status="fail",
+                reason=f"HPA control resource {resource}/{name} ownership could not be verified",
+                evidence={"resources": observed},
+            )
+        metadata = payload.get("metadata")
+        labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != namespace
+            or not isinstance(labels, Mapping)
+            or labels.get(HPA_DRIVER_OWNER_LABEL) != HPA_DRIVER_OWNER_VALUE
+        ):
+            return CommandResult(
+                status="fail",
+                reason=f"HPA control resource {resource}/{name} owner label is not verified",
+                evidence={"resources": observed},
+            )
+        observed.append({"kind": resource, "name": name, "state": "owned"})
+    return CommandResult(
+        status="pass",
+        evidence={
+            "owner_label": {
+                "key": HPA_DRIVER_OWNER_LABEL,
+                "value": HPA_DRIVER_OWNER_VALUE,
+            },
+            "resources": observed,
+        },
+    )
+
+
+def _hpa_driver_namespace_preflight(
+    *,
+    subject: str,
+    namespace: str,
+    context: str | None,
+    timeout_seconds: float,
+    allowed_secret_names: Sequence[str] | None = None,
+) -> CommandResult:
+    """Fail closed unless the static driver namespace is dedicated and writable."""
+
+    parsed = _parse_hpa_driver_subject(subject)
+    if parsed is None:
+        return CommandResult(status="not_run", reason="HPA driver subject is invalid")
+    subject_namespace, service_account = parsed
+    if subject_namespace != namespace:
+        return CommandResult(
+            status="not_run",
+            reason="HPA driver subject namespace must match the Job namespace",
+        )
+
+    allowed_secrets = {HPA_DRIVER_DATABASE_SECRET_NAME}
+    if allowed_secret_names is not None:
+        for name in allowed_secret_names:
+            if not isinstance(name, str) or not name.strip():
+                return CommandResult(
+                    status="not_run",
+                    reason="HPA driver static Secret allowlist is invalid",
+                )
+            allowed_secrets.add(name.strip())
+    if any(not _valid_image_pull_secret_name(name) for name in allowed_secrets):
+        return CommandResult(
+            status="not_run",
+            reason="HPA driver static Secret allowlist contains an invalid name",
+        )
+
+    evidence: dict[str, Any] = {
+        "namespace": namespace,
+        "service_account": service_account,
+        "owner_label": {
+            "key": HPA_DRIVER_NAMESPACE_OWNER_LABEL,
+            "value": HPA_DRIVER_NAMESPACE_OWNER_VALUE,
+        },
+        "job_count": 0,
+        "pod_count": 0,
+        "permissions": {},
+    }
+    namespace_result, namespace_payload = _json_command(
+        ["get", "namespace", namespace, "-o", "json"],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    namespace_metadata = (
+        namespace_payload.get("metadata") if isinstance(namespace_payload, Mapping) else None
+    )
+    if (
+        namespace_result.status != "pass"
+        or not isinstance(namespace_metadata, Mapping)
+        or namespace_metadata.get("name") != namespace
+        or namespace_metadata.get("deletionTimestamp") is not None
+    ):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver namespace is unavailable",
+            evidence=evidence,
+        )
+    namespace_labels = namespace_metadata.get("labels")
+    if (
+        not isinstance(namespace_labels, Mapping)
+        or namespace_labels.get(HPA_DRIVER_NAMESPACE_OWNER_LABEL)
+        != HPA_DRIVER_NAMESPACE_OWNER_VALUE
+    ):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver namespace owner label is missing or unexpected",
+            evidence=evidence,
+        )
+
+    service_account_result, service_account_payload = _json_command(
+        [
+            "get",
+            "serviceaccount",
+            service_account,
+            "--namespace",
+            namespace,
+            "-o",
+            "json",
+        ],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    service_account_metadata = (
+        service_account_payload.get("metadata")
+        if isinstance(service_account_payload, Mapping)
+        else None
+    )
+    if (
+        service_account_result.status != "pass"
+        or not isinstance(service_account_metadata, Mapping)
+        or service_account_metadata.get("name") != service_account
+        or service_account_metadata.get("namespace") != namespace
+        or service_account_metadata.get("deletionTimestamp") is not None
+    ):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver ServiceAccount is unavailable",
+            evidence=evidence,
+        )
+
+    service_accounts_result, service_accounts_payload = _json_command(
+        [
+            "get",
+            "serviceaccounts",
+            "--namespace",
+            namespace,
+            "-o",
+            "json",
+        ],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    service_account_items = (
+        service_accounts_payload.get("items")
+        if isinstance(service_accounts_payload, Mapping)
+        else None
+    )
+    if service_accounts_result.status != "pass" or not isinstance(service_account_items, list):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver namespace ServiceAccount inventory is unavailable",
+            evidence=evidence,
+        )
+    allowed_service_accounts = {service_account, _HPA_DRIVER_NAMESPACE_DEFAULT_SERVICE_ACCOUNT}
+    evidence["allowed_service_account_count"] = len(allowed_service_accounts)
+    service_account_names: set[str] = set()
+    for item in service_account_items:
+        metadata = item.get("metadata") if isinstance(item, Mapping) else None
+        service_account_name: object = (
+            metadata.get("name") if isinstance(metadata, Mapping) else None
+        )
+        if not isinstance(service_account_name, str) or not _valid_namespace_name(
+            service_account_name
+        ):
+            return CommandResult(
+                status="not_run",
+                reason="dedicated HPA driver namespace ServiceAccount inventory is invalid",
+                evidence=evidence,
+            )
+        service_account_names.add(service_account_name)
+    evidence["service_account_count"] = len(service_account_names)
+    if not service_account_names.issubset(allowed_service_accounts):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver namespace contains an unexpected ServiceAccount",
+            evidence=evidence,
+        )
+
+    secrets_result, secrets_payload = _json_command(
+        ["get", "secrets", "--namespace", namespace, "-o", "json"],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    secret_items = secrets_payload.get("items") if isinstance(secrets_payload, Mapping) else None
+    if secrets_result.status != "pass" or not isinstance(secret_items, list):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver namespace Secret inventory is unavailable",
+            evidence=evidence,
+        )
+    secret_names: set[str] = set()
+    for item in secret_items:
+        metadata = item.get("metadata") if isinstance(item, Mapping) else None
+        secret_name: object = metadata.get("name") if isinstance(metadata, Mapping) else None
+        if not isinstance(secret_name, str) or not _valid_image_pull_secret_name(secret_name):
+            return CommandResult(
+                status="not_run",
+                reason="dedicated HPA driver namespace Secret inventory is invalid",
+                evidence=evidence,
+            )
+        secret_names.add(secret_name)
+    evidence["secret_count"] = len(secret_names)
+    evidence["allowed_secret_count"] = len(allowed_secrets)
+    if not secret_names.issubset(allowed_secrets):
+        return CommandResult(
+            status="not_run",
+            reason="dedicated HPA driver namespace contains an unexpected Secret",
+            evidence=evidence,
+        )
+
+    for resource in _HPA_DRIVER_NAMESPACE_WORKLOAD_RESOURCES:
+        result, payload = _json_command(
+            ["get", resource, "--namespace", namespace, "-o", "json"],
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        items = payload.get("items") if isinstance(payload, Mapping) else None
+        if result.status != "pass" or not isinstance(items, list):
+            return CommandResult(
+                status="not_run",
+                reason=f"dedicated HPA driver namespace {resource} could not be enumerated",
+                evidence=evidence,
+            )
+        count = len(items)
+        evidence[f"{resource}_count"] = count
+        if resource == "jobs":
+            evidence["job_count"] = count
+        elif resource == "pods":
+            evidence["pod_count"] = count
+        if items:
+            return CommandResult(
+                status="not_run",
+                reason="dedicated HPA driver namespace contains pre-existing workloads",
+                evidence=evidence,
+            )
+
+    permission_results = cast(dict[str, str], evidence["permissions"])
+    resources = (
+        "secrets",
+        "roles.rbac.authorization.k8s.io",
+        "rolebindings.rbac.authorization.k8s.io",
+        "networkpolicies.networking.k8s.io",
+    )
+    for resource in resources:
+        for verb in ("get", "create", "patch", "delete"):
+            result = _permission_check(
+                verb,
+                resource,
+                context=context,
+                namespace=namespace,
+                timeout_seconds=timeout_seconds,
+            )
+            permission_results[f"{verb}:{resource}"] = result.status
+            if result.status != "pass":
+                return CommandResult(
+                    status="not_run",
+                    reason=result.reason
+                    or f"HPA driver namespace permission denied: {verb} {resource}",
+                    evidence=evidence,
+                )
+    return CommandResult(status="pass", evidence=evidence)
 
 
 def _minimal_driver_environment(*, kubeconfig_path: str) -> dict[str, str]:
@@ -2787,6 +3723,61 @@ def _minimal_driver_environment(*, kubeconfig_path: str) -> dict[str, str]:
     return environment
 
 
+def _valid_hpa_cleanup_receipt(receipt: Any, *, nonce: str) -> bool:
+    if not isinstance(receipt, Mapping):
+        return False
+    deleted = receipt.get("deleted")
+    residual = receipt.get("residual")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("status") != "pass"
+        or receipt.get("phase") != "clear"
+        or receipt.get("run_nonce") != nonce
+        or receipt.get("tenant_id") != f"hpa-{nonce}"
+        or not isinstance(receipt.get("already_absent"), bool)
+        or not isinstance(deleted, Mapping)
+        or set(deleted) != set(_HPA_CLEANUP_TABLES)
+        or not isinstance(residual, Mapping)
+        or set(residual) != set(_HPA_CLEANUP_TABLES)
+    ):
+        return False
+    for table in _HPA_CLEANUP_TABLES:
+        deleted_count = deleted.get(table)
+        residual_count = residual.get(table)
+        if (
+            isinstance(deleted_count, bool)
+            or not isinstance(deleted_count, int)
+            or deleted_count < 0
+            or isinstance(residual_count, bool)
+            or not isinstance(residual_count, int)
+            or residual_count != 0
+        ):
+            return False
+    return True
+
+
+def _sanitized_hpa_cleanup_receipt(receipt: Any, *, nonce: str) -> dict[str, Any] | None:
+    """Return only the versioned cleanup receipt fields trusted by the gate."""
+
+    if not _valid_hpa_cleanup_receipt(receipt, nonce=nonce):
+        return None
+    assert isinstance(receipt, Mapping)
+    deleted = receipt["deleted"]
+    residual = receipt["residual"]
+    assert isinstance(deleted, Mapping)
+    assert isinstance(residual, Mapping)
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "phase": "clear",
+        "run_nonce": nonce,
+        "tenant_id": f"hpa-{nonce}",
+        "already_absent": receipt["already_absent"],
+        "deleted": {table: deleted[table] for table in _HPA_CLEANUP_TABLES},
+        "residual": {table: residual[table] for table in _HPA_CLEANUP_TABLES},
+    }
+
+
 def _run_hpa_driver(
     driver_path: str,
     *,
@@ -2799,6 +3790,7 @@ def _run_hpa_driver(
     evidence_path: Path | None = None,
     driver_context: str | None = None,
     driver_subject: str | None = None,
+    job_namespace: str | None = None,
 ) -> CommandResult:
     """Run the bounded Job driver and verify its API-side causal evidence."""
 
@@ -2820,17 +3812,33 @@ def _run_hpa_driver(
         if context_error:
             return CommandResult(status="not_run", reason=context_error)
     effective_driver_context = driver_context or context
+    effective_job_namespace = job_namespace or namespace
+    if not _valid_namespace_name(effective_job_namespace):
+        return CommandResult(status="not_run", reason="HPA driver Job namespace is invalid")
+    if job_namespace is not None and effective_job_namespace == namespace:
+        return CommandResult(
+            status="not_run",
+            reason="HPA driver Job namespace must be isolated from the runtime namespace",
+        )
+    effective_subject = str(
+        driver_subject or os.getenv("TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT", "") or ""
+    )
+    parsed_subject = _parse_hpa_driver_subject(effective_subject)
+    if parsed_subject is None or parsed_subject[0] != effective_job_namespace:
+        return CommandResult(
+            status="not_run",
+            reason="HPA driver subject namespace must match the Job namespace",
+        )
     command = [sys.executable, identity["driver_path"]]
     environment = _minimal_driver_environment(kubeconfig_path=identity["kubeconfig_path"])
     environment.update(
         {
             "TRPC_K8S_HPA_RUN_NONCE": run_nonce,
             "TRPC_K8S_HPA_NAMESPACE": namespace,
+            "TRPC_K8S_HPA_JOB_NAMESPACE": effective_job_namespace,
             "TRPC_K8S_HPA_CLUSTER_FINGERPRINT": cluster_fingerprint,
             "TRPC_K8S_HPA_PHASE": phase,
-            "TRPC_K8S_HPA_DRIVER_SUBJECT": str(
-                driver_subject or os.getenv("TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT", "") or ""
-            ),
+            "TRPC_K8S_HPA_DRIVER_SUBJECT": effective_subject,
             "TRPC_K8S_HPA_DRIVER_JOB_IMAGE": os.getenv(
                 "TRPC_K8S_RUNTIME_HPA_JOB_IMAGE", os.getenv("TRPC_K8S_RUNTIME_IMAGE", "")
             ),
@@ -2840,16 +3848,27 @@ def _run_hpa_driver(
     image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
     if image_pull_secret:
         environment["TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET"] = image_pull_secret
+    placement_environment = {
+        "TRPC_K8S_HPA_DRIVER_NODE_NAME": os.getenv(HPA_DRIVER_NODE_NAME_ENV, "").strip(),
+        "TRPC_K8S_HPA_DRIVER_NODE_LABEL": os.getenv(HPA_DRIVER_NODE_LABEL_ENV, "").strip(),
+        "TRPC_K8S_HPA_DRIVER_TAINT_KEY": os.getenv(HPA_DRIVER_TAINT_KEY_ENV, "").strip(),
+        "TRPC_K8S_HPA_DRIVER_TAINT_VALUE": os.getenv(HPA_DRIVER_TAINT_VALUE_ENV, "").strip(),
+        "TRPC_K8S_HPA_DRIVER_TAINT_EFFECT": os.getenv(HPA_DRIVER_TAINT_EFFECT_ENV, "").strip(),
+    }
+    if any(placement_environment.values()):
+        environment.update(placement_environment)
     if effective_driver_context:
         environment["TRPC_K8S_HPA_CONTEXT"] = effective_driver_context
     before_job: dict[str, Any] | None = None
     if phase == "clear":
         before_result, before_job = _observe_hpa_driver_job(
-            namespace=namespace,
+            namespace=effective_job_namespace,
+            target_namespace=namespace,
             run_nonce=run_nonce,
             cluster_fingerprint=cluster_fingerprint,
             context=context,
-            timeout_seconds=min(timeout_seconds, 30),
+            timeout_seconds=min(timeout_seconds, _HPA_DRIVER_API_OBSERVATION_TIMEOUT_SECONDS),
+            expected_node_name=os.getenv(HPA_DRIVER_NODE_NAME_ENV, "").strip() or None,
         )
         if before_result.status != "pass":
             return CommandResult(
@@ -2885,6 +3904,8 @@ def _run_hpa_driver(
         driver_payload.get("status") != "pass"
         or driver_payload.get("phase") != phase
         or driver_payload.get("namespace") != namespace
+        or driver_payload.get("target_namespace") != namespace
+        or driver_payload.get("job_namespace") != effective_job_namespace
         or driver_payload.get("run_nonce") != run_nonce
         or driver_payload.get("cluster_fingerprint") != cluster_fingerprint
     ):
@@ -2895,11 +3916,13 @@ def _run_hpa_driver(
         )
     if phase == "load":
         api_result, api_evidence = _observe_hpa_driver_job(
-            namespace=namespace,
+            namespace=effective_job_namespace,
+            target_namespace=namespace,
             run_nonce=run_nonce,
             cluster_fingerprint=cluster_fingerprint,
             context=context,
-            timeout_seconds=min(timeout_seconds, 30),
+            timeout_seconds=min(timeout_seconds, _HPA_DRIVER_API_OBSERVATION_TIMEOUT_SECONDS),
+            expected_node_name=os.getenv(HPA_DRIVER_NODE_NAME_ENV, "").strip() or None,
         )
         if api_result.status != "pass" or api_evidence is None:
             return CommandResult(
@@ -2916,7 +3939,7 @@ def _run_hpa_driver(
         evidence = api_evidence
     else:
         delete_result = _hpa_job_absent(
-            namespace=namespace,
+            namespace=effective_job_namespace,
             run_nonce=run_nonce,
             context=context,
             timeout_seconds=min(timeout_seconds, 30),
@@ -2927,15 +3950,58 @@ def _run_hpa_driver(
                 exit_code=completed.returncode,
                 reason=delete_result.reason or "HPA load Job deletion was not API verified",
             )
+        cleanup_delete_result = _hpa_job_absent(
+            namespace=effective_job_namespace,
+            run_nonce=run_nonce,
+            context=context,
+            timeout_seconds=min(timeout_seconds, 30),
+            job_name=_hpa_cleanup_job_name(run_nonce),
+        )
+        if cleanup_delete_result.status != "pass":
+            return CommandResult(
+                status="fail",
+                exit_code=completed.returncode,
+                reason=cleanup_delete_result.reason
+                or "HPA cleanup Job deletion was not API verified",
+            )
         evidence = dict(before_job or {})
         evidence["job_deleted"] = True
         evidence["api_observed"] = True
-        if driver_payload.get("job_uid") not in {None, evidence.get("job_uid")}:
+        evidence["already_absent"] = False
+        if driver_payload.get("job_uid") != evidence.get("job_uid"):
             return CommandResult(
                 status="fail",
                 exit_code=completed.returncode,
                 reason="HPA clear Job UID is not API verified",
             )
+        receipt = driver_payload.get("cleanup_receipt")
+        sanitized_receipt = _sanitized_hpa_cleanup_receipt(receipt, nonce=run_nonce)
+        residual = (
+            sanitized_receipt.get("residual") if isinstance(sanitized_receipt, Mapping) else None
+        )
+        cleanup_uid = driver_payload.get("cleanup_job_uid")
+        if (
+            driver_payload.get("cleanup_job_name") != _hpa_cleanup_job_name(run_nonce)
+            or not isinstance(cleanup_uid, str)
+            or not cleanup_uid
+            or sanitized_receipt is None
+            or driver_payload.get("residual") != residual
+            or driver_payload.get("api_observed") is not True
+            or driver_payload.get("job_deleted") is not True
+            or driver_payload.get("already_absent") is not False
+        ):
+            return CommandResult(
+                status="fail",
+                exit_code=completed.returncode,
+                reason="HPA cleanup Job receipt was not complete and nonce-bound",
+            )
+        evidence["cleanup"] = {
+            "api_observed": True,
+            "job_deleted": True,
+            "job_name": _hpa_cleanup_job_name(run_nonce),
+            "job_uid": cleanup_uid,
+            "receipt": sanitized_receipt,
+        }
     return CommandResult(status="pass", exit_code=completed.returncode, evidence=evidence)
 
 
@@ -3009,6 +4075,7 @@ def _driver_identity_and_scope(
     namespace: str,
     cluster_fingerprint: str,
     timeout_seconds: float,
+    role_name: str = _HPA_DRIVER_ROLE_NAME,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """Use server-side identity, scoped SSRR, and admin-side binding audit."""
 
@@ -3019,6 +4086,11 @@ def _driver_identity_and_scope(
         "subject_sha256": hashlib.sha256(subject.encode("utf-8")).hexdigest(),
         "rule_audit": {"complete": False},
     }
+    parsed_subject = _parse_hpa_driver_subject(subject)
+    if parsed_subject is None:
+        reasons.append("HPA driver subject is invalid")
+    elif parsed_subject[0] != namespace:
+        reasons.append("HPA driver subject namespace differs from the Job namespace")
     whoami_result, whoami = _driver_json(
         ["auth", "whoami", "-o", "json"],
         kubeconfig_path=kubeconfig_path,
@@ -3059,6 +4131,7 @@ def _driver_identity_and_scope(
         ("batch", "jobs", "get"),
         ("batch", "jobs", "delete"),
         ("", "pods", "get"),
+        ("", "pods", "list"),
         ("", "pods/log", "get"),
     }
 
@@ -3183,7 +4256,6 @@ def _driver_identity_and_scope(
         "matching_rolebinding_count": 0,
         "matching_clusterrolebinding_count": 0,
     }
-    parsed_subject = _parse_hpa_driver_subject(subject)
     if not admin_context:
         reasons.append("admin Kubernetes context is required for HPA driver binding audit")
     elif parsed_subject is None:
@@ -3243,7 +4315,7 @@ def _driver_identity_and_scope(
                 "namespace": namespace,
                 "role_api_group": "rbac.authorization.k8s.io",
                 "role_kind": "Role",
-                "role_name": _HPA_DRIVER_ROLE_NAME,
+                "role_name": role_name,
             }:
                 reasons.append("HPA driver RoleBinding is outside the declared target Role")
         if clusterrolebinding_result.status == "pass" and isinstance(clusterrolebindings, Mapping):
@@ -3287,21 +4359,23 @@ def _driver_identity_and_scope(
     ).hexdigest()
     attestation["rule_audit"] = {
         "complete": not reasons,
-        "scope": "target_namespace_jobs_pods_only",
-        "target_namespace": namespace,
+        "scope": "driver_namespace_jobs_pods_only",
+        "job_namespace": namespace,
         "binding_audit": binding_audit,
         **hashes,
     }
     return not reasons, reasons, attestation
 
 
-def _observe_hpa_driver_job(
+def _observe_hpa_driver_job_once(
     *,
     namespace: str,
     run_nonce: str,
     cluster_fingerprint: str,
     context: str | None,
     timeout_seconds: float,
+    expected_node_name: str | None = None,
+    target_namespace: str | None = None,
 ) -> tuple[CommandResult, dict[str, Any] | None]:
     result, payload = _json_command(
         ["get", "job", _hpa_job_name(run_nonce), "--namespace", namespace, "-o", "json"],
@@ -3309,7 +4383,7 @@ def _observe_hpa_driver_job(
         timeout_seconds=timeout_seconds,
     )
     if result.status != "pass" or payload is None:
-        return result, None
+        return CommandResult(status="fail", reason="HPA load Job API object is unavailable"), None
     metadata = payload.get("metadata")
     metadata_map = metadata if isinstance(metadata, Mapping) else {}
     labels = metadata_map.get("labels")
@@ -3331,23 +4405,218 @@ def _observe_hpa_driver_job(
         return CommandResult(
             status="fail", reason="HPA load Job API object is not nonce-labelled"
         ), None
+    job_name = _hpa_job_name(run_nonce)
+    pod_result, pod_payload = _json_command(
+        [
+            "get",
+            "pods",
+            "--namespace",
+            namespace,
+            "-l",
+            f"job-name={job_name}",
+            "-o",
+            "json",
+        ],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    if pod_result.status != "pass" or pod_payload is None:
+        return (
+            CommandResult(status="fail", reason="HPA load Job Pod API evidence is unavailable"),
+            None,
+        )
+    pod_items = pod_payload.get("items")
+    if not isinstance(pod_items, list):
+        return CommandResult(status="fail", reason="HPA load Job Pod list is invalid"), None
+    matching_pods: list[Mapping[str, Any]] = []
+    for pod in pod_items:
+        if not isinstance(pod, Mapping):
+            continue
+        pod_metadata = pod.get("metadata")
+        pod_metadata_map = pod_metadata if isinstance(pod_metadata, Mapping) else {}
+        pod_labels = pod_metadata_map.get("labels")
+        if not isinstance(pod_labels, Mapping) or any(
+            pod_labels.get(key) != value for key, value in expected_labels.items()
+        ):
+            continue
+        if pod_labels.get("app.kubernetes.io/part-of") != "trpc-agent-service":
+            continue
+        owner_references = pod_metadata_map.get("ownerReferences")
+        if not isinstance(owner_references, list) or not any(
+            isinstance(owner, Mapping)
+            and owner.get("kind") == "Job"
+            and owner.get("uid") == uid
+            and owner.get("controller") is True
+            for owner in owner_references
+        ):
+            continue
+        matching_pods.append(pod)
+    if len(matching_pods) != 1:
+        return (
+            CommandResult(
+                status="fail",
+                reason="HPA load Job must have exactly one nonce-labelled Pod",
+            ),
+            None,
+        )
+    pod = matching_pods[0]
+    pod_metadata = pod.get("metadata")
+    pod_metadata_map = pod_metadata if isinstance(pod_metadata, Mapping) else {}
+    pod_name = pod_metadata_map.get("name")
+    pod_uid = pod_metadata_map.get("uid")
+    pod_spec = pod.get("spec")
+    pod_spec_map = pod_spec if isinstance(pod_spec, Mapping) else {}
+    pod_status = pod.get("status")
+    pod_status_map = pod_status if isinstance(pod_status, Mapping) else {}
+    pod_phase = pod_status_map.get("phase")
+    pod_node_name = pod_spec_map.get("nodeName")
+    if (
+        not isinstance(pod_name, str)
+        or not pod_name
+        or any(ch.isspace() for ch in pod_name)
+        or not isinstance(pod_uid, str)
+        or not pod_uid
+        or not isinstance(pod_node_name, str)
+        or not pod_node_name
+        or pod_phase not in {"Running", "Succeeded"}
+    ):
+        return (
+            CommandResult(status="fail", reason="HPA load Job Pod is not running or succeeded"),
+            None,
+        )
+    if expected_node_name is not None and pod_node_name != expected_node_name:
+        return (
+            CommandResult(
+                status="fail",
+                reason="HPA load Job Pod was scheduled to an unexpected node",
+            ),
+            None,
+        )
+    job_spec = payload.get("spec")
+    job_spec_map = job_spec if isinstance(job_spec, Mapping) else {}
+    template = job_spec_map.get("template")
+    template_map = template if isinstance(template, Mapping) else {}
+    template_spec = template_map.get("spec")
+    template_spec_map = template_spec if isinstance(template_spec, Mapping) else {}
+    node_selector = template_spec_map.get("nodeSelector")
+    tolerations = template_spec_map.get("tolerations")
+    placement: dict[str, Any] = {
+        "pod_name": pod_name,
+        "pod_uid": pod_uid,
+        "pod_node_name": pod_node_name,
+        "pod_phase": pod_phase,
+    }
+    if expected_node_name is not None:
+        expected_label = os.getenv(HPA_DRIVER_NODE_LABEL_ENV, "").strip()
+        expected_taint_key = os.getenv(HPA_DRIVER_TAINT_KEY_ENV, "").strip()
+        expected_taint_value = os.getenv(HPA_DRIVER_TAINT_VALUE_ENV, "").strip()
+        expected_taint_effect = os.getenv(HPA_DRIVER_TAINT_EFFECT_ENV, "").strip()
+        if (
+            not expected_label
+            or not expected_taint_key
+            or not expected_taint_value
+            or not expected_taint_effect
+            or "=" not in expected_label
+        ):
+            return (
+                CommandResult(
+                    status="fail", reason="HPA load Job placement configuration is missing"
+                ),
+                None,
+            )
+        label_key, label_value = expected_label.split("=", 1)
+        expected_selector = {
+            label_key: label_value,
+            "kubernetes.io/hostname": expected_node_name,
+        }
+        expected_toleration = {
+            "key": expected_taint_key,
+            "operator": "Equal",
+            "value": expected_taint_value,
+            "effect": expected_taint_effect,
+        }
+        if node_selector != expected_selector or tolerations != [expected_toleration]:
+            return (
+                CommandResult(
+                    status="fail",
+                    reason="HPA load Job template is not bound to the configured placement",
+                ),
+                None,
+            )
+        placement.update(
+            {
+                "expected_node_name": expected_node_name,
+                "node_selector": dict(node_selector),
+                "tolerations": [dict(expected_toleration)],
+            }
+        )
     return CommandResult(status="pass"), {
         "api_observed": True,
-        "job_name": _hpa_job_name(run_nonce),
+        "job_name": job_name,
         "job_uid": uid,
         "job_labels": dict(expected_labels),
-        "namespace": namespace,
+        "namespace": target_namespace or namespace,
+        "target_namespace": target_namespace or namespace,
+        "job_namespace": namespace,
         "run_nonce": run_nonce,
         "cluster_fingerprint": cluster_fingerprint,
         "phase": "load",
+        "placement": placement,
     }
 
 
+def _observe_hpa_driver_job(
+    *,
+    namespace: str,
+    run_nonce: str,
+    cluster_fingerprint: str,
+    context: str | None,
+    timeout_seconds: float,
+    expected_node_name: str | None = None,
+    target_namespace: str | None = None,
+) -> tuple[CommandResult, dict[str, Any] | None]:
+    """Wait for the nonce-labelled load Pod to become API-visible and running."""
+
+    deadline = time.monotonic() + min(
+        _validate_timeout_seconds(timeout_seconds),
+        _HPA_DRIVER_API_OBSERVATION_TIMEOUT_SECONDS,
+    )
+    retryable = {
+        "HPA load Job API object is unavailable",
+        "HPA load Job Pod API evidence is unavailable",
+        "HPA load Job must have exactly one nonce-labelled Pod",
+        "HPA load Job Pod is not running or succeeded",
+    }
+    last_result = CommandResult(status="fail", reason="HPA load Job was not observed")
+    while True:
+        last_result, evidence = _observe_hpa_driver_job_once(
+            namespace=namespace,
+            run_nonce=run_nonce,
+            cluster_fingerprint=cluster_fingerprint,
+            context=context,
+            timeout_seconds=max(0.1, min(10.0, deadline - time.monotonic())),
+            expected_node_name=expected_node_name,
+            target_namespace=target_namespace,
+        )
+        if last_result.status == "pass" or last_result.reason not in retryable:
+            return last_result, evidence
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return last_result, None
+        time.sleep(min(0.25, remaining))
+
+
 def _hpa_job_absent(
-    *, namespace: str, run_nonce: str, context: str | None, timeout_seconds: float
+    *,
+    namespace: str,
+    run_nonce: str,
+    context: str | None,
+    timeout_seconds: float,
+    job_name: str | None = None,
 ) -> CommandResult:
+    expected_name = job_name or _hpa_job_name(run_nonce)
     result = _kubectl(
-        ["get", "job", _hpa_job_name(run_nonce), "--namespace", namespace, "-o", "json"],
+        ["get", "job", expected_name, "--namespace", namespace, "-o", "json"],
         context=context,
         timeout_seconds=timeout_seconds,
     )
@@ -3356,8 +4625,8 @@ def _hpa_job_absent(
     ):
         return CommandResult(status="pass")
     if result.status == "pass":
-        return CommandResult(status="fail", reason="HPA load Job still exists after clear")
-    return CommandResult(status="fail", reason="HPA load Job deletion could not be verified")
+        return CommandResult(status="fail", reason="HPA Job still exists after clear")
+    return CommandResult(status="fail", reason="HPA Job deletion could not be verified")
 
 
 def _hpa_driver_scope_contract(
@@ -3369,6 +4638,7 @@ def _hpa_driver_scope_contract(
     driver_context: str | None = None,
     subject: str | None = None,
     cluster_fingerprint: str | None = None,
+    role_name: str = _HPA_DRIVER_ROLE_NAME,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """Verify the real identity and complete SSR rule sets, fail closed."""
 
@@ -3390,12 +4660,13 @@ def _hpa_driver_scope_contract(
         namespace=namespace,
         cluster_fingerprint=cluster_fingerprint,
         timeout_seconds=timeout_seconds,
+        role_name=role_name,
     )
 
 
 def _parse_controlled_node_label(value: str) -> tuple[str, str] | None:
     key, separator, label_value = value.partition("=")
-    if separator != "=" or key != _NODE_LABEL_KEY or not label_value:
+    if separator != "=" or key != _NODE_LABEL_KEY or label_value != _NODE_LABEL_VALUE:
         return None
     if any(character.isspace() for character in value):
         return None
@@ -3497,6 +4768,8 @@ def _node_drain_preflight(
     label_value: str,
     context: str | None,
     timeout_seconds: float,
+    run_nonce: str | None = None,
+    cluster_fingerprint: str | None = None,
     require_schedulable: bool = True,
     require_gate_workload: bool = False,
 ) -> tuple[CommandResult, dict[str, Any]]:
@@ -3549,7 +4822,39 @@ def _node_drain_preflight(
             item_metadata = item_metadata if isinstance(item_metadata, Mapping) else {}
             item_namespace = str(item_metadata.get("namespace", ""))
             if item_namespace == namespace:
-                gate_namespace_pods += 1
+                item_labels = item_metadata.get("labels")
+                item_labels = item_labels if isinstance(item_labels, Mapping) else {}
+                owners = item_metadata.get("ownerReferences")
+                owners = owners if isinstance(owners, list) else []
+                owner_ok = any(
+                    isinstance(owner, Mapping)
+                    and owner.get("controller") is True
+                    and owner.get("kind") in {"ReplicaSet", "Job"}
+                    for owner in owners
+                )
+                expected_runtime_labels = {
+                    RUNTIME_NAMESPACE_OWNER_LABEL: RUNTIME_NAMESPACE_OWNER_VALUE,
+                    RUNTIME_NAMESPACE_RUN_LABEL: run_nonce,
+                    RUNTIME_NAMESPACE_CLUSTER_LABEL: (
+                        cluster_fingerprint[:63] if cluster_fingerprint is not None else None
+                    ),
+                }
+                labels_ok = run_nonce is None and cluster_fingerprint is None
+                if run_nonce is not None and cluster_fingerprint is not None:
+                    labels_ok = all(
+                        item_labels.get(key) == value
+                        for key, value in expected_runtime_labels.items()
+                    )
+                app_name = item_labels.get("app.kubernetes.io/name")
+                if owner_ok and labels_ok and app_name in _RUNTIME_GATE_POD_NAMES:
+                    gate_namespace_pods += 1
+                    continue
+                blockers.append(
+                    {
+                        "namespace": item_namespace,
+                        "owner_kind": "untrusted-gate-namespace-pod",
+                    }
+                )
                 continue
             annotations = item_metadata.get("annotations")
             annotations = annotations if isinstance(annotations, Mapping) else {}
@@ -3649,8 +4954,24 @@ def _controlled_node_drain(
     label_value: str,
     context: str | None,
     timeout_seconds: float,
+    run_nonce: str | None = None,
+    cluster_fingerprint: str | None = None,
 ) -> tuple[CommandResult, dict[str, Any]]:
-    """Cordon/drain one preflighted dedicated node and always uncordon it."""
+    """Cordon/drain one preflighted dedicated node and always uncordon it.
+
+    The runtime pods are pinned to this one node, so a normal PDB-respecting
+    drain cannot evict the final replica and then schedule its replacement.
+    The namespace-scoped PDB eviction check runs before this operation; the
+    node phase models a hard node failure and therefore explicitly bypasses
+    eviction/PDB admission with ``--disable-eviction=true``.
+    """
+
+    drain_policy = {
+        "mode": "hard-node-failure",
+        "disable_eviction": True,
+        "pdb_bypass": True,
+        "pdb_preflight_required": True,
+    }
 
     preflight, details = _node_drain_preflight(
         node_name,
@@ -3659,9 +4980,16 @@ def _controlled_node_drain(
         label_value=label_value,
         context=context,
         timeout_seconds=timeout_seconds,
+        run_nonce=run_nonce,
+        cluster_fingerprint=cluster_fingerprint,
     )
     if preflight.status != "pass":
-        return preflight, {"preflight": details, "uncordon": {"status": "not_run"}}
+        return preflight, {
+            "preflight": details,
+            "drain_policy": drain_policy,
+            "uncordon": {"status": "not_run"},
+        }
+    details["drain_policy"] = drain_policy
     cordon = _kubectl(["cordon", node_name], context=context, timeout_seconds=timeout_seconds)
     details["cordon"] = _result_payload(cordon)
     if cordon.status != "pass":
@@ -3689,6 +5017,8 @@ def _controlled_node_drain(
             label_value=label_value,
             context=context,
             timeout_seconds=timeout_seconds,
+            run_nonce=run_nonce,
+            cluster_fingerprint=cluster_fingerprint,
             require_schedulable=False,
             require_gate_workload=True,
         )
@@ -3710,6 +5040,11 @@ def _controlled_node_drain(
                 # to this isolated namespace, so deleting that disposable
                 # state is an explicit part of the controlled test.
                 "--delete-emptydir-data=true",
+                # All gate Pods are pinned to this node.  The final replica
+                # cannot be replaced while the node is cordoned, so this
+                # phase intentionally models a hard-node failure and bypasses
+                # PDB eviction admission after the namespace PDB check above.
+                "--disable-eviction=true",
                 "--force=false",
                 "--grace-period=90",
                 f"--timeout={int(timeout_seconds)}s",
@@ -3728,6 +5063,22 @@ def _controlled_node_drain(
             "node": _result_payload(post_node_result),
             "node_cordoned": isinstance(post_spec, Mapping)
             and post_spec.get("unschedulable") is True,
+        }
+        post_drain_inventory, post_drain_inventory_details = _node_drain_preflight(
+            node_name,
+            namespace=namespace,
+            label_key=label_key,
+            label_value=label_value,
+            context=context,
+            timeout_seconds=timeout_seconds,
+            run_nonce=run_nonce,
+            cluster_fingerprint=cluster_fingerprint,
+            require_schedulable=False,
+        )
+        details["post_drain_inventory"] = {
+            **post_drain_inventory_details,
+            "status": post_drain_inventory.status,
+            "reason": post_drain_inventory.reason,
         }
     except (OSError, ValueError) as error:
         drain = CommandResult(
@@ -3748,6 +5099,8 @@ def _controlled_node_drain(
         drain.status == "pass"
         and post_node_result.status == "pass"
         and details["post_drain"]["node_cordoned"] is True
+        and details.get("post_drain_inventory", {}).get("status") == "pass"
+        and details.get("post_drain_inventory", {}).get("gate_namespace_pod_count") == 0
         and uncordon.status == "pass"
     )
     if not success:
@@ -3764,6 +5117,9 @@ def _build_runtime_attestation(
     rolling = checks.get("rolling_upgrade")
     rolling_images = rolling.get("image_ids") if isinstance(rolling, Mapping) else {}
     initial = checks.get("initial_image_ids")
+    node_eviction = checks.get("node_eviction")
+    node_drain = node_eviction.get("drain") if isinstance(node_eviction, Mapping) else None
+    node_drain_policy = node_drain.get("drain_policy") if isinstance(node_drain, Mapping) else None
     return {
         "status": "pass",
         "namespace_isolated": bool(candidate.get("namespace")),
@@ -3782,6 +5138,7 @@ def _build_runtime_attestation(
             "rolling_upgrade": _check_status(checks, "rolling_upgrade") == "pass",
             "hpa_observed": _check_status(checks, "worker_scale_and_hpa") == "pass",
             "hpa_load_observed": _check_status(checks, "hpa_load_observation") == "pass",
+            "hpa_driver_cleanup": _check_status(checks, "hpa_driver_rbac_cleanup") == "pass",
             "pod_eviction": _check_status(checks, "pdb_eviction") == "pass",
             "node_eviction": _check_status(checks, "node_eviction") == "pass",
             "graceful_termination": _check_status(checks, "graceful_termination") == "pass",
@@ -3798,6 +5155,7 @@ def _build_runtime_attestation(
             if _check_status(checks, "node_eviction") == "pass"
             else "namespace_pod_eviction"
         ),
+        "node_drain_policy": node_drain_policy if isinstance(node_drain_policy, Mapping) else {},
         "node_eviction_status": (
             "pass" if _check_status(checks, "node_eviction") == "pass" else "not_run"
         ),
@@ -3890,11 +5248,25 @@ def _missing_prerequisites(
         ),
         "TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT": os.getenv("TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT"),
         "TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT": os.getenv("TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT"),
+        "TRPC_K8S_RUNTIME_HPA_JOB_IMAGE": os.getenv("TRPC_K8S_RUNTIME_HPA_JOB_IMAGE"),
         "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND": os.getenv("TRPC_K8S_RUNTIME_HPA_JOB_COMMAND"),
         "TRPC_K8S_RUNTIME_NODE_NAME": os.getenv("TRPC_K8S_RUNTIME_NODE_NAME"),
         "TRPC_K8S_RUNTIME_NODE_LABEL": os.getenv("TRPC_K8S_RUNTIME_NODE_LABEL"),
         "TRPC_K8S_RUNTIME_NODE_DRAIN_CONFIRM": os.getenv("TRPC_K8S_RUNTIME_NODE_DRAIN_CONFIRM"),
     }
+    if not allow_local_images:
+        required["TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE"] = os.getenv(
+            "TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE"
+        )
+        required.update(
+            {
+                HPA_DRIVER_NODE_NAME_ENV: os.getenv(HPA_DRIVER_NODE_NAME_ENV),
+                HPA_DRIVER_NODE_LABEL_ENV: os.getenv(HPA_DRIVER_NODE_LABEL_ENV),
+                HPA_DRIVER_TAINT_KEY_ENV: os.getenv(HPA_DRIVER_TAINT_KEY_ENV),
+                HPA_DRIVER_TAINT_VALUE_ENV: os.getenv(HPA_DRIVER_TAINT_VALUE_ENV),
+                HPA_DRIVER_TAINT_EFFECT_ENV: os.getenv(HPA_DRIVER_TAINT_EFFECT_ENV),
+            }
+        )
     missing = [name for name, value in required.items() if not value]
     secret_manifest = required["TRPC_K8S_RUNTIME_SECRET_MANIFEST"]
     if secret_manifest and not Path(secret_manifest).is_file():
@@ -3933,8 +5305,68 @@ def _missing_prerequisites(
             )
         ):
             missing.append("TRPC_K8S_RUNTIME_HPA_JOB_COMMAND must be a bounded JSON argument array")
+    hpa_job_image = required["TRPC_K8S_RUNTIME_HPA_JOB_IMAGE"] or ""
+    runtime_image = required["TRPC_K8S_RUNTIME_IMAGE"] or ""
+    if hpa_job_image and runtime_image and hpa_job_image != runtime_image:
+        missing.append("TRPC_K8S_RUNTIME_HPA_JOB_IMAGE must match TRPC_K8S_RUNTIME_IMAGE")
+    if not allow_local_images and job_command:
+        try:
+            command_payload = json.loads(job_command)
+        except json.JSONDecodeError:
+            command_payload = None
+        if command_payload != [
+            "python",
+            "scripts/kubernetes_hpa_load_driver.py",
+            "--backlog-probe",
+        ]:
+            missing.append(
+                "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND must be the bounded backlog probe command"
+            )
     if required["TRPC_K8S_RUNTIME_NODE_DRAIN_CONFIRM"] != _NODE_DRAIN_CONFIRMATION:
         missing.append(f"TRPC_K8S_RUNTIME_NODE_DRAIN_CONFIRM must equal {_NODE_DRAIN_CONFIRMATION}")
+    if not allow_local_images:
+        hpa_node_name = (required[HPA_DRIVER_NODE_NAME_ENV] or "").strip()
+        hpa_node_label = (required[HPA_DRIVER_NODE_LABEL_ENV] or "").strip()
+        hpa_taint_key = (required[HPA_DRIVER_TAINT_KEY_ENV] or "").strip()
+        hpa_taint_value = (required[HPA_DRIVER_TAINT_VALUE_ENV] or "").strip()
+        hpa_taint_effect = (required[HPA_DRIVER_TAINT_EFFECT_ENV] or "").strip()
+        if hpa_node_name and not _valid_node_name(hpa_node_name):
+            missing.append(f"{HPA_DRIVER_NODE_NAME_ENV} is invalid")
+        label_key, separator, label_value = hpa_node_label.partition("=")
+        if hpa_node_label and (
+            separator != "="
+            or not label_key
+            or not label_value
+            or any(character.isspace() for character in hpa_node_label)
+        ):
+            missing.append(f"{HPA_DRIVER_NODE_LABEL_ENV} is invalid")
+        if hpa_taint_key and (
+            any(character.isspace() for character in hpa_taint_key)
+            or "=" in hpa_taint_key
+            or len(hpa_taint_key) > 253
+        ):
+            missing.append(f"{HPA_DRIVER_TAINT_KEY_ENV} is invalid")
+        if hpa_taint_value and (
+            any(character.isspace() for character in hpa_taint_value) or len(hpa_taint_value) > 253
+        ):
+            missing.append(f"{HPA_DRIVER_TAINT_VALUE_ENV} is invalid")
+        if hpa_taint_effect and hpa_taint_effect not in {
+            "NoSchedule",
+            "PreferNoSchedule",
+            "NoExecute",
+        }:
+            missing.append(f"{HPA_DRIVER_TAINT_EFFECT_ENV} is invalid")
+        if (
+            label_key
+            and label_value
+            and hpa_taint_key
+            and hpa_taint_value
+            and (label_key != hpa_taint_key or label_value != hpa_taint_value)
+        ):
+            missing.append("HPA load-driver node label and taint must bind the same role")
+    support_namespace = required.get("TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE")
+    if support_namespace and not _valid_namespace_name(support_namespace):
+        missing.append("TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE is invalid")
     if require_release_binding:
         release_id = os.getenv("TRPC_RELEASE_ID", "").strip()
         release_nonce = os.getenv("TRPC_RELEASE_NONCE", "").strip()
@@ -4785,6 +6217,25 @@ def _run_live_once(
     hpa_driver_path = os.environ["TRPC_K8S_RUNTIME_HPA_DRIVER"]
     hpa_driver_subject = os.environ["TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT"]
     hpa_driver_context = os.environ["TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT"]
+    parsed_hpa_subject = _parse_hpa_driver_subject(hpa_driver_subject)
+    if parsed_hpa_subject is None:
+        _report(
+            output,
+            gate="not_run",
+            candidate=candidate,
+            rejection_reasons=["HPA driver subject is invalid"],
+        )
+        return 1 if require_runtime else 0
+    hpa_job_namespace = parsed_hpa_subject[0]
+    if hpa_job_namespace == namespace:
+        _report(
+            output,
+            gate="not_run",
+            candidate=candidate,
+            rejection_reasons=["HPA driver namespace is not isolated"],
+        )
+        return 1 if require_runtime else 0
+    candidate["hpa_driver_namespace"] = hpa_job_namespace
     hpa_driver_identity, hpa_driver_identity_error = _hpa_driver_identity(
         hpa_driver_path,
         expected_sha256=os.environ["TRPC_K8S_RUNTIME_HPA_DRIVER_SHA256"],
@@ -4800,7 +6251,8 @@ def _run_live_once(
         return 1 if require_runtime else 0
     node_name = os.environ["TRPC_K8S_RUNTIME_NODE_NAME"]
     node_label = _parse_controlled_node_label(os.environ["TRPC_K8S_RUNTIME_NODE_LABEL"])
-    if re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", node_name) is None:
+    support_namespace = os.environ.get("TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE", "").strip()
+    if not _valid_node_name(node_name):
         _report(
             output,
             gate="not_run",
@@ -4808,10 +6260,46 @@ def _run_live_once(
             rejection_reasons=["TRPC_K8S_RUNTIME_NODE_NAME is not a valid Kubernetes node name"],
         )
         return 1 if require_runtime else 0
+    if not _valid_namespace_name(support_namespace):
+        _report(
+            output,
+            gate="not_run",
+            candidate=candidate,
+            rejection_reasons=[
+                "TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE is not a valid Kubernetes namespace"
+            ],
+        )
+        return 1 if require_runtime else 0
+    try:
+        projected_runtime_secrets = _project_secret_yaml(
+            secret_manifest,
+            namespace=namespace,
+            profile="runtime",
+            image_pull_secret=image_pull_secret,
+        )
+        projected_hpa_secrets = _project_secret_yaml(
+            secret_manifest,
+            namespace=hpa_job_namespace,
+            profile="hpa",
+            image_pull_secret=image_pull_secret,
+        )
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+        _report(
+            output,
+            gate="not_run",
+            candidate=candidate,
+            rejection_reasons=["least-privilege Secret projection failed"],
+        )
+        return 1 if require_runtime else 0
     candidate["controlled_node"] = {
         "fingerprint_sha256": hashlib.sha256(node_name.encode("utf-8")).hexdigest()
     }
     namespace_created = False
+    hpa_control_resources_created = False
+    hpa_role_name = f"{_HPA_DRIVER_ROLE_NAME}-{run_nonce[:10]}"
+    hpa_network_policy_name = hpa_role_name.replace(
+        _HPA_DRIVER_ROLE_NAME, _HPA_DRIVER_NETWORK_POLICY_NAME, 1
+    )
     temporary_directory: tempfile.TemporaryDirectory[str] | None = None
     gate_status = "not_run"
     cluster_stdout = ""
@@ -4827,10 +6315,25 @@ def _run_live_once(
             reasons.append("current Kubernetes context is unavailable")
             return 1 if require_runtime else 0
         cluster_identity = _cluster_identity(cluster_stdout, context)
+        hpa_namespace_preflight = _hpa_driver_namespace_preflight(
+            subject=hpa_driver_subject,
+            namespace=hpa_job_namespace,
+            context=context,
+            timeout_seconds=min(timeout_seconds, 30),
+            allowed_secret_names=tuple(
+                name for name in (HPA_DRIVER_DATABASE_SECRET_NAME, image_pull_secret) if name
+            ),
+        )
+        checks["hpa_driver_namespace_preflight"] = _result_payload(hpa_namespace_preflight)
+        if hpa_namespace_preflight.status != "pass":
+            reasons.append(
+                hpa_namespace_preflight.reason or "dedicated HPA driver namespace preflight failed"
+            )
+            return 1 if require_runtime else 0
         if node_label is None:
             checks["node_eviction"] = {
                 "status": "not_run",
-                "reason": "controlled node label must use trpc-runtime-gate=<value>",
+                "reason": "controlled node label must use trpc-cell-fabric-owner=innovation",
             }
             reasons.append("controlled node label is invalid")
             return 1 if require_runtime else 0
@@ -4841,6 +6344,8 @@ def _run_live_once(
             label_value=node_label[1],
             context=context,
             timeout_seconds=timeout_seconds,
+            run_nonce=run_nonce,
+            cluster_fingerprint=cluster_identity["fingerprint_sha256"],
         )
         checks["node_eviction"] = {
             "status": "not_run" if node_preflight.status == "pass" else node_preflight.status,
@@ -4895,6 +6400,8 @@ def _run_live_once(
             image=image,
             local_kind=allow_local_images,
             node_label=node_label,
+            node_name=node_name,
+            support_namespace=support_namespace,
             run_nonce=run_nonce,
             cluster_fingerprint=cluster_identity["fingerprint_sha256"],
             expires_at=str(int(time.time()) + RUNTIME_NAMESPACE_TTL_SECONDS),
@@ -4937,7 +6444,18 @@ def _run_live_once(
         rendered_manifest.write_text(rendered, encoding="utf-8")
 
         manifest_ok, manifest_reasons = _rendered_manifest_contract(
-            rendered, local_kind=allow_local_images
+            rendered,
+            local_kind=allow_local_images,
+            required_node_selector={
+                node_label[0]: node_label[1],
+                "kubernetes.io/hostname": node_name,
+            },
+            required_runtime_labels={
+                RUNTIME_NAMESPACE_OWNER_LABEL: RUNTIME_NAMESPACE_OWNER_VALUE,
+                RUNTIME_NAMESPACE_RUN_LABEL: run_nonce,
+                RUNTIME_NAMESPACE_CLUSTER_LABEL: cluster_identity["fingerprint_sha256"][:63],
+            },
+            support_namespace=support_namespace,
         )
         checks["manifest_contract"] = {
             "status": "pass" if manifest_ok else "fail",
@@ -5016,27 +6534,25 @@ def _run_live_once(
         if reasons:
             return 1 if require_runtime else 0
 
-        secret_dry_run = _kubectl(
-            [
-                "apply",
-                "--server-side",
-                "--dry-run=server",
-                "--namespace",
-                namespace,
-                "-f",
-                secret_manifest,
-            ],
+        secret_profiles = (
+            ("runtime", namespace, projected_runtime_secrets),
+            ("hpa", hpa_job_namespace, projected_hpa_secrets),
+        )
+        secret_dry_run = _apply_secret_profiles(
+            secret_profiles,
             context=context,
             timeout_seconds=timeout_seconds,
+            dry_run=True,
         )
         checks["secret_server_side_dry_run"] = _result_payload(secret_dry_run)
         if secret_dry_run.status != "pass":
             reasons.append("Secret manifest server-side dry-run failed")
             return 1 if require_runtime else 0
-        secret_apply = _kubectl(
-            ["apply", "--server-side", "--namespace", namespace, "-f", secret_manifest],
+        secret_apply = _apply_secret_profiles(
+            secret_profiles,
             context=context,
             timeout_seconds=timeout_seconds,
+            dry_run=False,
         )
         checks["secret_apply"] = _result_payload(secret_apply)
         if secret_apply.status != "pass":
@@ -5203,11 +6719,14 @@ def _run_live_once(
             )
             return 1 if require_runtime else 0
 
+        hpa_control_resources_created = True
         rbac_binding = _bind_hpa_driver_rbac(
             subject=hpa_driver_subject,
-            namespace=namespace,
+            namespace=hpa_job_namespace,
             context=context,
             timeout_seconds=min(timeout_seconds, 30),
+            support_namespace=support_namespace,
+            role_name=hpa_role_name,
         )
         checks["hpa_driver_rbac_bind"] = _result_payload(rbac_binding)
         if rbac_binding.status != "pass":
@@ -5216,18 +6735,21 @@ def _run_live_once(
         scope_ok, scope_reasons, scope_attestation = _hpa_driver_scope_contract(
             kubeconfig_path=hpa_driver_identity["kubeconfig_path"],
             context=context,
-            namespace=namespace,
+            namespace=hpa_job_namespace,
             timeout_seconds=min(timeout_seconds, 30),
             driver_context=hpa_driver_context,
             subject=hpa_driver_subject,
             cluster_fingerprint=cluster_identity["fingerprint_sha256"],
+            role_name=hpa_role_name,
         )
         checks["hpa_driver_trust"] = {
             "status": "pass" if scope_ok else "not_run",
             "driver_sha256": hpa_driver_identity["driver_sha256"],
             "kubeconfig_sha256": hpa_driver_identity["kubeconfig_sha256"],
             "dedicated_kubeconfig": True,
-            "scope": "namespace_jobs_only",
+            "scope": "driver_namespace_jobs_only",
+            "target_namespace": namespace,
+            "job_namespace": hpa_job_namespace,
             "rbac_verified": scope_ok,
             "subject_sha256": hashlib.sha256(hpa_driver_subject.encode("utf-8")).hexdigest(),
             "driver_context_sha256": scope_attestation.get("driver_context_sha256"),
@@ -5257,6 +6779,7 @@ def _run_live_once(
                 phase="load",
                 driver_context=hpa_driver_context,
                 driver_subject=hpa_driver_subject,
+                job_namespace=hpa_job_namespace,
             )
             during_result, during_observation = _wait_for_hpa_phase(
                 namespace=namespace,
@@ -5277,6 +6800,7 @@ def _run_live_once(
                 phase="clear",
                 driver_context=hpa_driver_context,
                 driver_subject=hpa_driver_subject,
+                job_namespace=hpa_job_namespace,
             )
             if during_result.status == "pass" and during_observation is not None:
                 after_result, after_observation = _wait_for_hpa_phase(
@@ -5588,6 +7112,8 @@ def _run_live_once(
             label_value=node_label[1] if node_label is not None else "",
             context=context,
             timeout_seconds=timeout_seconds,
+            run_nonce=run_nonce,
+            cluster_fingerprint=cluster_identity["fingerprint_sha256"],
         )
         checks["node_eviction"] = {
             "status": node_drain.status,
@@ -5616,6 +7142,41 @@ def _run_live_once(
         reasons.append(f"runtime gate setup failed: {type(error).__name__}")
         return 1 if require_runtime else 0
     finally:
+        if hpa_control_resources_created:
+            ownership = _verify_hpa_driver_control_resource_ownership(
+                namespace=hpa_job_namespace,
+                role_name=hpa_role_name,
+                network_policy_name=hpa_network_policy_name,
+                context=context,
+                timeout_seconds=min(timeout_seconds, 60),
+            )
+            checks["hpa_driver_rbac_cleanup_preflight"] = _result_payload(ownership)
+            if ownership.status != "pass":
+                checks["hpa_driver_rbac_cleanup"] = _result_payload(
+                    CommandResult(
+                        status="fail",
+                        reason="HPA driver temporary control resources ownership was not verified",
+                    )
+                )
+                reasons.append("HPA driver temporary control resources cleanup ownership failed")
+            else:
+                hpa_cleanup = _kubectl(
+                    [
+                        "delete",
+                        f"role/{hpa_role_name}",
+                        f"rolebinding/{hpa_role_name}",
+                        f"networkpolicy/{hpa_network_policy_name}",
+                        "--namespace",
+                        hpa_job_namespace,
+                        "--ignore-not-found=true",
+                        "--wait=true",
+                    ],
+                    context=context,
+                    timeout_seconds=min(timeout_seconds, 60),
+                )
+                checks["hpa_driver_rbac_cleanup"] = _result_payload(hpa_cleanup)
+                if hpa_cleanup.status != "pass":
+                    reasons.append("HPA driver temporary control resources cleanup failed")
         if namespace_created:
             cleanup = _kubectl(
                 [

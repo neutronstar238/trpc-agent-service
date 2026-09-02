@@ -1608,6 +1608,7 @@ def _valid_kubernetes_report() -> dict[str, object]:
     evidence = _current_evidence("scripts.kubernetes_runtime_gate")
     run_id = str(evidence["run_id"])
     namespace = "trpc-runtime-gate-abcdef1234"
+    job_namespace = "trpc-runtime-driver"
     nonce = "a" * 32
     cluster_fingerprint = "c" * 64
     driver_sha256 = hashlib.sha256(
@@ -1639,6 +1640,8 @@ def _valid_kubernetes_report() -> dict[str, object]:
                     "trpc.io/hpa-cluster": cluster_fingerprint[:63],
                 },
                 "namespace": namespace,
+                "target_namespace": namespace,
+                "job_namespace": job_namespace,
                 "run_nonce": nonce,
                 "cluster_fingerprint": cluster_fingerprint,
                 "phase": "load",
@@ -1654,10 +1657,29 @@ def _valid_kubernetes_report() -> dict[str, object]:
                     "trpc.io/hpa-cluster": cluster_fingerprint[:63],
                 },
                 "namespace": namespace,
+                "target_namespace": namespace,
+                "job_namespace": job_namespace,
                 "run_nonce": nonce,
                 "cluster_fingerprint": cluster_fingerprint,
                 "phase": "load",
                 "job_deleted": True,
+                "already_absent": False,
+                "cleanup": {
+                    "api_observed": True,
+                    "job_deleted": True,
+                    "job_name": f"trpc-hpa-cleanup-{nonce[:20]}",
+                    "job_uid": "cleanup-job-uid-1",
+                    "receipt": {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "phase": "clear",
+                        "run_nonce": nonce,
+                        "tenant_id": f"hpa-{nonce}",
+                        "already_absent": False,
+                        "deleted": {name: 0 for name in release_gate.K8S_HPA_CLEANUP_TABLES},
+                        "residual": {name: 0 for name in release_gate.K8S_HPA_CLEANUP_TABLES},
+                    },
+                },
             },
         },
         "scale_up_timeout_seconds": 60,
@@ -1698,6 +1720,12 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "value": metric_value,
         }
     post_ready = {name: {"status": "pass"} for name in release_gate.K8S_REQUIRED_DEPLOYMENTS}
+    node_drain_policy = {
+        "mode": "hard-node-failure",
+        "disable_eviction": True,
+        "pdb_bypass": True,
+        "pdb_preflight_required": True,
+    }
     node_eviction = {
         "status": "pass",
         "preflight": {
@@ -1706,6 +1734,7 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "node_schedulable": True,
         },
         "drain": {
+            "drain_policy": node_drain_policy,
             "cordon": {"status": "pass"},
             "post_cordon_preflight": {
                 "node_label_verified": True,
@@ -1714,6 +1743,11 @@ def _valid_kubernetes_report() -> dict[str, object]:
             },
             "drain": {"status": "pass"},
             "post_drain": {"node_cordoned": True},
+            "post_drain_inventory": {
+                "status": "pass",
+                "blocking_pod_count": 0,
+                "gate_namespace_pod_count": 0,
+            },
             "uncordon": {"status": "pass"},
         },
         "uncordon_observed": True,
@@ -1735,17 +1769,50 @@ def _valid_kubernetes_report() -> dict[str, object]:
         "identity_verified": True,
         "rule_audit": {
             "complete": True,
-            "scope": "target_namespace_jobs_pods_only",
-            "target_namespace": namespace,
+            "scope": "driver_namespace_jobs_pods_only",
+            "job_namespace": job_namespace,
             "target_rules_sha256": "5" * 64,
             "default_rules_sha256": "6" * 64,
             "kube_system_rules_sha256": "7" * 64,
             "cluster_rules_sha256": "8" * 64,
         },
         "dedicated_kubeconfig": True,
-        "scope": "namespace_jobs_only",
+        "scope": "driver_namespace_jobs_only",
+        "target_namespace": namespace,
+        "job_namespace": job_namespace,
         "rbac_verified": True,
         "reasons": [],
+    }
+    checks["hpa_driver_namespace_preflight"] = {
+        "status": "pass",
+        "evidence": {
+            "namespace": job_namespace,
+            "service_account": "hpa-driver",
+            "owner_label": {
+                "key": release_gate.K8S_HPA_DRIVER_NAMESPACE_OWNER_LABEL,
+                "value": release_gate.K8S_HPA_DRIVER_NAMESPACE_OWNER_VALUE,
+            },
+            "service_account_count": 2,
+            "allowed_service_account_count": 2,
+            "secret_count": 2,
+            "allowed_secret_count": 2,
+            "job_count": 0,
+            "pod_count": 0,
+            **{
+                f"{resource}_count": 0
+                for resource in release_gate.K8S_HPA_DRIVER_NAMESPACE_WORKLOAD_RESOURCES
+            },
+            "permissions": {
+                f"{verb}:{resource}": "pass"
+                for resource in (
+                    "secrets",
+                    "roles.rbac.authorization.k8s.io",
+                    "rolebindings.rbac.authorization.k8s.io",
+                    "networkpolicies.networking.k8s.io",
+                )
+                for verb in ("get", "create", "patch", "delete")
+            },
+        },
     }
     checks["node_eviction"] = node_eviction
     checks["rolling_upgrade"] = {
@@ -1788,6 +1855,7 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "actions": {name: True for name in release_gate.K8S_REQUIRED_ACTIONS},
             "image_ids": {"initial": initial, "upgrade": upgrade},
             "eviction_scope": "namespace_pod_eviction+controlled_node",
+            "node_drain_policy": node_drain_policy,
             "node_eviction_status": "pass",
         },
         "lineage": {
@@ -2304,6 +2372,70 @@ def test_kubernetes_pass_rejects_incomplete_or_replayed_runtime_evidence(
 
     assert status in {"not_run", "fail"}
     assert any(reason_fragment in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "tenant_id",
+        "deleted_missing",
+        "deleted_extra",
+        "deleted_negative",
+        "residual_nonzero",
+        "already_absent",
+        "receipt_extra",
+    ),
+)
+def test_kubernetes_pass_rejects_mutated_hpa_cleanup_receipt(tmp_path, mutation: str) -> None:
+    value = json.loads(json.dumps(_valid_kubernetes_report()))
+    receipt = value["candidate"]["checks"]["hpa_load_observation"]["observation"][  # type: ignore[index]
+        "driver_evidence"
+    ]["clear"]["cleanup"]["receipt"]
+    table = release_gate.K8S_HPA_CLEANUP_TABLES[0]
+    if mutation == "tenant_id":
+        receipt["tenant_id"] = "hpa-other"
+    elif mutation == "deleted_missing":
+        receipt["deleted"].pop(table)
+    elif mutation == "deleted_extra":
+        receipt["deleted"]["unexpected_table"] = 0
+    elif mutation == "deleted_negative":
+        receipt["deleted"][table] = -1
+    elif mutation == "residual_nonzero":
+        receipt["residual"][table] = 1
+    elif mutation == "already_absent":
+        receipt["already_absent"] = True
+    else:
+        receipt["untrusted_detail"] = "must-not-enter-release-evidence"
+    report = tmp_path / REPORTS["deployment"][0]
+    report.write_text(json.dumps(value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status in {"not_run", "fail"}
+    assert any("cleanup receipt" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("mutation", ("owner", "workload", "secret_inventory"))
+def test_kubernetes_pass_rejects_mutated_hpa_driver_namespace_preflight(
+    tmp_path, mutation: str
+) -> None:
+    value = json.loads(json.dumps(_valid_kubernetes_report()))
+    evidence = value["candidate"]["checks"]["hpa_driver_namespace_preflight"][  # type: ignore[index]
+        "evidence"
+    ]
+    if mutation == "owner":
+        evidence["owner_label"]["value"] = "other-controller"
+    elif mutation == "workload":
+        evidence["deployments_count"] = 1
+    else:
+        evidence["secret_count"] = evidence["allowed_secret_count"] - 1
+    report = tmp_path / REPORTS["deployment"][0]
+    report.write_text(json.dumps(value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status in {"not_run", "fail"}
+    assert any("namespace_preflight evidence" in reason for reason in reasons)
 
 
 def test_migration_pass_accepts_only_complete_real_attested_report(tmp_path) -> None:
@@ -3477,6 +3609,200 @@ def test_release_status_rejects_boolean_schema_version(tmp_path) -> None:
     assert reasons == ["invalid schema_version in boolean-schema.json"]
 
 
+def _coverage_fixture(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "candidate.py").write_text("candidate = 1\n", encoding="utf-8")
+    monkeypatch.setattr(release_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(release_gate, "SOURCE_FINGERPRINT_ROOTS", ("source",))
+
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "percent_statements_covered": 95.0,
+                    "percent_branches_covered": 91.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "gate": "pass",
+        "baseline": {"line_percent": 90.0, "branch_percent": 90.0},
+        "candidate": {"line_percent": 95.0, "branch_percent": 91.0},
+        "coverage_report_sha256": hashlib.sha256(coverage.read_bytes()).hexdigest(),
+        "source_fingerprint": release_gate._current_coverage_source_fingerprint(),
+    }
+    report = tmp_path / "coverage-gate.json"
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    return report, coverage, payload
+
+
+def test_release_status_validates_coverage_lineage_and_adjacent_report(
+    tmp_path, monkeypatch
+) -> None:
+    report, _coverage, _payload = _coverage_fixture(tmp_path, monkeypatch)
+
+    assert _status(report, production_field=False) == ("pass", [])
+
+
+def test_release_status_rejects_legacy_coverage_pass_without_lineage(tmp_path, monkeypatch) -> None:
+    report, coverage, _payload = _coverage_fixture(tmp_path, monkeypatch)
+    report.write_text(
+        json.dumps({"gate": "pass", "candidate": {"line_percent": 95.0}}),
+        encoding="utf-8",
+    )
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["coverage evidence source fingerprint is missing or invalid"]
+    assert coverage.is_file()
+
+
+def test_release_status_rejects_tampered_coverage_report(tmp_path, monkeypatch) -> None:
+    report, coverage, _payload = _coverage_fixture(tmp_path, monkeypatch)
+    coverage.write_text('{"totals": {"percent_branches_covered": 1.0}}', encoding="utf-8")
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["coverage report sha256 does not match coverage evidence"]
+
+
+def test_release_status_rejects_hashed_low_coverage_report(tmp_path, monkeypatch) -> None:
+    report, coverage, payload = _coverage_fixture(tmp_path, monkeypatch)
+    coverage.write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "percent_statements_covered": 80.0,
+                    "percent_branches_covered": 80.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload["coverage_report_sha256"] = hashlib.sha256(coverage.read_bytes()).hexdigest()
+    payload["candidate"] = {"line_percent": 80.0, "branch_percent": 80.0}
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["raw coverage totals are below the reported baseline"]
+
+
+def test_release_status_rejects_coverage_candidate_mismatch(tmp_path, monkeypatch) -> None:
+    report, _coverage, payload = _coverage_fixture(tmp_path, monkeypatch)
+    payload["candidate"]["line_percent"] = 94.0
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["coverage candidate does not match raw coverage totals"]
+
+
+def test_release_status_accepts_explicit_coverage_report_path(tmp_path, monkeypatch) -> None:
+    report, coverage, payload = _coverage_fixture(tmp_path, monkeypatch)
+    raw_coverage = coverage.read_bytes()
+    report.parent.joinpath("coverage.json").unlink()
+    external = tmp_path / "artifacts" / "coverage.json"
+    external.parent.mkdir()
+    external.write_bytes(raw_coverage)
+
+    status, reasons = _status(
+        report,
+        production_field=False,
+        coverage_report_path=Path("artifacts/coverage.json"),
+    )
+
+    assert status == "pass"
+    assert reasons == []
+    assert payload["coverage_report_sha256"] == hashlib.sha256(external.read_bytes()).hexdigest()
+
+
+def _simulation_fixture(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "candidate.py").write_text("candidate = 1\n", encoding="utf-8")
+    monkeypatch.setattr(release_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(release_gate, "SOURCE_FINGERPRINT_ROOTS", ("source",))
+    report = tmp_path / "production-mock.json"
+    report.write_text(
+        json.dumps(
+            {
+                "gate": "pass",
+                "production_gate": "not_run",
+                "source_fingerprint": release_gate._current_coverage_source_fingerprint(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return report, source / "candidate.py"
+
+
+def test_release_status_validates_mock_source_lineage(tmp_path, monkeypatch) -> None:
+    report, _source = _simulation_fixture(tmp_path, monkeypatch)
+
+    assert _status(report, production_field=False) == ("pass", [])
+
+
+def test_release_status_rejects_stale_mock_source_lineage(tmp_path, monkeypatch) -> None:
+    report, source = _simulation_fixture(tmp_path, monkeypatch)
+    source.write_text("candidate = 2\n", encoding="utf-8")
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["simulation evidence source fingerprint belongs to a different candidate"]
+
+
+def test_release_status_rejects_stale_mock_selector_source(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "tests" / "simulation"
+    source.mkdir(parents=True)
+    selector = source / "test_selector.py"
+    selector.write_text("def test_selector(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(release_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        release_gate,
+        "SOURCE_FINGERPRINT_ROOTS",
+        ("tests/simulation",),
+    )
+    report = tmp_path / "production-mock.json"
+    report.write_text(
+        json.dumps(
+            {
+                "gate": "pass",
+                "production_gate": "not_run",
+                "source_fingerprint": release_gate._current_coverage_source_fingerprint(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    selector.write_text("def test_selector(): return False\n", encoding="utf-8")
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["simulation evidence source fingerprint belongs to a different candidate"]
+
+
+def test_release_status_rejects_mock_production_promotion(tmp_path, monkeypatch) -> None:
+    report, _source = _simulation_fixture(tmp_path, monkeypatch)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    payload["production_gate"] = "pass"
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=False)
+
+    assert status == "fail"
+    assert reasons == ["simulation report must keep production_gate=not_run"]
+
+
 def test_online_im_release_rejects_missing_or_rotated_current_trust(tmp_path, monkeypatch) -> None:
     trust = _install_release_probe_trust(tmp_path, monkeypatch)
     report = tmp_path / REPORTS["online_im"][0]
@@ -3673,7 +3999,36 @@ def _write_complete_report_set(
                 }
             )
         else:
-            payload = {"gate": "pass"}
+            if filename == REPORTS["coverage"][0]:
+                coverage_report = directory / "coverage.json"
+                coverage_report.write_text(
+                    json.dumps(
+                        {
+                            "totals": {
+                                "percent_statements_covered": 95.0,
+                                "percent_branches_covered": 91.0,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                payload = {
+                    "gate": "pass",
+                    "baseline": {"line_percent": 90.0, "branch_percent": 90.0},
+                    "candidate": {"line_percent": 95.0, "branch_percent": 91.0},
+                    "coverage_report_sha256": hashlib.sha256(
+                        coverage_report.read_bytes()
+                    ).hexdigest(),
+                    "source_fingerprint": release_gate._current_coverage_source_fingerprint(),
+                }
+            elif filename == REPORTS["simulation"][0]:
+                payload = {
+                    "gate": "pass",
+                    "production_gate": "not_run",
+                    "source_fingerprint": release_gate._current_coverage_source_fingerprint(),
+                }
+            else:
+                payload = {"gate": "pass"}
         (directory / filename).write_text(json.dumps(payload), encoding="utf-8")
     production_reports = {
         name: filename for name, (filename, production) in REPORTS.items() if production

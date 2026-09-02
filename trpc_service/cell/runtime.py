@@ -11,10 +11,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from trpc_service.cell.capsule import AgentCapsule
 from trpc_service.cell.effects import (
+    ApprovalCredential,
+    ApprovalVerifier,
     EffectCallable,
     EffectReceipt,
     EffectStatus,
     ExactlyOnceEffectExecutor,
+    PolicyAuthority,
+    PolicyJudge,
 )
 from trpc_service.cell.events import (
     CausalEvent,
@@ -46,6 +50,10 @@ class BranchEffectDenied(PermissionError):
     """Raised when a counterfactual branch attempts a real-world side effect."""
 
 
+class CellNotActive(LookupError):
+    """Raised when an effect targets a Cell that was never activated or forked."""
+
+
 @dataclass(frozen=True, slots=True)
 class CellActivation:
     """Auditable result of accepting and placing one logical Cell."""
@@ -58,6 +66,11 @@ class CellActivation:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _stable_event_id(tenant_id: str, kind: str, *parts: str) -> str:
+    material = "\x1f".join(("trpc-agent-cell/v1", tenant_id, kind, *parts))
+    return f"cell-{kind}-{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
 
 
 def default_cell_reducer(state: dict[str, Any], event: CausalEvent) -> dict[str, Any]:
@@ -90,24 +103,42 @@ class AgentCellFabric:
     def __init__(
         self,
         *,
-        trusted_capsule_keys: Mapping[str, Ed25519PublicKey | bytes] | None = None,
+        trusted_capsule_keys: Mapping[str, Mapping[str, Ed25519PublicKey | bytes]] | None = None,
         require_signed_capsules: bool = True,
         event_store: EventStore | None = None,
         scheduler: CellScheduler | None = None,
         effect_executor: ExactlyOnceEffectExecutor | None = None,
+        approval_verifier: ApprovalVerifier | None = None,
+        policy_authority: PolicyAuthority | None = None,
+        policy_judge: PolicyJudge | None = None,
     ) -> None:
-        self._trusted_capsule_keys = dict(trusted_capsule_keys or {})
+        self._trusted_capsule_keys = {
+            tenant_id: dict(keys) for tenant_id, keys in (trusted_capsule_keys or {}).items()
+        }
         self._require_signed_capsules = require_signed_capsules
         self.events = event_store or InMemoryEventStore()
         self.scheduler = scheduler or CellScheduler()
-        self.effects = effect_executor or ExactlyOnceEffectExecutor()
+        if effect_executor is not None and any(
+            value is not None for value in (approval_verifier, policy_authority, policy_judge)
+        ):
+            raise TypeError(
+                "inject policy/approval authorities into the executor or the fabric, not both"
+            )
+        self.effects = effect_executor or ExactlyOnceEffectExecutor(
+            approval_verifier=approval_verifier,
+            policy_authority=policy_authority,
+            policy_judge=policy_judge,
+        )
         self._capsules: dict[tuple[str, str], AgentCapsule] = {}
+        self._active_cells: set[CellAddress] = set()
 
     def register_capsule(self, capsule: AgentCapsule) -> str:
         """Verify and register one immutable capsule, returning its digest."""
 
+        tenant_keys = self._trusted_capsule_keys.get(capsule.metadata.tenant_id, {})
+        capsule.spec.validate_asset_refs()
         capsule.verify(
-            self._trusted_capsule_keys,
+            tenant_keys,
             require_signature=self._require_signed_capsules,
         )
         if capsule.digest is None:
@@ -131,12 +162,14 @@ class AgentCellFabric:
         self,
         *,
         tenant_id: str,
+        app_id: str = "default",
         cell_id: str,
         session_id: str,
         capsule_digest: str,
         message: str,
         channel: str,
         external_message_id: str,
+        channel_binding_id: str = "default",
         nodes: tuple[NodeSnapshot, ...] | list[NodeSnapshot],
         correlation_id: str,
         trace_id: str,
@@ -151,6 +184,7 @@ class AgentCellFabric:
         request = CellPlacementRequest(
             cell_id=cell_id,
             tenant_id=tenant_id,
+            app_id=app_id,
             capsule_digest=capsule_digest,
             slo=capsule.spec.slo,
             required_capabilities=frozenset(capsule.spec.channel_capabilities),
@@ -160,6 +194,7 @@ class AgentCellFabric:
         placement = self.scheduler.place(request, nodes)
         address = CellAddress(
             tenant_id=tenant_id,
+            app_id=app_id,
             cell_id=cell_id,
             session_id=session_id,
             capsule_digest=capsule_digest,
@@ -168,15 +203,25 @@ class AgentCellFabric:
         accepted = self.events.append(
             EventDraft(
                 tenant_id=tenant_id,
+                app_id=app_id,
                 cell_id=cell_id,
                 session_id=session_id,
                 capsule_digest=capsule_digest,
                 branch_id=branch_id,
                 event_type=EventType.MESSAGE_ACCEPTED,
+                event_id=_stable_event_id(
+                    tenant_id,
+                    "message-accepted",
+                    app_id,
+                    channel,
+                    channel_binding_id,
+                    external_message_id,
+                ),
                 payload={
                     "message_hash": _sha256_text(message),
                     "channel": channel,
-                    "external_message_id": external_message_id,
+                    "external_message_id_hash": _sha256_text(external_message_id),
+                    "channel_binding_id_hash": _sha256_text(channel_binding_id),
                 },
                 correlation_id=correlation_id,
                 trace_id=trace_id,
@@ -186,11 +231,22 @@ class AgentCellFabric:
         activated = self.events.append(
             EventDraft(
                 tenant_id=tenant_id,
+                app_id=app_id,
                 cell_id=cell_id,
                 session_id=session_id,
                 capsule_digest=capsule_digest,
                 branch_id=branch_id,
                 event_type=EventType.CELL_ACTIVATED,
+                event_id=_stable_event_id(
+                    tenant_id,
+                    "cell-activated",
+                    app_id,
+                    cell_id,
+                    session_id,
+                    capsule_digest,
+                    branch_id,
+                    accepted.event_id,
+                ),
                 payload={
                     "node_id": placement.node_id,
                     "score": placement.score,
@@ -202,6 +258,7 @@ class AgentCellFabric:
                 request_id=request_id,
             )
         )
+        self._active_cells.add(address)
         return CellActivation(address, placement, accepted, activated)
 
     async def execute_intent(
@@ -211,12 +268,15 @@ class AgentCellFabric:
         effect: EffectCallable | None,
         *,
         confirmation_scope: ConfirmationScope | None = None,
+        approval_credential: ApprovalCredential | str | None = None,
         simulate: EffectCallable | None = None,
         manual_replay: bool = False,
     ) -> EffectReceipt:
         """Persist intent/policy/effect metadata around one guarded side effect."""
 
         self._validate_intent_namespace(address, intent)
+        if address not in self._active_cells:
+            raise CellNotActive("tool intent targets a Cell that is not active")
         if address.branch_id != "main" and intent.policy_decision != PolicyDecision.SIMULATE_ONLY:
             raise BranchEffectDenied(
                 "counterfactual branches may only execute simulate_only tool intents"
@@ -233,11 +293,16 @@ class AgentCellFabric:
                 "risk": str(intent.risk),
             },
         )
+        effective_intent, policy_error = await self.effects.authorize(intent)
         decided = self._append_from_intent(
             address,
             intent,
             EventType.POLICY_DECIDED,
-            {"intent_id": intent.intent_id, "decision": str(intent.policy_decision)},
+            {
+                "intent_id": intent.intent_id,
+                "decision": str(effective_intent.policy_decision),
+                "reason": policy_error,
+            },
             causation_id=created.event_id,
         )
         receipt = await self.effects.execute(
@@ -245,6 +310,8 @@ class AgentCellFabric:
             effect,
             simulate=simulate,
             confirmation_scope=confirmation_scope,
+            approval_credential=approval_credential,
+            authorized_intent=effective_intent,
             manual_replay=manual_replay,
         )
         event_type = (
@@ -282,18 +349,31 @@ class AgentCellFabric:
     ) -> CausalEvent:
         """Record a content-redacted terminal delivery event."""
 
+        if address not in self._active_cells:
+            raise CellNotActive("reply targets a Cell that is not active")
         head = self.events.head(address)
         return self.events.append(
             EventDraft(
                 tenant_id=address.tenant_id,
+                app_id=address.app_id,
                 cell_id=address.cell_id,
                 session_id=address.session_id,
                 capsule_digest=address.capsule_digest,
                 branch_id=address.branch_id,
                 event_type=EventType.REPLY_DELIVERED,
+                event_id=_stable_event_id(
+                    address.tenant_id,
+                    "reply-delivered",
+                    address.app_id,
+                    address.cell_id,
+                    address.session_id,
+                    address.capsule_digest,
+                    address.branch_id,
+                    provider_message_id,
+                ),
                 payload={
                     "reply_hash": _sha256_text(reply),
-                    "provider_message_id": provider_message_id,
+                    "provider_message_id_hash": _sha256_text(provider_message_id),
                 },
                 causation_id=head.event_id if head is not None else None,
                 correlation_id=correlation_id,
@@ -320,6 +400,7 @@ class AgentCellFabric:
             new_branch_id=new_branch_id,
             target_capsule_digest=target,
         )
+        self._active_cells.add(branch.address)
         return branch.address
 
     def replay(self, address: CellAddress) -> ProjectionResult[dict[str, Any]]:
@@ -335,6 +416,7 @@ class AgentCellFabric:
     def _validate_intent_namespace(address: CellAddress, intent: ToolIntent) -> None:
         if (
             intent.tenant_id != address.tenant_id
+            or intent.app_id != address.app_id
             or intent.cell_id != address.cell_id
             or intent.session_id != address.session_id
             or intent.capsule_digest != address.capsule_digest
@@ -354,11 +436,23 @@ class AgentCellFabric:
         return self.events.append(
             EventDraft(
                 tenant_id=address.tenant_id,
+                app_id=address.app_id,
                 cell_id=address.cell_id,
                 session_id=address.session_id,
                 capsule_digest=address.capsule_digest,
                 branch_id=address.branch_id,
                 event_type=event_type,
+                event_id=_stable_event_id(
+                    address.tenant_id,
+                    "intent-event",
+                    address.app_id,
+                    address.cell_id,
+                    address.session_id,
+                    address.capsule_digest,
+                    address.branch_id,
+                    intent.intent_id,
+                    str(event_type),
+                ),
                 payload=payload,
                 causation_id=causation_id,
                 correlation_id=intent.request_id or intent.intent_id,
@@ -374,5 +468,6 @@ __all__ = [
     "CapsuleNotRegistered",
     "CellActivation",
     "CellNamespaceMismatch",
+    "CellNotActive",
     "default_cell_reducer",
 ]

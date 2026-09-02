@@ -1,3 +1,5 @@
+throw "This legacy performance wrapper is disabled because it contains a stale protected namespace and candidate binding. Render the current deploy/runtime-gate.yaml and run scripts/ack_performance_acceptance.py."
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
@@ -15,7 +17,7 @@ $imageDigest = "sha256:ef3bd5c94fe8fdf748019fa40fa21a1b21c9de0f1b8d534451c40ca5b
 $upgradeDigest = "sha256:87e5d418ed0fb4de1e61d35c343b2aac94ab79438ba566f4a2121a359286c335"
 $releaseContextInitialDigest = "sha256:ef3bd5c94fe8fdf748019fa40fa21a1b21c9de0f1b8d534451c40ca5bb4dede9"
 $releaseContextUpgradeDigest = "sha256:87e5d418ed0fb4de1e61d35c343b2aac94ab79438ba566f4a2121a359286c335"
-$dockerHubRepository = "docker.io/zixuan760/trpc-agent-service"
+$dockerHubRepository = "docker.io/zixuan760/trpc-agent-cell-fabric"
 $dockerHubReference = "$dockerHubRepository@$imageDigest"
 $dockerHubMirrorReference = "$dockerHubRepository@$upgradeDigest"
 $imageTag = "release-da1d5d43d852"

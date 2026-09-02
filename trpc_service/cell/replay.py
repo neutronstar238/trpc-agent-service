@@ -113,9 +113,10 @@ class ProjectionReplayer(Generic[StateT]):
         self.store = store
 
     @staticmethod
-    def _scope(address: CellAddress) -> tuple[str, str, str]:
+    def _scope(address: CellAddress) -> tuple[str, str, str, str]:
         return (
             address.tenant_id,
+            address.app_id,
             address.cell_id,
             address.session_id,
         )
@@ -127,7 +128,7 @@ class ProjectionReplayer(Generic[StateT]):
                 raise NamespaceViolation("projection received an event without a branch id")
             if cls._scope(event.address) != cls._scope(address):
                 raise NamespaceViolation(
-                    "projection received an event from another tenant, cell or session"
+                    "projection received an event from another tenant, app, cell or session"
                 )
         for previous, current in pairwise(events):
             if current.sequence != previous.sequence + 1:

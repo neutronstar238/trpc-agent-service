@@ -829,7 +829,15 @@ def test_live_acceptance_timeout_limits_reject_non_finite_or_excessive_values() 
         _bounded_timeout(0, name="timeout", maximum=10.0)
 
 
-def test_live_failure_report_contains_only_secret_free_progress_labels(tmp_path: Path) -> None:
+def test_live_failure_report_contains_only_secret_free_progress_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_credential = "redis://user:source-credential-sentinel@source.invalid:6379/0"
+    target_credential = "postgresql://user:target-credential-sentinel@target.invalid:5432/database"
+    release_nonce = "raw-release-nonce-sentinel"
+    monkeypatch.setenv("TRPC_MIGRATION_SOURCE_DSN", source_credential)
+    monkeypatch.setenv("TRPC_MIGRATION_TARGET_DSN", target_credential)
+    monkeypatch.setenv("TRPC_RELEASE_NONCE", release_nonce)
     progress = _LiveProgress()
     progress.started("verify", "target_enumeration")
     progress.completed_operation("verify", "target_enumeration")
@@ -845,7 +853,10 @@ def test_live_failure_report_contains_only_secret_free_progress_labels(tmp_path:
         "last_completed_phase": "not_started",
         "last_completed_operation": "target_enumeration",
     }
-    assert "secret" not in json.dumps(report)
+    serialized = json.dumps(report)
+    assert source_credential not in serialized
+    assert target_credential not in serialized
+    assert release_nonce not in serialized
 
 
 @pytest.mark.asyncio

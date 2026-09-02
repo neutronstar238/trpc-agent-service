@@ -16,7 +16,7 @@ import json
 import re
 import shutil
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ DEFAULT_MINIO_TEMPLATE = Path("runs") / "multitenant" / "ack-runtime-minio.yaml"
 DEFAULT_OUTPUT_DIR = Path("runs") / "multitenant" / "rendered"
 DEFAULT_PERFORMANCE_TEMPLATE = Path("deploy") / "kustomize" / "overlays" / "performance"
 DEFAULT_PERFORMANCE_OUTPUT_DIR = DEFAULT_OUTPUT_DIR / "performance"
+DEFAULT_SUPPORT_NAMESPACE = "trpc-runtime-support"
 
 _REQUIRED_SUPPORT_FIELDS = (
     "data_node",
@@ -59,6 +60,76 @@ _SUPPORT_CONFIG_ROLLOUTS = {
         "trpc.io/prometheus-adapter-config-sha256",
     ),
 }
+_RUNTIME_SUPPORT_MODES = frozenset({"full", "stage"})
+_DEFAULT_CUTOVER_OUTPUT_NAME = "runtime-support-cutover.yaml"
+_PROVIDER_MANAGED_BY = "trpc-runtime-support-renderer"
+_PROVIDER_LABEL_KEY = "trpc.io/provider"
+_PROVIDER_LABEL_VALUE = "trpc-runtime-metrics"
+_PROVIDER_NAMESPACE_LABEL_KEY = "trpc.io/support-namespace"
+
+# These resources are cluster-scoped (except the auth-reader RoleBinding), so
+# their historical fixed names cause two support providers to overwrite one
+# another.  The renderer keeps the legacy names in the default namespace for
+# clean-cluster compatibility and derives names for every additional provider.
+_PROVIDER_RESOURCE_BASES = (
+    ("clusterrole", "trpc-runtime-prometheus-discovery"),
+    ("clusterrolebinding", "trpc-runtime-prometheus-discovery"),
+    ("clusterrole", "trpc-runtime-prometheus-adapter"),
+    ("clusterrolebinding", "trpc-runtime-prometheus-adapter"),
+    ("clusterrolebinding", "trpc-runtime-prometheus-adapter-auth-delegator"),
+    ("rolebinding", "trpc-runtime-prometheus-adapter-auth-reader"),
+)
+
+# The old support template used a Job-observation sidecar that manufactured a
+# backlog value from the existence of the HPA driver Job.  That signal is not
+# a workload metric and must never be present in a production support
+# manifest.  Keep the names here so rendering an older template remains
+# fail-closed even before the template itself is upgraded.
+_SYNTHETIC_BACKLOG_RESOURCES = frozenset(
+    {
+        ("configmap", "backlog-metric-source"),
+        ("deployment", "backlog-metric-source"),
+        ("service", "backlog-metric-source"),
+        ("serviceaccount", "backlog-observer"),
+        ("clusterrole", "trpc-runtime-backlog-observer"),
+        ("clusterrolebinding", "trpc-runtime-backlog-observer"),
+    }
+)
+_SYNTHETIC_BACKLOG_JOB_NAMES = frozenset({"trpc-runtime-backlog"})
+_PROMETHEUS_DISCOVERY_SERVICE_ACCOUNT = "prometheus"
+_PROMETHEUS_DISCOVERY_ROLE = "trpc-runtime-prometheus-discovery"
+_PROMETHEUS_RUNTIME_GATE_JOB = "trpc-runtime-gate-backlog"
+_PROMETHEUS_PRODUCTION_JOB = "trpc-session-ready-backlog-production"
+_RUNTIME_GATE_NAMESPACE_REGEX = r"^trpc-runtime-gate-[0-9a-f]{10}$"
+_RUNTIME_GATE_NONCE_REGEX = r"^[0-9a-f]{32}$"
+# Kubernetes label values are capped at 63 characters.  The runtime overlay
+# deliberately stores the first 63 characters of the SHA-256 cluster
+# fingerprint on the exporter Service.
+_RUNTIME_GATE_CLUSTER_FINGERPRINT_REGEX = r"^[0-9a-f]{63}$"
+_BACKLOG_METRIC_REGEX = r"^trpc_session_ready_backlog$"
+
+# These are cluster-scoped Kubernetes kinds.  The support renderer must not
+# add metadata.namespace to them, even though the support resources around
+# them are namespaced.  APIService is cluster-scoped, but its spec.service
+# reference is intentionally rewritten below.
+_CLUSTER_SCOPED_KINDS = {
+    "apiservice",
+    "clusterrole",
+    "clusterrolebinding",
+    "customresourcedefinition",
+    "mutatingwebhookconfiguration",
+    "namespace",
+    "node",
+    "persistentvolume",
+    "podsecuritypolicy",
+    "priorityclass",
+    "runtimeclass",
+    "selfsubjectrulesreview",
+    "selfsubjectaccessreview",
+    "storageclass",
+    "tokenreview",
+    "validatingwebhookconfiguration",
+}
 
 
 class RuntimeSupportRenderError(ValueError):
@@ -85,7 +156,7 @@ def _support_values(config: Any) -> dict[str, str]:
             "runtime config is missing kubernetes.support; all runtime-support fields are required"
         )
 
-    values: dict[str, str] = {}
+    values: dict[str, str] = {"namespace": _support_namespace(config)}
     invalid: list[str] = []
     for name in _REQUIRED_SUPPORT_FIELDS:
         value = _field(support, name)
@@ -98,6 +169,128 @@ def _support_values(config: Any) -> dict[str, str]:
             "runtime config kubernetes.support has missing or invalid fields: " + ", ".join(invalid)
         )
     return values
+
+
+def _support_namespace(config: Any) -> str:
+    """Return and validate the configured support-service namespace.
+
+    The checked-in support templates historically used
+    ``trpc-runtime-support``.  Keeping that value as a safe default lets old
+    acceptance configurations continue to render while making a custom ACK
+    namespace explicit whenever one is supplied.
+    """
+
+    support = _field(config, "support")
+    raw_namespace = _field(support, "namespace") if support is not None else None
+    namespace = DEFAULT_SUPPORT_NAMESPACE if raw_namespace is None else raw_namespace
+    if (
+        not isinstance(namespace, str)
+        or not namespace.strip()
+        or len(namespace.strip()) > 63
+        or _NAMESPACE_RE.fullmatch(namespace.strip()) is None
+    ):
+        raise RuntimeSupportRenderError(
+            "runtime config kubernetes.support.namespace must be a valid DNS label "
+            "within 63 characters"
+        )
+    return namespace.strip()
+
+
+def _replace_support_namespace_string(value: str, namespace: str) -> str:
+    """Replace support namespace tokens without touching unrelated namespaces."""
+
+    if value == DEFAULT_SUPPORT_NAMESPACE:
+        return namespace
+    return value.replace(
+        f".{DEFAULT_SUPPORT_NAMESPACE}.svc.cluster.local",
+        f".{namespace}.svc.cluster.local",
+    ).replace(
+        f".{DEFAULT_SUPPORT_NAMESPACE}.svc",
+        f".{namespace}.svc",
+    )
+
+
+def _render_support_namespace_references(
+    documents: Iterable[Any],
+    *,
+    namespace: str,
+    rewrite_resource_metadata: bool,
+) -> None:
+    """Rewrite support namespace references in a copied manifest tree.
+
+    ``rewrite_resource_metadata`` is true for the dedicated support/MinIO
+    templates, where every namespaced object belongs to the support namespace.
+    It is false for the performance overlay's copied runtime base: those
+    workloads remain in the performance namespace, while NetworkPolicy
+    selectors, service DNS names, and APIService service references still
+    need to point at the configured support namespace.
+    """
+
+    def visit(value: Any, *, resource_root: bool = False) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item, resource_root=resource_root)
+            return
+        if not isinstance(value, dict):
+            return
+
+        is_resource = resource_root or (
+            isinstance(value.get("apiVersion"), str)
+            and isinstance(value.get("kind"), str)
+            and isinstance(value.get("metadata"), dict)
+        )
+        metadata = value.get("metadata")
+        if rewrite_resource_metadata and is_resource and isinstance(metadata, dict):
+            resource_kind = _kind(value)
+            if resource_kind == "namespace":
+                if metadata.get("name") == DEFAULT_SUPPORT_NAMESPACE:
+                    metadata["name"] = namespace
+            elif resource_kind not in _CLUSTER_SCOPED_KINDS:
+                raw_resource_namespace = metadata.get("namespace")
+                if raw_resource_namespace in (None, DEFAULT_SUPPORT_NAMESPACE):
+                    metadata["namespace"] = namespace
+
+        # A RoleBinding may live in kube-system while its ServiceAccount lives
+        # in the support namespace.  Only rewrite the subject reference, not
+        # the RoleBinding's own external namespace.
+        subjects = value.get("subjects")
+        if isinstance(subjects, list):
+            for subject in subjects:
+                if (
+                    isinstance(subject, dict)
+                    and subject.get("namespace") == DEFAULT_SUPPORT_NAMESPACE
+                ):
+                    subject["namespace"] = namespace
+
+        # APIService itself is cluster-scoped.  Its adapter Service is not.
+        if _kind(value) == "apiservice":
+            spec = value.get("spec")
+            service = spec.get("service") if isinstance(spec, dict) else None
+            if isinstance(service, dict):
+                service_name = service.get("name")
+                if service_name == "prometheus-adapter":
+                    service["namespace"] = namespace
+
+        namespace_selector = value.get("namespaceSelector")
+        if isinstance(namespace_selector, dict):
+            labels = namespace_selector.get("matchLabels")
+            if (
+                isinstance(labels, dict)
+                and labels.get("kubernetes.io/metadata.name") == DEFAULT_SUPPORT_NAMESPACE
+            ):
+                labels["kubernetes.io/metadata.name"] = namespace
+
+        for key, child in list(value.items()):
+            if isinstance(child, str):
+                value[key] = _replace_support_namespace_string(child, namespace)
+            elif key == "items" and isinstance(child, list):
+                for item in child:
+                    visit(item, resource_root=True)
+            else:
+                visit(child)
+
+    for document in documents:
+        visit(document, resource_root=True)
 
 
 def _read_documents(path: Path) -> list[Any]:
@@ -335,8 +528,14 @@ def _render_document(document: Any, values: Mapping[str, str]) -> None:
 
 def render_documents(documents: Iterable[Any], support: Any) -> list[Any]:
     """Render loaded YAML documents without mutating the caller's objects."""
-    values = _support_values(type("Config", (), {"support": support})())
+    config = type("Config", (), {"support": support})()
+    values = _support_values(config)
     rendered = copy.deepcopy(list(documents))
+    _render_support_namespace_references(
+        rendered,
+        namespace=values["namespace"],
+        rewrite_resource_metadata=True,
+    )
     for document in rendered:
         _render_document(document, values)
     return rendered
@@ -368,22 +567,234 @@ def _support_runtime_bindings(config: Any) -> dict[str, str] | None:
         raise RuntimeSupportRenderError(
             "runtime config support image bindings are missing or invalid: " + ", ".join(invalid)
         )
-    try:
-        references = config.resolved_image_references()
-        initial_image = references["initial"]
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        raise RuntimeSupportRenderError(
-            "runtime config does not provide an immutable initial runtime image"
-        ) from exc
-    if not isinstance(initial_image, str) or not initial_image.strip():
-        raise RuntimeSupportRenderError(
-            "runtime config does not provide an immutable initial runtime image"
-        )
     return {
         **{name: value.strip() for name, value in image_values.items() if isinstance(value, str)},
-        "backlog-metric-source_image": initial_image.strip(),
         "image_pull_secret": pull_secret.strip(),
     }
+
+
+def _drop_synthetic_backlog_resources(documents: list[Any]) -> None:
+    """Remove legacy Job-existence metric resources from rendered support.
+
+    This is intentionally performed in the renderer as well as in the
+    checked-in template.  A caller may supply an older copied template, and
+    production rendering must not accidentally publish a synthetic backlog
+    source merely because that template was not refreshed.
+    """
+
+    def keep(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return True
+        identity = (_kind(value), _name(value))
+        if identity in _SYNTHETIC_BACKLOG_RESOURCES:
+            return False
+        items = value.get("items")
+        if isinstance(items, list):
+            value["items"] = [item for item in items if keep(item)]
+        return True
+
+    documents[:] = [document for document in documents if keep(document)]
+
+
+def _find_resource(documents: Iterable[Any], *, kind: str, name: str) -> dict[str, Any] | None:
+    """Find a resource in top-level documents or Kubernetes List items."""
+
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        if _kind(document) == kind and _name(document) == name:
+            return document
+        items = document.get("items")
+        if isinstance(items, list):
+            found = _find_resource(items, kind=kind, name=name)
+            if found is not None:
+                return found
+    return None
+
+
+def _provider_resource_name(namespace: str, base_name: str) -> str:
+    """Derive a stable, DNS-safe cluster resource name for a support provider."""
+
+    if namespace == DEFAULT_SUPPORT_NAMESPACE:
+        return base_name
+    suffix = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:16]
+    prefix_limit = 63 - len(suffix) - 1
+    prefix = base_name[:prefix_limit].rstrip("-")
+    if not prefix:
+        raise RuntimeSupportRenderError("provider resource name prefix is empty")
+    return f"{prefix}-{suffix}"
+
+
+def _provider_resource_labels(namespace: str) -> dict[str, str]:
+    return {
+        "app.kubernetes.io/managed-by": _PROVIDER_MANAGED_BY,
+        _PROVIDER_LABEL_KEY: _PROVIDER_LABEL_VALUE,
+        _PROVIDER_NAMESPACE_LABEL_KEY: namespace,
+    }
+
+
+def _set_provider_resource_identity(documents: list[Any], *, namespace: str) -> None:
+    """Namespace-bind discovery/adapter RBAC names and labels.
+
+    ClusterRole and ClusterRoleBinding names are global.  A support provider
+    rendered into a non-default namespace therefore gets a deterministic hash
+    suffix, while the default acceptance provider retains its historical names.
+    The RoleBinding lives in ``kube-system`` but is part of the same provider
+    identity and is handled identically.
+    """
+
+    name_map = {
+        base_name: _provider_resource_name(namespace, base_name)
+        for _kind_name, base_name in _PROVIDER_RESOURCE_BASES
+    }
+    resources: list[tuple[str, str, dict[str, Any]]] = []
+    for kind, base_name in _PROVIDER_RESOURCE_BASES:
+        resource = _find_resource(documents, kind=kind, name=base_name)
+        if resource is not None:
+            resources.append((kind, base_name, resource))
+
+    for kind, base_name, resource in resources:
+        metadata = resource.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+            resource["metadata"] = metadata
+        metadata["name"] = name_map[base_name]
+        labels = metadata.setdefault("labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+            metadata["labels"] = labels
+        labels.update(_provider_resource_labels(namespace))
+
+        if kind != "clusterrolebinding":
+            continue
+        role_ref = resource.get("roleRef")
+        if not isinstance(role_ref, dict):
+            continue
+        role_name = role_ref.get("name")
+        if isinstance(role_name, str) and role_name in name_map:
+            role_ref["name"] = name_map[role_name]
+
+
+def _cutover_output_path(output_dir: Path, cutover_output: str | Path | None) -> Path:
+    if cutover_output is not None:
+        return Path(cutover_output)
+    return output_dir / _DEFAULT_CUTOVER_OUTPUT_NAME
+
+
+def _split_stage_documents(documents: list[Any]) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Remove APIService objects from stage output and retain them for cutover."""
+
+    cutover: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> tuple[bool, Any]:
+        if isinstance(value, dict):
+            if _kind(value) == "apiservice":
+                cutover.append(copy.deepcopy(value))
+                return False, value
+            items = value.get("items")
+            if isinstance(items, list):
+                retained_items: list[Any] = []
+                for item in items:
+                    keep, retained = visit(item)
+                    if keep:
+                        retained_items.append(retained)
+                value["items"] = retained_items
+            return True, value
+        if isinstance(value, list):
+            retained_values: list[Any] = []
+            for item in value:
+                keep, retained = visit(item)
+                if keep:
+                    retained_values.append(retained)
+            return True, retained_values
+        return True, value
+
+    staged: list[Any] = []
+    for document in documents:
+        keep, retained = visit(document)
+        if keep:
+            staged.append(retained)
+    return staged, cutover
+
+
+def _ensure_prometheus_discovery_rbac(documents: list[Any], *, namespace: str) -> None:
+    """Bind Prometheus to the minimal Kubernetes SD read surface.
+
+    The discovery job uses the ``endpoints`` role, which needs read access to
+    namespaces, Services, Endpoints and (on clusters that enrich endpoint
+    targets from Pods) Pods.  No Job/Pod mutation or Secret access is granted
+    here; the adapter keeps its separate, existing ServiceAccount.
+    """
+
+    config = _find_resource(documents, kind="configmap", name="prometheus-config")
+    deployment = _find_resource(documents, kind="deployment", name="prometheus")
+    if config is None or deployment is None:
+        return
+
+    service_account = _find_resource(
+        documents, kind="serviceaccount", name=_PROMETHEUS_DISCOVERY_SERVICE_ACCOUNT
+    )
+    if service_account is None:
+        documents.append(
+            {
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": _PROMETHEUS_DISCOVERY_SERVICE_ACCOUNT,
+                    "namespace": namespace,
+                },
+            }
+        )
+    else:
+        metadata = service_account.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            metadata["namespace"] = namespace
+
+    role = _find_resource(documents, kind="clusterrole", name=_PROMETHEUS_DISCOVERY_ROLE)
+    role_payload = {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {"name": _PROMETHEUS_DISCOVERY_ROLE},
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": ["namespaces", "services", "endpoints", "pods"],
+                "verbs": ["get", "list", "watch"],
+            }
+        ],
+    }
+    if role is None:
+        documents.append(role_payload)
+    else:
+        role["rules"] = role_payload["rules"]
+
+    binding = _find_resource(documents, kind="clusterrolebinding", name=_PROMETHEUS_DISCOVERY_ROLE)
+    binding_payload = {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {"name": _PROMETHEUS_DISCOVERY_ROLE},
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": _PROMETHEUS_DISCOVERY_ROLE,
+        },
+        "subjects": [
+            {
+                "kind": "ServiceAccount",
+                "name": _PROMETHEUS_DISCOVERY_SERVICE_ACCOUNT,
+                "namespace": namespace,
+            }
+        ],
+    }
+    if binding is None:
+        documents.append(binding_payload)
+    else:
+        binding["roleRef"] = binding_payload["roleRef"]
+        binding["subjects"] = binding_payload["subjects"]
+
+    for pod_spec in _pod_specs(deployment):
+        pod_spec["serviceAccountName"] = _PROMETHEUS_DISCOVERY_SERVICE_ACCOUNT
+        pod_spec["automountServiceAccountToken"] = True
 
 
 def _set_support_runtime_bindings(document: Any, bindings: Mapping[str, str]) -> None:
@@ -403,8 +814,6 @@ def _set_support_runtime_bindings(document: Any, bindings: Mapping[str, str]) ->
             image = bindings["prometheus_image"]
         elif name == "prometheus-adapter":
             image = bindings["prometheus_adapter_image"]
-        elif name == "backlog-metric-source":
-            image = bindings["backlog-metric-source_image"]
         if image is not None:
             for pod_spec in _pod_specs(document):
                 containers = (
@@ -493,14 +902,31 @@ def _set_support_config_rollout_annotations(documents: Iterable[Any]) -> None:
             annotations[annotation_key] = digest
 
 
-def _inject_prometheus_scrape_target(documents: list[Any], *, namespace: str) -> None:
-    """Add the production exporter target while isolating synthetic series."""
+def _inject_prometheus_scrape_target(
+    documents: list[Any],
+    *,
+    namespace: str,
+    compatibility_namespaces: Sequence[str] = (),
+) -> None:
+    """Configure authoritative performance and disposable-gate scraping.
 
-    if not _NAMESPACE_RE.fullmatch(namespace):
+    The fixed performance namespace is a direct, explicit target.  Disposable
+    runtime-gate namespaces cannot be known at render time, so Prometheus uses
+    Kubernetes Endpoints discovery and keeps only the exporter Service objects
+    carrying the runtime-gate owner, run-nonce and cluster-fingerprint labels.
+    All other discovered targets are dropped before scraping.  There is no
+    fallback value: a failed/503 scrape remains an absent or ``up=0`` target,
+    never a fabricated zero backlog.
+    """
+
+    namespaces = (namespace, *compatibility_namespaces)
+    if len(set(namespaces)) != len(namespaces) or any(
+        not _NAMESPACE_RE.fullmatch(item) for item in namespaces
+    ):
         raise RuntimeSupportRenderError(
-            "kubernetes.performance.namespace must be a valid Kubernetes namespace"
+            "external metric scrape namespaces must be unique Kubernetes namespaces"
         )
-    target = f"trpc-backlog-exporter.{namespace}.svc:9100"
+    targets = [f"trpc-backlog-exporter.{item}.svc:9100" for item in namespaces]
     config_maps = [
         document
         for document in documents
@@ -529,58 +955,120 @@ def _inject_prometheus_scrape_target(documents: list[Any], *, namespace: str) ->
         raise RuntimeSupportRenderError("prometheus.yml has no scrape_configs")
 
     jobs: list[dict[str, Any]] = []
-    synthetic_jobs: list[dict[str, Any]] = []
     for raw_job in raw_jobs:
         if not isinstance(raw_job, dict):
             raise RuntimeSupportRenderError("prometheus.yml contains an invalid scrape job")
         job = copy.deepcopy(raw_job)
-        static_configs = job.get("static_configs")
-        if isinstance(static_configs, list):
-            filtered_static: list[Any] = []
-            for static in static_configs:
-                if not isinstance(static, dict):
-                    filtered_static.append(static)
-                    continue
-                targets = static.get("targets")
-                if isinstance(targets, list):
-                    static["targets"] = [value for value in targets if value != target]
-                    if any(
-                        isinstance(value, str) and "backlog-metric-source" in value
-                        for value in targets
-                    ):
-                        synthetic_jobs.append(job)
-                filtered_static.append(static)
-            job["static_configs"] = filtered_static
+        job_name = job.get("job_name")
+        if job_name in _SYNTHETIC_BACKLOG_JOB_NAMES:
+            continue
+        if job_name in {_PROMETHEUS_PRODUCTION_JOB, _PROMETHEUS_RUNTIME_GATE_JOB}:
+            continue
+
+        # Remove any legacy source reference even when it is nested in a
+        # copied scrape configuration.  A whole legacy job is discarded so a
+        # stale metric relabel rule cannot survive with an empty target list.
+        def contains_synthetic_reference(value: Any) -> bool:
+            if isinstance(value, str):
+                return "backlog-metric-source" in value
+            if isinstance(value, Mapping):
+                return any(contains_synthetic_reference(item) for item in value.values())
+            if isinstance(value, list):
+                return any(contains_synthetic_reference(item) for item in value)
+            return False
+
+        if contains_synthetic_reference(job):
+            continue
         jobs.append(job)
 
-    # Do not let the ephemeral source emit a second series for the production
-    # namespace when the support template is reused in the same cluster.
-    drop_rule = {
-        "source_labels": ["namespace"],
-        "regex": f"^{re.escape(namespace)}$",
-        "action": "drop",
-    }
-    for job in synthetic_jobs:
-        relabels = job.get("metric_relabel_configs")
-        relabels = relabels if isinstance(relabels, list) else []
-        relabels = [
-            item
-            for item in relabels
-            if not (
-                isinstance(item, Mapping)
-                and item.get("source_labels") == ["namespace"]
-                and item.get("action") == "drop"
-                and item.get("regex") == drop_rule["regex"]
-            )
-        ]
-        relabels.append(drop_rule)
-        job["metric_relabel_configs"] = relabels
-
-    jobs = [job for job in jobs if job.get("job_name") != "trpc-session-ready-backlog-production"]
     jobs.append(
         {
-            "job_name": "trpc-session-ready-backlog-production",
-            "static_configs": [{"targets": [target]}],
+            "job_name": _PROMETHEUS_PRODUCTION_JOB,
+            "static_configs": [{"targets": targets}],
+            "metric_relabel_configs": [
+                {
+                    "source_labels": ["__name__"],
+                    "regex": _BACKLOG_METRIC_REGEX,
+                    "action": "keep",
+                }
+            ],
+        }
+    )
+    jobs.append(
+        {
+            "job_name": _PROMETHEUS_RUNTIME_GATE_JOB,
+            "kubernetes_sd_configs": [{"role": "endpoints"}],
+            "relabel_configs": [
+                {
+                    "source_labels": ["__meta_kubernetes_namespace"],
+                    "regex": _RUNTIME_GATE_NAMESPACE_REGEX,
+                    "action": "keep",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_service_name"],
+                    "regex": r"^trpc-backlog-exporter$",
+                    "action": "keep",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_service_label_trpc_io_managed_by"],
+                    "regex": r"^trpc-kubernetes-runtime-gate$",
+                    "action": "keep",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_service_label_trpc_io_run_nonce"],
+                    "regex": _RUNTIME_GATE_NONCE_REGEX,
+                    "action": "keep",
+                },
+                {
+                    "source_labels": [
+                        "__meta_kubernetes_service_label_trpc_io_cluster_fingerprint"
+                    ],
+                    "regex": _RUNTIME_GATE_CLUSTER_FINGERPRINT_REGEX,
+                    "action": "keep",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_endpoint_port_name"],
+                    "regex": r"^metrics$",
+                    "action": "keep",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_endpoint_ready"],
+                    "regex": r"^true$",
+                    "action": "keep",
+                },
+                {
+                    "source_labels": [
+                        "__meta_kubernetes_namespace",
+                        "__meta_kubernetes_service_label_trpc_io_run_nonce",
+                    ],
+                    "regex": r"^trpc-runtime-gate-[0-9a-f]{10};[0-9a-f]{32}$",
+                    "action": "keep",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_namespace"],
+                    "target_label": "namespace",
+                    "action": "replace",
+                },
+                {
+                    "source_labels": ["__meta_kubernetes_service_label_trpc_io_run_nonce"],
+                    "target_label": "run_nonce",
+                    "action": "replace",
+                },
+                {
+                    "source_labels": [
+                        "__meta_kubernetes_service_label_trpc_io_cluster_fingerprint"
+                    ],
+                    "target_label": "cluster_fingerprint",
+                    "action": "replace",
+                },
+            ],
+            "metric_relabel_configs": [
+                {
+                    "source_labels": ["__name__"],
+                    "regex": _BACKLOG_METRIC_REGEX,
+                    "action": "keep",
+                }
+            ],
         }
     )
     prometheus["scrape_configs"] = jobs
@@ -618,8 +1106,23 @@ def render_runtime_support(
     support_template: str | Path = DEFAULT_SUPPORT_TEMPLATE,
     minio_template: str | Path = DEFAULT_MINIO_TEMPLATE,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    mode: str = "full",
+    cutover_output: str | Path | None = None,
 ) -> tuple[Path, Path]:
-    """Render both templates and return ``(support_yaml, minio_yaml)`` paths."""
+    """Render both templates and return ``(support_yaml, minio_yaml)`` paths.
+
+    ``full`` keeps the APIService in the support manifest for a clean-cluster
+    deployment.  ``stage`` omits it and writes a separate one-object cutover
+    manifest, allowing a second provider to be reviewed before switching the
+    cluster-scoped external-metrics registration.
+    """
+
+    if mode not in _RUNTIME_SUPPORT_MODES:
+        raise RuntimeSupportRenderError(
+            f"runtime-support render mode must be one of {sorted(_RUNTIME_SUPPORT_MODES)}"
+        )
+    if cutover_output is not None and mode != "stage":
+        raise RuntimeSupportRenderError("cutover-output requires --mode stage")
     config_path = Path(config)
     support_template_path = Path(support_template)
     minio_template_path = Path(minio_template)
@@ -629,11 +1132,13 @@ def render_runtime_support(
     values = _support_values(loaded_config)
     support_documents = render_documents(_read_documents(support_template_path), values)
     minio_documents = render_documents(_read_documents(minio_template_path), values)
+    _drop_synthetic_backlog_resources(support_documents)
     support_bindings = _support_runtime_bindings(loaded_config)
     if support_bindings is not None:
         for document in (*support_documents, *minio_documents):
             _set_support_runtime_bindings(document, support_bindings)
     performance = _field(loaded_config, "performance")
+    support = _field(loaded_config, "support")
     performance_namespace = _field(performance, "namespace") if performance is not None else None
     if performance_namespace is not None:
         if not isinstance(performance_namespace, str) or not performance_namespace.strip():
@@ -643,7 +1148,18 @@ def render_runtime_support(
         _inject_prometheus_scrape_target(
             support_documents,
             namespace=performance_namespace.strip(),
+            compatibility_namespaces=tuple(
+                _field(support, "external_metric_compatibility_namespaces") or ()
+            ),
         )
+    _ensure_prometheus_discovery_rbac(
+        support_documents,
+        namespace=values["namespace"],
+    )
+    _set_provider_resource_identity(
+        support_documents,
+        namespace=values["namespace"],
+    )
     if support_bindings is not None:
         _set_support_config_rollout_annotations(support_documents)
     support_output, minio_output = _output_paths(
@@ -651,14 +1167,40 @@ def render_runtime_support(
         minio_template_path,
         output_dir_path,
     )
+    cutover_output_path = (
+        _cutover_output_path(output_dir_path, cutover_output) if mode == "stage" else None
+    )
+    if cutover_output_path is not None:
+        if cutover_output_path.resolve() in {
+            support_output.resolve(),
+            minio_output.resolve(),
+            support_template_path.resolve(),
+            minio_template_path.resolve(),
+        }:
+            raise RuntimeSupportRenderError(
+                f"refusing to overwrite support or MinIO output/template {cutover_output_path}"
+            )
+        support_documents, support_cutover = _split_stage_documents(support_documents)
+        minio_documents, minio_cutover = _split_stage_documents(minio_documents)
+        cutover_documents = [*support_cutover, *minio_cutover]
+        if len(cutover_documents) != 1:
+            raise RuntimeSupportRenderError(
+                "stage mode requires exactly one APIService for the cutover manifest"
+            )
+    else:
+        cutover_documents = []
     try:
         output_dir_path.mkdir(parents=True, exist_ok=True)
+        if cutover_output_path is not None:
+            cutover_output_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeSupportRenderError(
             f"cannot create rendered-manifest directory {output_dir_path}: {exc}"
         ) from exc
     _write_documents(support_documents, support_output)
     _write_documents(minio_documents, minio_output)
+    if cutover_output_path is not None:
+        _write_documents(cutover_documents, cutover_output_path)
     return support_output, minio_output
 
 
@@ -726,7 +1268,7 @@ def _performance_manifest_values(config: Any, performance: Any) -> dict[str, str
     return values
 
 
-def _performance_workload_patch(documents: list[Any], performance: Any) -> None:
+def _performance_workload_patch(documents: list[Any], performance: Any, config: Any) -> None:
     """Bind the configured workload placement and role env to Deployment patches."""
 
     workload = _field(performance, "workload")
@@ -740,6 +1282,14 @@ def _performance_workload_patch(documents: list[Any], performance: Any) -> None:
             "runtime config kubernetes.performance.workload.node_label is invalid"
         )
     node_key, node_value = node_label.split("=", 1)
+    node_name = _field(config, "node_name")
+    if not isinstance(node_name, str) or not node_name.strip():
+        raise RuntimeSupportRenderError("runtime config kubernetes.node.name is invalid")
+    node_selector = {node_key: node_value, "kubernetes.io/hostname": node_name.strip()}
+    if node_key == "kubernetes.io/hostname" and node_value != node_name.strip():
+        raise RuntimeSupportRenderError(
+            "runtime workload node label conflicts with kubernetes.node.name"
+        )
     roles = {
         "trpc-gateway": (
             "gateway",
@@ -793,9 +1343,19 @@ def _performance_workload_patch(documents: list[Any], performance: Any) -> None:
         ),
     }
     for document in documents:
-        if not isinstance(document, dict) or _kind(document) != "deployment":
+        if not isinstance(document, dict):
             continue
         name = _name(document)
+        kind = _kind(document)
+        if not (
+            (kind == "deployment" and name in {*roles, "trpc-backlog-exporter"})
+            or (kind == "job" and name == "trpc-schema-migration")
+        ):
+            continue
+        spec = document.setdefault("spec", {})
+        template = spec.setdefault("template", {})
+        pod_spec = template.setdefault("spec", {})
+        pod_spec["nodeSelector"] = node_selector
         if name not in roles:
             continue
         container_name, raw_environment = roles[name]
@@ -803,10 +1363,6 @@ def _performance_workload_patch(documents: list[Any], performance: Any) -> None:
             raise RuntimeSupportRenderError(
                 f"runtime config workload settings are incomplete for {name}"
             )
-        spec = document.setdefault("spec", {})
-        template = spec.setdefault("template", {})
-        pod_spec = template.setdefault("spec", {})
-        pod_spec["nodeSelector"] = {node_key: node_value}
         containers = pod_spec.setdefault("containers", [])
         container = next(
             (
@@ -834,6 +1390,7 @@ def _render_performance_file(
     image_repository: str,
     image_digest: str,
     relative_base: str,
+    support_namespace: str,
 ) -> None:
     documents = _read_documents(source)
     rendered = copy.deepcopy(documents)
@@ -884,8 +1441,25 @@ def _render_performance_file(
                 spec = document.setdefault("spec", {})
                 spec["replicas"] = int(replicas[name])
     elif source.name == "performance-workload-patch.yaml":
-        _performance_workload_patch(rendered, performance)
+        _performance_workload_patch(rendered, performance, config)
+    _render_support_namespace_references(
+        rendered,
+        namespace=support_namespace,
+        rewrite_resource_metadata=False,
+    )
     _write_documents(rendered, target)
+
+
+def _render_performance_base_file(source: Path, *, support_namespace: str) -> None:
+    """Rewrite support references in a copied base file in place."""
+
+    documents = copy.deepcopy(_read_documents(source))
+    _render_support_namespace_references(
+        documents,
+        namespace=support_namespace,
+        rewrite_resource_metadata=False,
+    )
+    _write_documents(documents, source)
 
 
 def render_performance_overlay(
@@ -913,12 +1487,15 @@ def render_performance_overlay(
     loaded_config = _load_runtime_gate_config(config_path)
     performance = _performance_config(loaded_config)
     image_repository, image_digest = _performance_image(loaded_config)
+    support_namespace = _support_namespace(loaded_config)
     base_path = (template_path.parent.parent / "base").resolve()
     rendered_base = output_path / "base"
     relative_base = "base"
     try:
         output_path.mkdir(parents=True, exist_ok=True)
         shutil.copytree(base_path, rendered_base, dirs_exist_ok=True)
+        for copied_file in sorted(rendered_base.rglob("*.yaml")):
+            _render_performance_base_file(copied_file, support_namespace=support_namespace)
         for source in sorted(template_path.glob("*.yaml")):
             _render_performance_file(
                 source,
@@ -928,6 +1505,7 @@ def render_performance_overlay(
                 image_repository=image_repository,
                 image_digest=image_digest,
                 relative_base=relative_base,
+                support_namespace=support_namespace,
             )
     except OSError as exc:
         raise RuntimeSupportRenderError(
@@ -972,6 +1550,21 @@ def _parser() -> argparse.ArgumentParser:
         help=f"separate directory for rendered YAML (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--mode",
+        choices=sorted(_RUNTIME_SUPPORT_MODES),
+        default="full",
+        help="full applies APIService with the support resources; stage writes it separately",
+    )
+    parser.add_argument(
+        "--cutover-output",
+        type=Path,
+        default=None,
+        help=(
+            "optional one-object APIService output path; only valid with --mode stage "
+            f"(default: <output-dir>/{_DEFAULT_CUTOVER_OUTPUT_NAME})"
+        ),
+    )
+    parser.add_argument(
         "--performance-output-dir",
         type=Path,
         default=None,
@@ -991,6 +1584,8 @@ def main(argv: list[str] | None = None) -> int:
             support_template=args.support_template,
             minio_template=args.minio_template,
             output_dir=args.output_dir,
+            mode=args.mode,
+            cutover_output=args.cutover_output,
         )
         performance_output = (
             render_performance_overlay(
@@ -1008,6 +1603,11 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "support": str(support_output),
                 "minio": str(minio_output),
+                **(
+                    {"cutover": str(_cutover_output_path(args.output_dir, args.cutover_output))}
+                    if args.mode == "stage"
+                    else {}
+                ),
                 **({"performance": str(performance_output)} if performance_output else {}),
             },
             ensure_ascii=False,

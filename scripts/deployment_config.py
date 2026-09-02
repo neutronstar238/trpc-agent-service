@@ -29,9 +29,10 @@ REGISTRY_HOST_RE = re.compile(
     r"^(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::[1-9][0-9]{0,4})?$"
 )
 KUBERNETES_NAME_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
+DEFAULT_SUPPORT_NAMESPACE = "trpc-runtime-support"
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
-NODE_LABEL_RE = re.compile(r"^trpc-runtime-gate=[A-Za-z0-9_.-]+$")
+NODE_LABEL_RE = re.compile(r"^trpc-cell-fabric-owner=innovation$")
 PERFORMANCE_LABEL_RE = re.compile(
     r"^[A-Za-z0-9](?:[-A-Za-z0-9./_]*[A-Za-z0-9])?=[A-Za-z0-9](?:[-A-Za-z0-9._]*[A-Za-z0-9])?$"
 )
@@ -94,6 +95,7 @@ REQUIRED_SECRET_KEYS = {
 }
 REAL_HPA_BACKLOG_SECRET_KEYS = {
     "trpc-metrics-secrets": {"TRPC_SERVICE_METRICS_DATABASE_DSN"},
+    "trpc-hpa-secrets": {"TRPC_HPA_DATABASE_DSN"},
 }
 
 
@@ -158,6 +160,8 @@ class RuntimeSupportConfig:
     postgres_host_path: str
     redis_host_path: str
     minio_host_path: str
+    external_metric_compatibility_namespaces: tuple[str, ...] = ()
+    namespace: str = DEFAULT_SUPPORT_NAMESPACE
 
     @classmethod
     def from_mapping(cls, value: object) -> RuntimeSupportConfig:
@@ -167,6 +171,7 @@ class RuntimeSupportConfig:
             value,
             path="kubernetes.support",
             allowed={
+                "namespace",
                 "data_node",
                 "postgres_image",
                 "redis_image",
@@ -177,6 +182,7 @@ class RuntimeSupportConfig:
                 "postgres_host_path",
                 "redis_host_path",
                 "minio_host_path",
+                "external_metric_compatibility_namespaces",
             },
             required={
                 "data_node",
@@ -191,6 +197,16 @@ class RuntimeSupportConfig:
                 "minio_host_path",
             },
         )
+        raw_namespace = support.get("namespace", DEFAULT_SUPPORT_NAMESPACE)
+        namespace = _string(raw_namespace, path="kubernetes.support.namespace")
+        if (
+            len(namespace) > 63
+            or KUBERNETES_NAME_RE.fullmatch(namespace) is None
+            or "." in namespace
+        ):
+            raise DeploymentConfigError(
+                "kubernetes.support.namespace must be a valid DNS label within 63 characters"
+            )
         postgres_image = _string(
             support["postgres_image"], path="kubernetes.support.postgres_image"
         )
@@ -217,7 +233,34 @@ class RuntimeSupportConfig:
                 raise DeploymentConfigError(
                     f"kubernetes.support.{name} must be an immutable sha256 reference"
                 )
+        raw_compatibility_namespaces = support.get("external_metric_compatibility_namespaces", [])
+        if (
+            not isinstance(raw_compatibility_namespaces, list)
+            or len(raw_compatibility_namespaces) > 16
+        ):
+            raise DeploymentConfigError(
+                "kubernetes.support.external_metric_compatibility_namespaces "
+                "must be a list with at most 16 entries"
+            )
+        compatibility_namespaces: list[str] = []
+        for index, raw_value in enumerate(raw_compatibility_namespaces):
+            compatibility_namespace = _string(
+                raw_value,
+                path=(f"kubernetes.support.external_metric_compatibility_namespaces[{index}]"),
+            )
+            if (
+                len(compatibility_namespace) > 63
+                or KUBERNETES_NAME_RE.fullmatch(compatibility_namespace) is None
+                or "." in compatibility_namespace
+                or compatibility_namespace in compatibility_namespaces
+            ):
+                raise DeploymentConfigError(
+                    "kubernetes.support.external_metric_compatibility_namespaces "
+                    "must contain unique DNS-label namespaces"
+                )
+            compatibility_namespaces.append(compatibility_namespace)
         return cls(
+            namespace=namespace,
             data_node=_string(support["data_node"], path="kubernetes.support.data_node"),
             postgres_image=postgres_image,
             redis_image=redis_image,
@@ -234,12 +277,14 @@ class RuntimeSupportConfig:
             minio_host_path=_string(
                 support["minio_host_path"], path="kubernetes.support.minio_host_path"
             ),
+            external_metric_compatibility_namespaces=tuple(compatibility_namespaces),
         )
 
     def environment(self) -> dict[str, str]:
         """Project support settings to their explicit runtime environment names."""
 
         return {
+            "TRPC_K8S_SUPPORT_NAMESPACE": self.namespace,
             "TRPC_K8S_SUPPORT_DATA_NODE": self.data_node,
             "TRPC_K8S_SUPPORT_POSTGRES_IMAGE": self.postgres_image,
             "TRPC_K8S_SUPPORT_REDIS_IMAGE": self.redis_image,
@@ -250,6 +295,9 @@ class RuntimeSupportConfig:
             "TRPC_K8S_SUPPORT_POSTGRES_HOST_PATH": self.postgres_host_path,
             "TRPC_K8S_SUPPORT_REDIS_HOST_PATH": self.redis_host_path,
             "TRPC_K8S_SUPPORT_MINIO_HOST_PATH": self.minio_host_path,
+            "TRPC_K8S_SUPPORT_EXTERNAL_METRIC_COMPATIBILITY_NAMESPACES": json.dumps(
+                self.external_metric_compatibility_namespaces, separators=(",", ":")
+            ),
         }
 
 
@@ -432,6 +480,7 @@ class PerformanceRunnerConfig:
     worker_concurrency: int
     workload: PerformanceWorkloadConfig
     fixture_secret_env_names: tuple[str, ...]
+    node_name: str | None = None
 
     @property
     def node_selector(self) -> dict[str, str]:
@@ -490,6 +539,13 @@ class PerformanceRunnerConfig:
                 "TRPC_PERF_K8S_LOAD_DRIVER_MEMORY_LIMIT": self.resources.limit_memory,
             }
         )
+        if self.node_name is not None:
+            values.update(
+                {
+                    "TRPC_PERF_K8S_RUNNER_NODE_NAME": self.node_name,
+                    "TRPC_PERF_K8S_LOAD_DRIVER_NODE_NAME": self.node_name,
+                }
+            )
         return values
 
 
@@ -656,9 +712,22 @@ def _performance_runner(value: object) -> PerformanceRunnerConfig:
     runner = _mapping(
         performance["runner"],
         path="kubernetes.performance.runner",
-        allowed={"node_label", "taint", "resources", "max_inflight", "db_pool_size"},
+        allowed={
+            "node_name",
+            "node_label",
+            "taint",
+            "resources",
+            "max_inflight",
+            "db_pool_size",
+        },
         required={"node_label", "taint", "resources", "max_inflight", "db_pool_size"},
     )
+    raw_node_name = runner.get("node_name")
+    node_name = None
+    if raw_node_name is not None:
+        node_name = _string(raw_node_name, path="kubernetes.performance.runner.node_name")
+        if KUBERNETES_NAME_RE.fullmatch(node_name) is None:
+            raise DeploymentConfigError("kubernetes.performance.runner.node_name is invalid")
     node_label = _performance_label(
         runner["node_label"], path="kubernetes.performance.runner.node_label"
     )
@@ -877,6 +946,7 @@ def _performance_runner(value: object) -> PerformanceRunnerConfig:
         worker_concurrency=worker_concurrency,
         workload=workload_config,
         fixture_secret_env_names=fixture_secret_env_names,
+        node_name=node_name,
     )
 
 
@@ -1027,6 +1097,11 @@ class RuntimeGateConfig:
             )
         binding = _image_references(self.image_binding)[2]
         resolved_images = self.resolved_image_references()
+        resolved_hpa_job_image = _rewrite_image_registry(self.hpa_job_image, self.pull_registry)
+        if resolved_hpa_job_image != resolved_images["initial"]:
+            raise DeploymentConfigError(
+                "kubernetes.hpa.job_image must match the resolved initial runtime image"
+            )
         release_binding = binding.get("release_binding")
         binding_release = (
             release_binding.get("release_id") if isinstance(release_binding, Mapping) else None
@@ -1062,7 +1137,9 @@ class RuntimeGateConfig:
             "TRPC_K8S_RUNTIME_HPA_DRIVER_KUBECONFIG": str(self.hpa_kubeconfig),
             "TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT": self.hpa_subject,
             "TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT": self.hpa_context,
-            "TRPC_K8S_RUNTIME_HPA_JOB_IMAGE": self.hpa_job_image,
+            # The Job is created by the runtime gate, so it must pull the same
+            # immutable runtime bytes from the configured ACK/Xuanyuan host.
+            "TRPC_K8S_RUNTIME_HPA_JOB_IMAGE": resolved_hpa_job_image,
             "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND": json.dumps(
                 self.hpa_job_command, separators=(",", ":")
             ),
@@ -1085,11 +1162,31 @@ class RuntimeGateConfig:
             )
         if self.support is not None:
             environment.update(self.support.environment())
+            environment["TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE"] = self.support.namespace
         if self.performance is not None:
             environment.update(self.performance.environment())
             initial_image = resolved_images["initial"]
             environment["TRPC_PERF_K8S_IMAGE"] = initial_image
             environment["TRPC_PERF_K8S_IMAGE_DIGEST"] = initial_image.rsplit("@", 1)[1]
+            if self.performance.node_name is not None:
+                # HPA load Jobs run on the dedicated runner node, which is
+                # distinct from the controlled runtime-gate node above.
+                label_key, label_value = self.performance.node_label.split("=", 1)
+                environment.update(
+                    {
+                        "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_NODE_NAME": self.performance.node_name,
+                        "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_NODE_LABEL": (
+                            f"{label_key}={label_value}"
+                        ),
+                        "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_KEY": self.performance.taint_key,
+                        "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_VALUE": (
+                            self.performance.taint_value
+                        ),
+                        "TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_EFFECT": (
+                            self.performance.taint_effect
+                        ),
+                    }
+                )
         return environment
 
     @property
@@ -1101,9 +1198,10 @@ class RuntimeGateConfig:
     def required_secret_keys(self) -> dict[str, set[str]]:
         """Return the secret contract for this deployment mode.
 
-        The metrics Secret is required only by configurations that explicitly
-        enable the real HPA backlog path.  Existing runtime-gate configurations
-        that leave that capability disabled retain the legacy contract.
+        The metrics and least-privilege HPA Secrets are required only by
+        configurations that explicitly enable the real backlog path. Existing
+        runtime-gate configurations that leave it disabled retain the legacy
+        contract.
         """
 
         required = {name: set(keys) for name, keys in REQUIRED_SECRET_KEYS.items()}
@@ -1219,7 +1317,7 @@ def load_runtime_gate_config(path: Path) -> RuntimeGateConfig:
     drain_confirmation = _string(
         node["drain_confirmation"], path="kubernetes.node.drain_confirmation"
     )
-    if drain_confirmation != "I_UNDERSTAND_ISOLATED_NODE_DRAIN":
+    if drain_confirmation != "I_UNDERSTAND_HARD_NODE_FAILURE_PDB_BYPASS":
         raise DeploymentConfigError("kubernetes.node.drain_confirmation is invalid")
     hpa = _mapping(
         kubernetes["hpa"],

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Freeze one source fingerprint and immutable registry image set for a release run."""
 
 from __future__ import annotations
@@ -6,15 +7,26 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# A direct file launch puts ``scripts`` rather than this checkout at
+# ``sys.path[0]``.  Pin sibling imports to the checkout that owns this file so
+# an interpreter installed from another checkout cannot validate the wrong
+# source tree.
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+_REPO_IMPORT_ROOT_STR = str(_REPO_IMPORT_ROOT)
+while _REPO_IMPORT_ROOT_STR in sys.path:
+    sys.path.remove(_REPO_IMPORT_ROOT_STR)
+sys.path.insert(0, _REPO_IMPORT_ROOT_STR)
+
 from scripts.evidence_lineage import canonical_sha256, current_release_binding, source_fingerprint
 from scripts.report_io import atomic_write_json
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = _REPO_IMPORT_ROOT
 IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 REFERENCE_RE = re.compile(r"^[^\s:@]+(?::[0-9]+)?(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
 

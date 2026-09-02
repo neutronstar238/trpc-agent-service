@@ -209,6 +209,7 @@ async def test_enabled_v2_worker_passes_controller_to_tool_and_claim_runtime(
         "trpc_service.agent.factory.DevelopmentAgentLoader",
         "trpc_service.agent.factory.ProductionAgentLoader",
         "trpc_service.agent.worker.AgentWorker",
+        "trpc_service.cell.worker_journal.PostgresCellRuntimeJournal",
         "trpc_service.channels.feishu.FeishuAdapter",
         "trpc_service.channels.media_locator.WeComMediaLocatorCipher",
         "trpc_service.channels.wecom.WeComMediaDownloader",

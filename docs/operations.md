@@ -70,6 +70,21 @@ candidate lock，在集群内创建临时 `trpc-dr-functional-*` Namespace；Nam
 恢复，密钥检查使用临时 Secret 中的合成 wrapping key；因此它只能证明功能链路，不能代替生产 PITR、
 异地对象冗余或外部 KMS。三个 Job 会一起提交，完成后收集 Kubernetes API 与 Job 输出证据，成功或失败
 都会按 Namespace UID 校验后清理临时 Namespace，报告固定为 `production_gate=not_run`。
+该功能验收使用单副本和 `emptyDir`，节点/Pod 重建会丢失临时状态，不能证明生产持久性、跨区冗余或
+RPO/RTO；生产灾备必须使用独立的高可用副本、持久卷/对象版本、跨区备份和 KMS 恢复门禁。
+
+ACK support 栈必须先由 renderer 从同一份配置生成：
+
+```powershell
+python -m scripts.render_runtime_support `
+  --config deploy/runtime-gate.yaml `
+  --output-dir runs/multitenant/rendered/ack-support
+```
+
+只允许 apply `runs/multitenant/rendered/ack-support/` 下的输出，不得直接 apply
+`runs/multitenant/ack-runtime-support.yaml` 模板。若输出包含
+`APIService.spec.insecureSkipTLSVerify: true`，它只属于隔离验收 support adapter，禁止复制到生产
+overlay。
 
 执行时先准备配置文件和当前 nonce，再显式开启：
 

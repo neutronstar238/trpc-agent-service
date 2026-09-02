@@ -10,7 +10,9 @@ node snapshot, so the same inputs produce the same decision on every gateway.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from math import isfinite
+from typing import Protocol
 
 from trpc_service.cell.capsule import SLOProfile
 
@@ -100,6 +102,11 @@ class CellPlacementRequest:
     cpu_millis: int = 100
     memory_mb: int = 128
     max_cost_per_hour: float | None = None
+    # Placement is a CellAddress concern too.  Defaults keep old scheduler
+    # call sites valid while durable reservations can use the full identity.
+    app_id: str = "default"
+    session_id: str = "default"
+    branch_id: str = "main"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cell_id", _non_empty(self.cell_id, "cell_id"))
@@ -109,6 +116,9 @@ class CellPlacementRequest:
             "capsule_digest",
             _non_empty(self.capsule_digest, "capsule_digest"),
         )
+        object.__setattr__(self, "app_id", _non_empty(self.app_id, "app_id"))
+        object.__setattr__(self, "session_id", _non_empty(self.session_id, "session_id"))
+        object.__setattr__(self, "branch_id", _non_empty(self.branch_id, "branch_id"))
         for field_name in (
             "required_capabilities",
             "preferred_capabilities",
@@ -132,6 +142,10 @@ class NodeSnapshot:
     node_id: str
     region: str
     capacity_cpu_millis: int
+    # Producer-owned monotonic marker for the snapshot.  It is deliberately
+    # required: a caller must persist and supply a source revision rather than
+    # silently publishing an un-fenced ``0`` observation.
+    observed_generation: int
     used_cpu_millis: int = 0
     capacity_memory_mb: int = 1
     used_memory_mb: int = 0
@@ -154,6 +168,12 @@ class NodeSnapshot:
             raise ValueError("node capacities must be positive")
         if self.used_cpu_millis < 0 or self.used_memory_mb < 0 or self.active_cells < 0:
             raise ValueError("node usage cannot be negative")
+        if (
+            isinstance(self.observed_generation, bool)
+            or not isinstance(self.observed_generation, int)
+            or self.observed_generation < 1
+        ):
+            raise ValueError("observed_generation must be a positive integer")
         if not isfinite(self.estimated_latency_ms) or self.estimated_latency_ms <= 0:
             raise ValueError("estimated_latency_ms must be finite and positive")
         if not isfinite(self.cost_per_hour) or self.cost_per_hour < 0:
@@ -188,6 +208,88 @@ class PlacementDecision:
     @property
     def winner(self) -> PlacementCandidate:
         return self.candidates[0]
+
+
+class ReservationConflict(RuntimeError):
+    """The authoritative placement store rejected a stale/over-capacity claim."""
+
+
+@dataclass(frozen=True, slots=True)
+class PlacementReservation:
+    """A durable lease over the resources selected by the scheduler.
+
+    The snapshot used by :meth:`CellScheduler.place` is advisory.  A
+    persistent implementation must atomically re-check capacity and insert
+    this lease under a row lock; callers must not treat a ``PlacementDecision``
+    as a reservation until this object is returned.
+    """
+
+    reservation_id: str
+    tenant_id: str
+    cell_id: str
+    node_id: str
+    owner_id: str
+    lease_epoch: int
+    expires_at: datetime
+    cpu_millis: int
+    memory_mb: int
+    decision: PlacementDecision
+    app_id: str = "default"
+    session_id: str = "default"
+    capsule_digest: str = "default"
+    branch_id: str = "main"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "reservation_id",
+            "tenant_id",
+            "cell_id",
+            "node_id",
+            "owner_id",
+            "app_id",
+            "session_id",
+            "capsule_digest",
+            "branch_id",
+        ):
+            _non_empty(getattr(self, name), name)
+        if self.lease_epoch < 1:
+            raise ValueError("lease_epoch must be positive")
+        if self.cpu_millis <= 0 or self.memory_mb <= 0:
+            raise ValueError("reservation resources must be positive")
+        if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
+            raise ValueError("reservation expiry must be timezone-aware")
+
+
+class PlacementReservationStore(Protocol):
+    """Durable reservation contract used to close the snapshot oversell race."""
+
+    async def reserve(
+        self,
+        request: CellPlacementRequest,
+        decision: PlacementDecision,
+        *,
+        owner_id: str,
+        lease_seconds: float = 30.0,
+        reservation_id: str | None = None,
+    ) -> PlacementReservation:
+        """Atomically reserve the decision or raise ``ReservationConflict``."""
+
+    async def renew(
+        self,
+        reservation: PlacementReservation,
+        *,
+        owner_id: str | None = None,
+        lease_seconds: float = 30.0,
+    ) -> PlacementReservation:
+        """CAS-renew a lease owned by the current fencing epoch."""
+
+    async def release(
+        self,
+        reservation: PlacementReservation,
+        *,
+        owner_id: str | None = None,
+    ) -> None:
+        """Release a lease idempotently, subject to owner/epoch fencing."""
 
 
 class CellScheduler:
@@ -244,6 +346,38 @@ class CellScheduler:
         """Compatibility helper returning only the selected node id."""
 
         return self.place(request, nodes).node_id
+
+    async def place_and_reserve(
+        self,
+        request: CellPlacementRequest,
+        nodes: tuple[NodeSnapshot, ...] | list[NodeSnapshot],
+        reservations: PlacementReservationStore,
+        *,
+        owner_id: str,
+        lease_seconds: float = 30.0,
+        reservation_id: str | None = None,
+    ) -> PlacementReservation:
+        """Score an advisory snapshot, then claim capacity durably.
+
+        The repository is the source of truth: concurrent gateways may choose
+        the same winner, but only one can consume the remaining capacity under
+        its atomic ``reserve`` transaction.  A conflict is surfaced so the
+        caller can refresh snapshots and retry instead of silently
+        overselling a node.
+        """
+
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id cannot be empty")
+        if not isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+        decision = self.place(request, nodes)
+        return await reservations.reserve(
+            request,
+            decision,
+            owner_id=owner_id,
+            lease_seconds=lease_seconds,
+            reservation_id=reservation_id,
+        )
 
     # ``schedule`` reads naturally at call sites that treat placement as a
     # scheduling operation while ``place`` remains the primary API.
@@ -357,5 +491,8 @@ __all__ = [
     "NodeSnapshot",
     "PlacementCandidate",
     "PlacementDecision",
+    "PlacementReservation",
+    "PlacementReservationStore",
+    "ReservationConflict",
     "SchedulerWeights",
 ]

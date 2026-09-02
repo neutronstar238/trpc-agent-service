@@ -25,7 +25,7 @@ from trpc_service.config.settings import Environment
 from trpc_service.tenant.models import ModelPolicy, TenantConfig, validate_model_base_url
 from trpc_service.tool.execution import ToolExecutor
 from trpc_service.tool.governance import GovernancePipeline
-from trpc_service.tool.integration import GovernedTool
+from trpc_service.tool.integration import GovernedTool, GovernedToolObserver
 from trpc_service.tool.test_tool import DETERMINISTIC_FAULT_TOOL_NAME
 
 
@@ -74,12 +74,14 @@ class ProductionAgentLoader:
         tools: dict[str, Any] | None = None,
         governance: GovernancePipeline | None = None,
         tool_executor: ToolExecutor | None = None,
+        tool_observer: GovernedToolObserver | None = None,
         allowed_model_hosts: Collection[str] | None = None,
     ) -> None:
         self._secrets = secrets
         self._tools = dict(tools or {})
         self._governance = governance
         self._tool_executor = tool_executor
+        self._tool_observer = tool_observer
         self._allowed_model_hosts = (
             frozenset(host.lower().rstrip(".") for host in allowed_model_hosts)
             if allowed_model_hosts is not None
@@ -119,6 +121,7 @@ class ProductionAgentLoader:
                 config=config,
                 governance=self._governance,
                 executor=self._tool_executor,
+                observer=self._tool_observer,
             )
             for tool in selected
         ]

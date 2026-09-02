@@ -33,12 +33,44 @@ docker-compose.yml
 scripts/*
 !scripts/*.py
 
+# Keep the deployment image's fingerprint inputs from runs/multitenant while
+# excluding private credentials and generated reports/cache files.
+!runs/
+runs/*
+!runs/multitenant/
+runs/multitenant/*
+!runs/multitenant/ack-runtime-support.yaml
+!runs/multitenant/ack-runtime-minio.yaml
+!runs/multitenant/project_kubernetes_secrets.py
+
 # The gate fingerprints these roots inside the immutable image.  Re-include
 # the same source material that is present in the host checkout; runtime-gate
 # input remains ignored by the fingerprint implementation itself.
 !deploy/
 !deploy/**
+# Re-exclude host-bound deployment inputs after the broad deploy re-include.
+# These files may contain kubeconfig-adjacent settings or credentials and must
+# never enter COPY . . image layers.
+deploy/runtime-gate.yaml
+deploy/yqzl/*.env
+deploy/**/__pycache__/
+deploy/**/*.pyc
 !tests/
+tests/**
 !tests/integration/
 !tests/integration/**
+!tests/simulation/
+!tests/simulation/**
 !docker-compose.yml
+!.github/
+.github/**
+!.github/workflows/
+!.github/workflows/**
+!build.sh
+!clean.sh
+!coverage.sh
+!format.sh
+!lint.sh
+!lint_flake8.sh
+!start.sh
+!stop.sh

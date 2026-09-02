@@ -74,7 +74,7 @@ class FakeRedis:
 
 
 @pytest.mark.asyncio
-async def test_session_ready_codec_has_exact_seven_fields() -> None:
+async def test_session_ready_codec_has_exact_trace_propagating_fields() -> None:
     message = notice()
     encoded = SessionReadyCodec.encode(message)
     assert tuple(encoded) == (
@@ -84,6 +84,7 @@ async def test_session_ready_codec_has_exact_seven_fields() -> None:
         "generation",
         "priority",
         "trace_id",
+        "trace_headers",
         "created_at",
     )
     assert SessionReadyCodec.decode(encoded) == message
@@ -123,6 +124,7 @@ async def test_session_ready_receive_is_v2_only_and_ack_is_explicit() -> None:
         "generation",
         "priority",
         "trace_id",
+        "trace_headers",
         "created_at",
     }
     assert redis.xadd_calls[0][0][0] == SESSION_READY_STREAM_V2

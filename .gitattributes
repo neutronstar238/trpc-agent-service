@@ -1,0 +1,11 @@
+# Keep content-addressed release fingerprints stable across Windows and Linux.
+* text=auto eol=lf
+
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.tar binary
+*.zip binary

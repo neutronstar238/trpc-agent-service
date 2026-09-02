@@ -14,9 +14,12 @@
   `TRPC_IM_ONLINE_PROBE_IDENTITY`）。探针必须回传匹配 digest、运行 nonce 和身份指纹，并逐通道证明
   往返、幂等、媒体、重连。探测器拒绝 userinfo/query/fragment，禁止 HTTP 重定向，也不会跟随重定向后
   的最终 URL；探针响应严格使用有限 JSON，并且必须通过源码绑定的
+  由部署环境从 `deploy/im-probe-trust.example.json` 模板 provision 的
   `deploy/im-probe-trust.json` Ed25519 公钥验证完整响应签名。缺少信任文件或签名时保持 `not_run`。
   `retry_after_seconds` 必须为有限的 0.001–3600 秒，
   `outage_seconds` 必须为有限的 0.001–604800 秒。
+- 当前仓库没有企业微信或飞书的真实线上账号/凭证；因此真实回调、发送、限流、媒体和重连证据保持
+  `not_run`，Fake/离线协议测试不能升级为生产 `pass`。
 - 在线 IM 的 `reconnect`/`prolonged_outage` 只按“单个 connector 进程不可用、冗余 owner 接管并继续
   交付”验收：必须记录旧 owner 释放、新 owner 接管、重新订阅和接管后唯一 marker 的 provider 事件
   与发送 ACK；`prolonged_outage` 的 connector 故障窗口至少 60 秒。两个 WSS 同时断开属于独立的
@@ -29,18 +32,18 @@
 uv sync --extra dev --locked
 uv run ruff format --check .
 uv run ruff check .
-uv run mypy trpc_service
-uv run pytest --cov=trpc_service --cov-branch
+uv run mypy trpc_service scripts
+sh coverage.sh
 docker compose config --quiet
 docker compose up -d --scale worker=4 --scale outbox-dispatcher=2
 kubectl kustomize deploy/kustomize/overlays/production >/dev/null
-python scripts/performance_gate.py
-python scripts/mock_production_gate.py
-python scripts/contract_gate.py fault
-python scripts/contract_gate.py migration
-python scripts/deployment_gate.py
-python scripts/kubernetes_runtime_gate.py
-python scripts/release_gate.py --output runs/multitenant/release-gate-final.json
+uv run python -m scripts.performance_gate
+uv run python -m scripts.mock_production_gate
+uv run python -m scripts.contract_gate fault
+uv run python -m scripts.contract_gate migration
+uv run python -m scripts.deployment_gate
+uv run python -m scripts.kubernetes_runtime_gate
+uv run python -m scripts.release_gate --output runs/multitenant/release-gate-final.json
 ```
 
 `deployment_gate.py` 默认只做静态部署检查：静态清单通过时返回 0，但报告明确为
@@ -52,12 +55,20 @@ python scripts/release_gate.py --output runs/multitenant/release-gate-final.json
 和 Toxiproxy；详见 [真实运行态验收](real-runtime.md)。未提供环境时应执行：
 
 ```bash
-python scripts/real_runtime_gate.py --output runs/multitenant/real-runtime.json
+uv run python -m scripts.real_runtime_gate --output runs/multitenant/real-runtime.json
 ```
 
 该命令只生成 `gate=not_run`。真实执行需要 `TRPC_RUN_REAL_MULTINODE=1`、`--execute`、
 `--use-toxiproxy` 和 `--allow-process-kill`；脚本永远不会删除 Compose 数据卷。
 
+`coverage.sh` 与 CI 均以 `tests/unit` 为候选覆盖范围，随后通过 `uv run python -m scripts.check_coverage` 对
+statement 与 branch 两项分别执行 90% 门禁；pytest 的综合覆盖率不能代替这两个独立结论。
+生成的 `runs/multitenant/coverage-gate.json` 同时记录 `test_scope`、UTC `generated_at`、可得的
+`git_sha` 和源码内容 `source_fingerprint`；提交号只标识基础提交，指纹用于识别未提交的源码变更。
+运行 `release_gate.py` 时默认读取与 `coverage-gate.json` 同目录的 `coverage.json`；若证据文件分开保存，
+使用 `--coverage-report <path>` 指定原始覆盖率报告，release gate 会校验其 SHA-256。
+它还会重新解析原始报告的 `totals`，确认 statement/branch 均达到报告中的不低于 90% 基线，且与
+`coverage-gate.json` 的 candidate 数值完全一致；旧报告、篡改报告或只手写 gate 的报告均会 fail-closed。
 `trpc_service` 行和分支覆盖率均不得低于 90%。真实 PostgreSQL 测试必须使用非 owner runtime 账号，
 构造两个租户相同 app/user/session 标识，验证 API、直接 SQL、Redis key、对象路径和向量 namespace 均
 不能互读。泄漏扫描把测试 token、API key、密码和消息正文作为 canary，扫描日志、span、异常和 JSON
@@ -67,10 +78,10 @@ python scripts/real_runtime_gate.py --output runs/multitenant/real-runtime.json
 `TRPC_TEST_S3_ENDPOINT`、`TRPC_TEST_S3_ACCESS_KEY`、`TRPC_TEST_S3_SECRET_KEY` 和
 `TRPC_TEST_S3_BUCKET` 以及已部署候选镜像的
 `TRPC_TEST_IMAGE_DIGEST=sha256:<64-hex-digest>` 显式启用；执行
-`python scripts/contract_gate.py backend`，并用 `--output`
+`uv run python -m scripts.contract_gate backend`，并用 `--output`
 将报告写入 `runs/multitenant/backend-compose.json`。控制面 E2E 使用
 `TRPC_E2E_DEVELOPMENT_TOKEN` 和
-`TRPC_E2E_POSTGRES_RUNTIME_DSN`，执行 `python scripts/compose_e2e.py`。该报告明确标记为
+`TRPC_E2E_POSTGRES_RUNTIME_DSN`，执行 `uv run python -m scripts.compose_e2e`。该报告明确标记为
 `scope=control_plane`，只证明控制面创建、配置、审计、绑定解析和清理，不是
 callback→mailbox→worker→outbound 的消息 E2E；完整消息 E2E 仍需真实运行态验收。这些变量只能从
 Secret 注入，命令和报告不能打印其值。
@@ -98,9 +109,12 @@ Pytest 默认清除从当前 Shell 继承的真实负载、故障、迁移、Kub
 只有在隔离验收环境中明确添加 `--allow-real-tests` 才会保留这些变量；普通 CI 只运行
 `tests/unit`，不会因为开发机遗留变量意外启动外部验收。
 
-当真实环境暂不可用时，`scripts/mock_production_gate.py` 会执行五组确定性虚拟验收：4 租户/8 Worker
-乱序与重复负载、节点和依赖故障、双租户可恢复迁移、Kubernetes 控制器行为模型，以及企业微信/飞书
-协议 Fake。结果写入 `runs/multitenant/production-mock.json`，并以独立 `simulation_gate` 汇总。报告始终把
+当真实环境暂不可用时，`scripts/mock_production_gate.py` 会执行六组确定性虚拟验收：4 租户/8 Worker
+乱序与重复负载、节点和依赖故障、双租户可恢复迁移、Kubernetes 控制器行为模型、企业微信/飞书
+协议 Fake，以及签名 Capsule、Cell 调度、因果回放和 Intent/Effect 幂等。结果写入
+`runs/multitenant/production-mock.json`，同时记录 UTC `generated_at`、Git SHA（不可用时标记
+`git_sha_status=unavailable`）和源码指纹（不可用时保留 `status=unavailable`），并以独立
+`simulation_gate` 汇总。报告始终把
 `production_gate` 保持为 `not_run`；Mock 通过只能提前发现逻辑错误，不能替代真实网络、进程、存储、
 Kubernetes 控制面和 IM 平台配额。
 
@@ -120,19 +134,19 @@ export TRPC_K8S_RUNTIME_CONTEXT=your-context
 export TRPC_K8S_RUNTIME_IMAGE=<registry-host>/<org>/trpc-agent-service@sha256:<64-hex-digest-a>
 export TRPC_K8S_RUNTIME_UPGRADE_IMAGE=<registry-host>/<org>/trpc-agent-service@sha256:<64-hex-digest-b>
 export TRPC_K8S_RUNTIME_SECRET_MANIFEST=/secure/trpc-runtime-secrets.yaml
-export TRPC_K8S_RUNTIME_HPA_DRIVER=E:/trpc-agent-service/scripts/kubernetes_hpa_load_driver.py
+export TRPC_K8S_RUNTIME_HPA_DRIVER="$(pwd)/scripts/kubernetes_hpa_load_driver.py"
 export TRPC_K8S_RUNTIME_HPA_DRIVER_SHA256=<64-hex-sha256-of-driver>
 export TRPC_K8S_RUNTIME_HPA_DRIVER_KUBECONFIG=/secure/hpa-driver-kubeconfig
-export TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT=system:serviceaccount:runtime-gate:hpa-driver
+export TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT=system:serviceaccount:trpc-runtime-driver:hpa-driver
 export TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT=dedicated-driver-context
 export TRPC_K8S_RUNTIME_HPA_JOB_IMAGE=<registry-host>/<org>/trpc-hpa-backlog@sha256:<64-hex-digest>
 export TRPC_K8S_RUNTIME_HPA_JOB_COMMAND='["python","-m","your_bounded_backlog_probe"]'
 export TRPC_K8S_RUNTIME_NODE_NAME=dedicated-runtime-node
 export TRPC_K8S_RUNTIME_NODE_LABEL=trpc-runtime-gate=dedicated-gate
-export TRPC_K8S_RUNTIME_NODE_DRAIN_CONFIRM=I_UNDERSTAND_ISOLATED_NODE_DRAIN
+export TRPC_K8S_RUNTIME_NODE_DRAIN_CONFIRM=I_UNDERSTAND_HARD_NODE_FAILURE_PDB_BYPASS
 export TRPC_RELEASE_ID=release-<current-candidate>
 export TRPC_RELEASE_NONCE=<same-high-entropy-release-nonce-for-all-gates>
-python scripts/kubernetes_runtime_gate.py --timeout-seconds 900 --require-runtime
+uv run python -m scripts.kubernetes_runtime_gate --timeout-seconds 900 --require-runtime
 ```
 
 PowerShell 等价写法是 `$env:TRPC_K8S_RUNTIME_TESTS_ENABLED = "true"`。Secret 清单必须由外部
@@ -140,6 +154,29 @@ Secret 管理系统生成，至少包含 `trpc-service-secrets` 和 `trpc-migrat
 写入报告、日志或命令输出。生产镜像必须带 registry host 的完整
 `registry/repository@sha256:<64-hex-digest>` 引用；本地 Docker image ID、未限定名、tag-only、
 example/replace 占位镜像会被拒绝，升级镜像必须是可拉取的不同 digest。
+
+ACK 发布链路固定为“DockerHub 推送、轩辕 pull-through 拉取”：先按
+[`registry-release.md`](registry-release.md) 将两个 source-attested candidate manifest 推送到
+`docker.io/<owner>/<repository>`，再在 `deploy/runtime-gate.yaml` 配置不带 scheme/path 的
+`kubernetes.pull_registry=<xuanyuan-registry-host>` 和 `image_pull_secret=xuanyuan-pull`。
+运行时只替换 registry host，repository path 与 `@sha256` digest 必须继续来自同一个
+`candidate-lock.json`；不能直接用 tag 或本地 image ID，也不能把 DockerHub 凭证写入 YAML。
+
+ACK support/MinIO YAML 必须由同一份 `runtime-gate.yaml` 通过 renderer 生成后再 apply；仓库中的
+`runs/multitenant/ack-runtime-support.yaml` 和 `ack-runtime-minio.yaml` 是模板，不是最终部署输入：
+
+```bash
+uv run python -m scripts.render_runtime_support \
+  --config deploy/runtime-gate.yaml \
+  --output-dir runs/multitenant/rendered/ack-support
+kubectl apply -f runs/multitenant/rendered/ack-support/ack-runtime-support.yaml
+kubectl apply -f runs/multitenant/rendered/ack-support/ack-runtime-minio.yaml
+```
+
+启用 Kubernetes 性能拓扑时，额外传入 `--performance-output-dir`，并只对 renderer 输出目录执行
+`kubectl apply -k`。renderer 会绑定轩辕镜像、support namespace、Secret 引用和 scrape 配置；禁止
+手工改模板或直接 apply 旧的静态 support YAML。输出中的 `APIService.spec.insecureSkipTLSVerify: true`
+仅为隔离验收 support adapter 的兼容设置，不能进入生产 overlay 或被解释为安全的生产 TLS 配置。
 
 运行器会先执行 server-side dry-run，然后在随机的 `trpc-runtime-gate-*` namespace 中部署生产
 overlay，检查所有 Deployment readiness、滚动升级、worker 扩容、HPA `AbleToScale=True`、
@@ -153,6 +190,10 @@ preflight 均证明专用的节点上执行；该测试允许删除这些生产 
 digest 注入一次失败 rollout，要求 `rollout undo` 后 readiness 和已知良好 digest 恢复，再继续
 Pod 驱逐与节点 drain。默认本地调用对这种未请求的 `not_run` 返回零，避免离线开发
 误触发集群操作。
+
+节点 drain 是硬故障/PDB bypass 演练，必须使用精确确认值
+`I_UNDERSTAND_HARD_NODE_FAILURE_PDB_BYPASS`；旧的普通 drain 文案不再满足门禁。该演练只允许在
+全量 inventory 和二次 cordon 证明专用节点后执行，并可能删除临时 `/tmp` `emptyDir` 数据。
 
 HPA 负载触发器必须是当前 checkout `scripts/` 目录下的绝对路径、非符号链接 Python 文件；默认驱动
 是 `scripts/kubernetes_hpa_load_driver.py`，它在独立 context 中创建一个单次完成、无重试、带
@@ -175,6 +216,14 @@ RBAC 证明该账号只能在这里创建、查询和删除负载 Job，并读�
 硬链接、内容或权限无法证明时，驱动不会启动。发布验证器会重新计算当前 driver digest，并核对 Job UID、
 nonce、标签和删除证据，不能只信报告中自报的字符串。
 
+ACK 的 HPA 功能探针使用 backlog `averageValue=10` 作为扩缩容目标；在基线为 3 个 worker 时，
+受控的 40 条 backlog 会越过 Kubernetes 默认 10% HPA 容忍区间，预期触发扩容到第 4 个 worker，
+并等待 4 个 worker 全部 Ready，再清理 backlog 并观察回收阶段。这个探针只证明 backlog 指标、HPA
+决策和副本就绪链路工作，不代表吞吐或容量，不能
+替代独立的 200 并发/4 worker 性能门禁。当前租用 ACK 验收中，第 4 个 worker 就绪后观测到节点内存
+requests 约占 95%；这是本次租用节点的验收边界，不是对通用生产容量的承诺，生产容量仍需按实际资源
+规格和负载基准单独评估。
+
 namespace 同时带有 owner、run nonce、集群指纹和 Unix expiry 标签。进程被 kill -9 后，下次运行只会在
 启动阶段清理本工具、当前集群、已过期且标签完整的最多 10 个残留 namespace；未过期、标签缺失或其他
 集群的资源永远不会被删除。
@@ -182,6 +231,10 @@ namespace 同时带有 owner、run nonce、集群指纹和 Unix expiry 标签。
 默认报告为 `runs/multitenant/kubernetes-runtime.json`，其中 `production_gate` 与 `gate` 同步，
 静态 Kustomize 渲染和控制器模型永远不会将运行态 `not_run` 升级为 `pass`。运行前请确保当前
 kube context 使用专用测试权限，并确认镜像、数据库、Redis、对象存储和两个 Secret 都是可用的。
+
+功能灾备验收的 support namespace 使用单副本和 `emptyDir`，只验证合成数据的恢复代码路径；Pod、
+节点或集群丢失时不提供持久性、跨区冗余或生产 RPO/RTO。生产灾备必须另行配置高可用副本、持久卷/
+对象版本、跨区备份和 KMS，并通过独立的 `production_gate` 证据。
 
 ### 本机 kind 低风险运行态验收
 
@@ -192,7 +245,9 @@ kube context 使用专用测试权限，并确认镜像、数据库、Redis、�
 和至少一个 NodeMetrics 样本：
 
 ```powershell
-Set-Location E:\trpc-agent-service
+# Save this snippet under runs/multitenant so the root is derived from its location.
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+Set-Location -LiteralPath $repoRoot
 $ErrorActionPreference = "Stop"
 $kindName = "trpc-runtime-gate-$PID"
 $kindContext = "kind-$kindName"

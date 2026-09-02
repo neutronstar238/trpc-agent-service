@@ -65,6 +65,7 @@ def _add_performance_config(config_path: Path, *, enabled: bool = True) -> None:
         "    postgres_port: 5432\n"
         "    redis_port: 6379\n"
         "    runner:\n"
+        "      node_name: acceptance-load-node\n"
         "      node_label: trpc-role=load-driver\n"
         "      taint:\n"
         "        key: trpc-role\n"
@@ -199,8 +200,8 @@ kubernetes:
     bucket: trpc-artifacts
   node:
     name: acceptance-node
-    label: trpc-runtime-gate=acceptance
-    drain_confirmation: I_UNDERSTAND_ISOLATED_NODE_DRAIN
+    label: trpc-cell-fabric-owner=innovation
+    drain_confirmation: I_UNDERSTAND_HARD_NODE_FAILURE_PDB_BYPASS
   hpa:
     driver: {driver_path}
     kubeconfig: driver.kubeconfig
@@ -230,7 +231,10 @@ def test_load_config_projects_all_runtime_environment(tmp_path: Path) -> None:
     assert environment["TRPC_K8S_RUNTIME_IMAGE"].endswith("1" * 64)
     assert environment["TRPC_K8S_RUNTIME_UPGRADE_IMAGE"].endswith("2" * 64)
     assert environment["TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET"] == "ghcr-pull"
-    assert environment["TRPC_K8S_RUNTIME_HPA_JOB_IMAGE"].endswith("1" * 64)
+    assert (
+        environment["TRPC_K8S_RUNTIME_HPA_JOB_IMAGE"]
+        == (config.resolved_image_references()["initial"])
+    )
     assert environment["TRPC_K8S_RUNTIME_HPA_BACKLOG_METRIC_ENABLED"] == "false"
     assert environment["TRPC_K8S_RUNTIME_S3_ENDPOINT"] == (
         "http://minio.runtime-support.svc.cluster.local:9000"
@@ -249,6 +253,29 @@ def test_load_config_projects_all_runtime_environment(tmp_path: Path) -> None:
     assert "trpc-metrics-secrets" not in config.required_secret_keys()
 
 
+@pytest.mark.parametrize(
+    "job_image",
+    (
+        "ghcr.io/example/other@sha256:" + "1" * 64,
+        "ghcr.io/example/runtime@sha256:" + "3" * 64,
+    ),
+)
+def test_hpa_job_image_must_match_initial_runtime_image(tmp_path: Path, job_image: str) -> None:
+    config_path, source = _write_inputs(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "job_image: ghcr.io/example/runtime@sha256:" + "1" * 64,
+            f"job_image: {job_image}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    config = load_runtime_gate_config(config_path)
+
+    with pytest.raises(DeploymentConfigError, match=r"hpa\.job_image"):
+        config.environment(source)
+
+
 def test_support_config_is_projected_to_explicit_environment_names(tmp_path: Path) -> None:
     config_path, source = _write_inputs(tmp_path)
     _add_support_config(config_path)
@@ -257,6 +284,7 @@ def test_support_config_is_projected_to_explicit_environment_names(tmp_path: Pat
     environment = config.environment(source)
 
     assert config.support == RuntimeSupportConfig(
+        namespace="trpc-runtime-support",
         data_node="ack-data-0",
         postgres_image=SUPPORT_POSTGRES_IMAGE,
         redis_image=SUPPORT_REDIS_IMAGE,
@@ -268,6 +296,8 @@ def test_support_config_is_projected_to_explicit_environment_names(tmp_path: Pat
         redis_host_path="/srv/trpc/support/redis",
         minio_host_path="/srv/trpc/support/minio",
     )
+    assert environment["TRPC_K8S_SUPPORT_NAMESPACE"] == "trpc-runtime-support"
+    assert environment["TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE"] == "trpc-runtime-support"
     assert environment["TRPC_K8S_SUPPORT_DATA_NODE"] == "ack-data-0"
     assert environment["TRPC_K8S_SUPPORT_POSTGRES_IMAGE"] == SUPPORT_POSTGRES_IMAGE
     assert environment["TRPC_K8S_SUPPORT_REDIS_IMAGE"] == SUPPORT_REDIS_IMAGE
@@ -280,6 +310,88 @@ def test_support_config_is_projected_to_explicit_environment_names(tmp_path: Pat
     assert environment["TRPC_K8S_SUPPORT_POSTGRES_HOST_PATH"] == "/srv/trpc/support/postgres"
     assert environment["TRPC_K8S_SUPPORT_REDIS_HOST_PATH"] == "/srv/trpc/support/redis"
     assert environment["TRPC_K8S_SUPPORT_MINIO_HOST_PATH"] == "/srv/trpc/support/minio"
+    assert environment["TRPC_K8S_SUPPORT_EXTERNAL_METRIC_COMPATIBILITY_NAMESPACES"] == "[]"
+
+
+def test_support_external_metric_compatibility_namespaces_are_explicit(tmp_path: Path) -> None:
+    config_path, source = _write_inputs(tmp_path)
+    _add_support_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "    minio_host_path: /srv/trpc/support/minio\n",
+            "    minio_host_path: /srv/trpc/support/minio\n"
+            "    external_metric_compatibility_namespaces:\n"
+            "      - trpc-service\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_gate_config(config_path)
+
+    assert config.support is not None
+    assert config.support.external_metric_compatibility_namespaces == ("trpc-service",)
+    assert (
+        config.environment(source)["TRPC_K8S_SUPPORT_EXTERNAL_METRIC_COMPATIBILITY_NAMESPACES"]
+        == '["trpc-service"]'
+    )
+
+
+def test_support_namespace_can_be_explicitly_overridden(tmp_path: Path) -> None:
+    config_path, source = _write_inputs(tmp_path)
+    _add_support_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  support:\n", "  support:\n    namespace: cell-runtime-support\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_gate_config(config_path)
+
+    assert config.support is not None
+    assert config.support.namespace == "cell-runtime-support"
+    assert config.environment(source)["TRPC_K8S_SUPPORT_NAMESPACE"] == "cell-runtime-support"
+    assert (
+        config.environment(source)["TRPC_K8S_RUNTIME_SUPPORT_NAMESPACE"] == "cell-runtime-support"
+    )
+
+
+@pytest.mark.parametrize(
+    "namespace",
+    (
+        "Cell-runtime-support",
+        "support.namespace",
+        "x" * 64,
+    ),
+)
+def test_support_namespace_must_be_a_dns_label_within_limit(tmp_path: Path, namespace: str) -> None:
+    config_path, _ = _write_inputs(tmp_path)
+    _add_support_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  support:\n", f"  support:\n    namespace: {namespace}\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeploymentConfigError, match=r"support\.namespace"):
+        load_runtime_gate_config(config_path)
+
+
+def test_runtime_node_label_is_fixed_to_acceptance(tmp_path: Path) -> None:
+    config_path, _ = _write_inputs(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "label: trpc-cell-fabric-owner=innovation",
+            "label: trpc-cell-fabric-owner=other",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeploymentConfigError, match=r"kubernetes\.node name or label is invalid"):
+        load_runtime_gate_config(config_path)
 
 
 def test_performance_config_projects_explicit_cluster_topology(tmp_path: Path) -> None:
@@ -291,6 +403,7 @@ def test_performance_config_projects_explicit_cluster_topology(tmp_path: Path) -
 
     assert isinstance(config.performance, PerformanceRunnerConfig)
     assert config.performance.enabled is True
+    assert config.performance.node_name == "acceptance-load-node"
     assert config.performance.node_selector == {"trpc-role": "load-driver"}
     assert config.performance.gateway_url == (
         "http://trpc-gateway.trpc-service.svc.cluster.local:8080"
@@ -339,6 +452,13 @@ def test_performance_config_projects_explicit_cluster_topology(tmp_path: Path) -
         '"TRPC_PERF_FIXTURE_UNUSED_ENCRYPT_KEY"]'
     )
     assert environment["TRPC_PERF_K8S_WORKLOAD_NODE_LABEL"] == "trpc-role=workload"
+    assert environment["TRPC_PERF_K8S_RUNNER_NODE_NAME"] == "acceptance-load-node"
+    assert environment["TRPC_PERF_K8S_LOAD_DRIVER_NODE_NAME"] == "acceptance-load-node"
+    assert environment["TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_NODE_NAME"] == ("acceptance-load-node")
+    assert environment["TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_NODE_LABEL"] == ("trpc-role=load-driver")
+    assert environment["TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_KEY"] == "trpc-role"
+    assert environment["TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_VALUE"] == "load-driver"
+    assert environment["TRPC_K8S_RUNTIME_HPA_LOAD_DRIVER_TAINT_EFFECT"] == "NoSchedule"
     assert environment["TRPC_PERF_K8S_GATEWAY_DATABASE_POOL_MIN_SIZE"] == "5"
     assert environment["TRPC_PERF_K8S_GATEWAY_DATABASE_POOL_MAX_SIZE"] == "6"
     assert environment["TRPC_PERF_K8S_WORKER_DATABASE_POOL_MIN_SIZE"] == "2"
@@ -596,6 +716,7 @@ def test_hpa_backlog_metric_enables_the_dedicated_metrics_secret_contract(
     assert config.required_secret_keys()["trpc-metrics-secrets"] == {
         "TRPC_SERVICE_METRICS_DATABASE_DSN"
     }
+    assert config.required_secret_keys()["trpc-hpa-secrets"] == {"TRPC_HPA_DATABASE_DSN"}
     assert environment["TRPC_K8S_RUNTIME_HPA_BACKLOG_METRIC_ENABLED"] == "true"
 
 
@@ -610,7 +731,7 @@ def test_hpa_backlog_metric_flag_is_strictly_boolean(tmp_path: Path) -> None:
         load_runtime_gate_config(config_path)
 
 
-def test_pull_registry_rewrites_only_runtime_registry_host(tmp_path: Path) -> None:
+def test_pull_registry_rewrites_runtime_and_hpa_job_registry_hosts(tmp_path: Path) -> None:
     config_path, source = _write_inputs(tmp_path)
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
@@ -631,7 +752,7 @@ def test_pull_registry_rewrites_only_runtime_registry_host(tmp_path: Path) -> No
         "elt91uy73y2gh25fs7-ghcr.xuanyuan.run/example/runtime@sha256:" + "2" * 64
     )
     assert environment["TRPC_K8S_RUNTIME_HPA_JOB_IMAGE"] == (
-        "ghcr.io/example/runtime@sha256:" + "1" * 64
+        "elt91uy73y2gh25fs7-ghcr.xuanyuan.run/example/runtime@sha256:" + "1" * 64
     )
 
 
@@ -713,7 +834,10 @@ def test_preflight_requires_metrics_secret_when_real_backlog_is_enabled(
     check = next(item for item in report["checks"] if item["name"] == "secret_manifest_contract")
     assert report["gate"] == "fail"
     assert projected is None
-    assert check["missing_keys"] == {"trpc-metrics-secrets": ["TRPC_SERVICE_METRICS_DATABASE_DSN"]}
+    assert check["missing_keys"] == {
+        "trpc-hpa-secrets": ["TRPC_HPA_DATABASE_DSN"],
+        "trpc-metrics-secrets": ["TRPC_SERVICE_METRICS_DATABASE_DSN"],
+    }
 
 
 def test_preflight_reports_all_missing_files_without_secret_data(tmp_path: Path) -> None:

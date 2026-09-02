@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Aggregate machine-readable evidence without upgrading missing gates to pass."""
 
 from __future__ import annotations
@@ -10,11 +11,22 @@ import importlib
 import json
 import math
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
+
+# A direct file launch can leave another checkout's ``scripts`` namespace
+# ahead of this one (for example through ``PYTHONPATH``).  Resolve sibling
+# helpers from the checkout that owns this file before importing them.  The
+# same guard is harmless for ``python -m scripts.release_gate``.
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+_REPO_IMPORT_ROOT_STR = str(_REPO_IMPORT_ROOT)
+while _REPO_IMPORT_ROOT_STR in sys.path:
+    sys.path.remove(_REPO_IMPORT_ROOT_STR)
+sys.path.insert(0, _REPO_IMPORT_ROOT_STR)
 
 from scripts.evidence_lineage import (
     DEFAULT_EVIDENCE_TTL_SECONDS,
@@ -35,7 +47,7 @@ from scripts.real_runtime_gate import _role_evidence_check
 from scripts.release_manifest import validate_manifest
 from scripts.report_io import atomic_write_json
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = _REPO_IMPORT_ROOT
 SOURCE_FINGERPRINT_ROOTS = DEFAULT_SOURCE_FINGERPRINT_ROOTS
 FINGERPRINT_MAX_FILES = DEFAULT_FINGERPRINT_MAX_FILES
 FINGERPRINT_MAX_BYTES = DEFAULT_FINGERPRINT_MAX_BYTES
@@ -494,9 +506,11 @@ K8S_REQUIRED_CHECKS = (
     "scheduler_cutover_guard",
     "rolling_upgrade",
     "worker_scale_and_hpa",
+    "hpa_driver_namespace_preflight",
     "hpa_driver_rbac_bind",
     "hpa_driver_trust",
     "hpa_load_observation",
+    "hpa_driver_rbac_cleanup",
     "pdb_eviction",
     "node_eviction",
     "graceful_termination",
@@ -511,6 +525,7 @@ K8S_REQUIRED_ACTIONS = (
     "rolling_upgrade",
     "hpa_observed",
     "hpa_load_observed",
+    "hpa_driver_cleanup",
     "pod_eviction",
     "node_eviction",
     "graceful_termination",
@@ -534,6 +549,62 @@ K8S_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 K8S_HPA_DRIVER_RELATIVE_PATH = "scripts/kubernetes_hpa_load_driver.py"
 K8S_HPA_DRIVER_MAX_BYTES = 1024 * 1024
 K8S_HPA_JOB_UID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+K8S_HPA_DRIVER_NAMESPACE_OWNER_LABEL = "trpc.io/managed-by"
+K8S_HPA_DRIVER_NAMESPACE_OWNER_VALUE = "trpc-kubernetes-runtime-gate"
+K8S_HPA_DRIVER_NAMESPACE_WORKLOAD_RESOURCES = (
+    "deployments",
+    "statefulsets",
+    "daemonsets",
+    "replicasets",
+    "cronjobs",
+    "jobs",
+    "replicationcontrollers",
+    "pods",
+)
+K8S_HPA_CLEANUP_TABLES = (
+    "cell_effect_receipts",
+    "cell_effect_ledger",
+    "cell_tool_intents",
+    "cell_branch_heads",
+    "cell_placement_reservations",
+    "cell_approval_nonces",
+    "cell_events",
+    "agent_cells",
+    "agent_capsules",
+    "session_mailbox_items",
+    "delivery_attempts",
+    "outbox_events",
+    "turn_intents",
+    "session_events",
+    "session_summaries",
+    "tool_executions",
+    "session_turns",
+    "inbound_messages",
+    "outbound_messages",
+    "memories",
+    "artifacts",
+    "knowledge_embeddings",
+    "knowledge_items",
+    "dead_letters",
+    "confirmation_challenges",
+    "audit_logs",
+    "tenant_budget_usage",
+    "fault_stage_controls",
+    "migration_write_barriers",
+    "migration_leases",
+    "migration_checkpoints",
+    "admin_idempotency",
+    "channel_identities",
+    "channel_bindings",
+    "config_revisions",
+    "storage_profiles",
+    "tenant_policies",
+    "session_mailboxes",
+    "sessions",
+    "agent_apps",
+    "migration_scope_manifests",
+    "tenants",
+)
 MIGRATION_ALLOWED_FACTORIES = frozenset(
     {
         "production_migration_control.create",
@@ -584,6 +655,143 @@ def _current_candidate_source_fingerprint() -> dict[str, Any]:
         max_files=FINGERPRINT_MAX_FILES,
         max_bytes=FINGERPRINT_MAX_BYTES,
     )
+
+
+def _current_coverage_source_fingerprint() -> dict[str, Any]:
+    """Return the source fingerprint used when the coverage gate is produced."""
+
+    # Coverage evidence includes its unit-test selectors in the candidate
+    # identity. Keep this framing aligned with scripts.check_coverage while
+    # retaining the release gate's test seams for a small isolated fixture.
+    return source_fingerprint(
+        ROOT,
+        (*SOURCE_FINGERPRINT_ROOTS, "tests/unit"),
+        max_files=FINGERPRINT_MAX_FILES,
+        max_bytes=FINGERPRINT_MAX_BYTES,
+    )
+
+
+def _source_fingerprint_status(
+    report: Mapping[str, Any],
+    *,
+    current_source: Mapping[str, Any],
+    evidence_name: str,
+) -> tuple[str, list[str]]:
+    """Check a report's source fingerprint against the current checkout."""
+
+    recorded_source = report.get("source_fingerprint")
+    recorded_value = recorded_source.get("value") if isinstance(recorded_source, Mapping) else None
+    if (
+        not isinstance(recorded_source, Mapping)
+        or recorded_source.get("algorithm") != "sha256"
+        or recorded_source.get("status") != "available"
+        or not isinstance(recorded_value, str)
+        or MIGRATION_SHA256_RE.fullmatch(recorded_value) is None
+    ):
+        return "fail", [f"{evidence_name} evidence source fingerprint is missing or invalid"]
+
+    current_value = current_source.get("value")
+    if (
+        current_source.get("algorithm") != "sha256"
+        or current_source.get("status") != "available"
+        or not isinstance(current_value, str)
+        or MIGRATION_SHA256_RE.fullmatch(current_value) is None
+    ):
+        return "fail", [f"current {evidence_name} source fingerprint is unavailable"]
+    if recorded_value != current_value:
+        return "fail", [
+            f"{evidence_name} evidence source fingerprint belongs to a different candidate"
+        ]
+    return "pass", []
+
+
+def _coverage_status(
+    report_path: Path,
+    report: Mapping[str, Any],
+    *,
+    coverage_report_path: Path | None = None,
+) -> tuple[str, list[str]]:
+    """Validate coverage evidence against this checkout and its raw report."""
+
+    source_status, source_reasons = _source_fingerprint_status(
+        report,
+        current_source=_current_coverage_source_fingerprint(),
+        evidence_name="coverage",
+    )
+    if source_status != "pass":
+        return source_status, source_reasons
+
+    recorded_sha = report.get("coverage_report_sha256")
+    if not isinstance(recorded_sha, str) or MIGRATION_SHA256_RE.fullmatch(recorded_sha) is None:
+        return "fail", ["coverage report sha256 is missing or invalid"]
+
+    raw_path = coverage_report_path or report_path.with_name("coverage.json")
+    if not raw_path.is_absolute():
+        # CLI paths are conventionally relative to the invoking checkout.  A
+        # report-local fallback keeps direct callers and artifact bundles that
+        # pass ``artifacts/coverage.json`` relative to the gate report working
+        # as well, without silently choosing an unrelated file.
+        checkout_path = raw_path
+        report_local_path = report_path.parent / raw_path
+        raw_path = checkout_path if checkout_path.is_file() else report_local_path
+    try:
+        raw_bytes = raw_path.read_bytes()
+    except OSError as error:
+        return "fail", [f"coverage report unavailable: {type(error).__name__}"]
+    if hashlib.sha256(raw_bytes).hexdigest() != recorded_sha:
+        return "fail", ["coverage report sha256 does not match coverage evidence"]
+
+    try:
+        raw_report = _strict_json_loads(raw_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        return "fail", [f"invalid coverage report: {type(error).__name__}"]
+    if not isinstance(raw_report, Mapping) or not isinstance(raw_report.get("totals"), Mapping):
+        return "fail", ["coverage report totals are missing or invalid"]
+
+    baseline = report.get("baseline")
+    candidate = report.get("candidate")
+    raw_totals = raw_report["totals"]
+    if not isinstance(baseline, Mapping) or not isinstance(candidate, Mapping):
+        return "fail", ["coverage evidence baseline or candidate is missing or invalid"]
+    minimum_line = _strict_number(baseline.get("line_percent"))
+    minimum_branch = _strict_number(baseline.get("branch_percent"))
+    candidate_line = _strict_number(candidate.get("line_percent"))
+    candidate_branch = _strict_number(candidate.get("branch_percent"))
+    raw_line = _strict_number(raw_totals.get("percent_statements_covered"))
+    raw_branch = _strict_number(raw_totals.get("percent_branches_covered"))
+    values = (minimum_line, minimum_branch, candidate_line, candidate_branch, raw_line, raw_branch)
+    if any(value is None or not 0.0 <= value <= 100.0 for value in values):
+        return "fail", ["coverage percentages are missing or out of range"]
+    assert (
+        minimum_line is not None
+        and minimum_branch is not None
+        and candidate_line is not None
+        and candidate_branch is not None
+        and raw_line is not None
+        and raw_branch is not None
+    )
+    if minimum_line < 90.0 or minimum_branch < 90.0:
+        return "fail", ["coverage evidence baseline minimum is below 90 percent"]
+    if candidate_line != raw_line or candidate_branch != raw_branch:
+        return "fail", ["coverage candidate does not match raw coverage totals"]
+    if raw_line < minimum_line or raw_branch < minimum_branch:
+        return "fail", ["raw coverage totals are below the reported baseline"]
+    return "pass", []
+
+
+def _simulation_status(report: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """Validate mock evidence without ever promoting its production status."""
+
+    source_status, source_reasons = _source_fingerprint_status(
+        report,
+        current_source=_current_coverage_source_fingerprint(),
+        evidence_name="simulation",
+    )
+    if source_status != "pass":
+        return source_status, source_reasons
+    if report.get("production_gate") != "not_run":
+        return "fail", ["simulation report must keep production_gate=not_run"]
+    return "pass", []
 
 
 def _strict_int(value: Any) -> int | None:
@@ -3172,7 +3380,12 @@ def _current_k8s_hpa_driver_sha256() -> tuple[str | None, str | None]:
 
 
 def _validate_k8s_hpa_job_evidence(
-    observed: Mapping[str, Any], *, namespace: str, nonce: str, cluster_fingerprint: str
+    observed: Mapping[str, Any],
+    *,
+    namespace: str,
+    job_namespace: str,
+    nonce: str,
+    cluster_fingerprint: str,
 ) -> tuple[str | None, str | None]:
     evidence = observed.get("driver_evidence")
     if not isinstance(evidence, Mapping):
@@ -3189,7 +3402,12 @@ def _validate_k8s_hpa_job_evidence(
             return _k8s_missing(
                 f"candidate.checks.hpa_load_observation.driver_evidence.{phase}.api_observed"
             )
-        if value.get("namespace") != namespace or value.get("run_nonce") != nonce:
+        if (
+            value.get("namespace") != namespace
+            or value.get("target_namespace") != namespace
+            or value.get("job_namespace") != job_namespace
+            or value.get("run_nonce") != nonce
+        ):
             return _k8s_missing(
                 f"candidate.checks.hpa_load_observation.driver_evidence.{phase} nonce/namespace"
             )
@@ -3219,13 +3437,67 @@ def _validate_k8s_hpa_job_evidence(
             )
     if load_uid != clear_uid:
         return _k8s_failed("HPA load and clear Job API evidence used different UIDs")
-    if clear.get("job_deleted") is not True:
+    if clear.get("job_deleted") is not True or clear.get("already_absent") is not False:
         return _k8s_missing("candidate.checks.hpa_load_observation.driver_evidence.clear deletion")
+    cleanup = clear.get("cleanup")
+    receipt = cleanup.get("receipt") if isinstance(cleanup, Mapping) else None
+    deleted = receipt.get("deleted") if isinstance(receipt, Mapping) else None
+    residual = receipt.get("residual") if isinstance(receipt, Mapping) else None
+    if (
+        not isinstance(cleanup, Mapping)
+        or cleanup.get("api_observed") is not True
+        or cleanup.get("job_deleted") is not True
+        or cleanup.get("job_name") != f"trpc-hpa-cleanup-{nonce[:20]}"
+        or not isinstance(cleanup.get("job_uid"), str)
+        or K8S_HPA_JOB_UID_RE.fullmatch(str(cleanup.get("job_uid"))) is None
+        or not isinstance(receipt, Mapping)
+        or set(receipt)
+        != {
+            "schema_version",
+            "status",
+            "phase",
+            "run_nonce",
+            "tenant_id",
+            "already_absent",
+            "deleted",
+            "residual",
+        }
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "pass"
+        or receipt.get("phase") != "clear"
+        or receipt.get("run_nonce") != nonce
+        or receipt.get("tenant_id") != f"hpa-{nonce}"
+        or receipt.get("already_absent") is not False
+        or not isinstance(deleted, Mapping)
+        or set(deleted) != set(K8S_HPA_CLEANUP_TABLES)
+        or not isinstance(residual, Mapping)
+        or set(residual) != set(K8S_HPA_CLEANUP_TABLES)
+        or any(
+            isinstance(deleted.get(name), bool)
+            or not isinstance(deleted.get(name), int)
+            or cast(int, deleted.get(name)) < 0
+            for name in K8S_HPA_CLEANUP_TABLES
+        )
+        or any(
+            isinstance(residual.get(name), bool)
+            or not isinstance(residual.get(name), int)
+            or residual.get(name) != 0
+            for name in K8S_HPA_CLEANUP_TABLES
+        )
+    ):
+        return _k8s_missing(
+            "candidate.checks.hpa_load_observation.driver_evidence.clear cleanup receipt"
+        )
     return None, None
 
 
 def _validate_k8s_hpa_observation(
-    check: Mapping[str, Any], *, namespace: str, nonce: str, cluster_fingerprint: str
+    check: Mapping[str, Any],
+    *,
+    namespace: str,
+    job_namespace: str,
+    nonce: str,
+    cluster_fingerprint: str,
 ) -> tuple[str | None, str | None]:
     if check.get("status") != "pass" or check.get("observed_live") is not True:
         return _k8s_missing("candidate.checks.hpa_load_observation live status")
@@ -3257,6 +3529,7 @@ def _validate_k8s_hpa_observation(
     job_problem = _validate_k8s_hpa_job_evidence(
         observed,
         namespace=namespace,
+        job_namespace=job_namespace,
         nonce=nonce,
         cluster_fingerprint=cluster_fingerprint,
     )
@@ -3336,14 +3609,62 @@ def _validate_kubernetes_semantics(
         if not isinstance(value, Mapping) or value.get("status") != "pass":
             return _k8s_missing(f"candidate.checks.{name}.status=pass")
     driver_trust = checks.get("hpa_driver_trust")
+    job_namespace = driver_trust.get("job_namespace") if isinstance(driver_trust, Mapping) else None
     if (
         not isinstance(driver_trust, Mapping)
         or driver_trust.get("dedicated_kubeconfig") is not True
-        or driver_trust.get("scope") != "namespace_jobs_only"
+        or driver_trust.get("scope") != "driver_namespace_jobs_only"
+        or driver_trust.get("target_namespace") != namespace
+        or not isinstance(job_namespace, str)
+        or job_namespace == namespace
+        or re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", job_namespace) is None
         or driver_trust.get("rbac_verified") is not True
         or driver_trust.get("reasons") != []
     ):
         return _k8s_missing("candidate.checks.hpa_driver_trust least privilege binding")
+    namespace_preflight = checks.get("hpa_driver_namespace_preflight")
+    preflight_evidence = (
+        namespace_preflight.get("evidence") if isinstance(namespace_preflight, Mapping) else None
+    )
+    permission_evidence = (
+        preflight_evidence.get("permissions") if isinstance(preflight_evidence, Mapping) else None
+    )
+    required_permissions = {
+        f"{verb}:{resource}"
+        for resource in (
+            "secrets",
+            "roles.rbac.authorization.k8s.io",
+            "rolebindings.rbac.authorization.k8s.io",
+            "networkpolicies.networking.k8s.io",
+        )
+        for verb in ("get", "create", "patch", "delete")
+    }
+    if (
+        not isinstance(preflight_evidence, Mapping)
+        or preflight_evidence.get("namespace") != job_namespace
+        or not isinstance(preflight_evidence.get("service_account"), str)
+        or not preflight_evidence.get("service_account")
+        or preflight_evidence.get("job_count") != 0
+        or preflight_evidence.get("pod_count") != 0
+        or preflight_evidence.get("owner_label")
+        != {
+            "key": K8S_HPA_DRIVER_NAMESPACE_OWNER_LABEL,
+            "value": K8S_HPA_DRIVER_NAMESPACE_OWNER_VALUE,
+        }
+        or preflight_evidence.get("service_account_count")
+        != preflight_evidence.get("allowed_service_account_count")
+        or preflight_evidence.get("allowed_service_account_count") != 2
+        or preflight_evidence.get("secret_count") != preflight_evidence.get("allowed_secret_count")
+        or preflight_evidence.get("allowed_secret_count") not in {1, 2}
+        or any(
+            preflight_evidence.get(f"{resource}_count") != 0
+            for resource in K8S_HPA_DRIVER_NAMESPACE_WORKLOAD_RESOURCES
+        )
+        or not isinstance(permission_evidence, Mapping)
+        or set(permission_evidence) != required_permissions
+        or any(permission_evidence.get(name) != "pass" for name in required_permissions)
+    ):
+        return _k8s_missing("candidate.checks.hpa_driver_namespace_preflight evidence")
     for field in ("driver_sha256", "kubeconfig_sha256", "subject_sha256"):
         value = driver_trust.get(field)
         if (
@@ -3370,8 +3691,8 @@ def _validate_kubernetes_semantics(
     if (
         not isinstance(rule_audit, Mapping)
         or rule_audit.get("complete") is not True
-        or rule_audit.get("scope") != "target_namespace_jobs_pods_only"
-        or rule_audit.get("target_namespace") != namespace
+        or rule_audit.get("scope") != "driver_namespace_jobs_pods_only"
+        or rule_audit.get("job_namespace") != job_namespace
     ):
         return _k8s_missing("candidate.checks.hpa_driver_trust complete SelfSubjectRulesReview")
     for field in (
@@ -3459,6 +3780,7 @@ def _validate_kubernetes_semantics(
     hpa_problem = _validate_k8s_hpa_observation(
         cast(Mapping[str, Any], checks["hpa_load_observation"]),
         namespace=namespace,
+        job_namespace=job_namespace,
         nonce=nonce,
         cluster_fingerprint=cluster_fp,
     )
@@ -5636,7 +5958,12 @@ def _production_evidence_reason(report: dict[str, Any], *, report_name: str) -> 
     return _production_evidence_result(report, report_name=report_name)[1]
 
 
-def _status(path: Path, *, production_field: bool) -> tuple[str, list[str]]:
+def _status(
+    path: Path,
+    *,
+    production_field: bool,
+    coverage_report_path: Path | None = None,
+) -> tuple[str, list[str]]:
     if not path.is_file():
         return "not_run", [f"missing report: {path.name}"]
     try:
@@ -5655,6 +5982,18 @@ def _status(path: Path, *, production_field: bool) -> tuple[str, list[str]]:
     reason_field = "production_rejection_reasons" if production_field else "rejection_reasons"
     reasons = [str(reason) for reason in report.get(reason_field, [])]
     if value == "pass":
+        if not production_field and path.name == REPORTS["coverage"][0]:
+            coverage_status, coverage_reasons = _coverage_status(
+                path,
+                report,
+                coverage_report_path=coverage_report_path,
+            )
+            if coverage_status != "pass":
+                return coverage_status, coverage_reasons
+        if not production_field and path.name == REPORTS["simulation"][0]:
+            simulation_status, simulation_reasons = _simulation_status(report)
+            if simulation_status != "pass":
+                return simulation_status, simulation_reasons
         if production_field:
             evidence_status, evidence_reason = _production_evidence_result(
                 report, report_name=path.name, report_path=path
@@ -5671,6 +6010,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", type=Path, default=Path("runs/multitenant"))
     parser.add_argument("--output", type=Path, default=Path("runs/multitenant/release-gate.json"))
+    parser.add_argument(
+        "--coverage-report",
+        type=Path,
+        help="Raw coverage.json path; defaults to coverage.json beside coverage-gate.json.",
+    )
     parser.add_argument("--require-production", action="store_true")
     args = parser.parse_args()
 
@@ -5680,6 +6024,7 @@ def main() -> int:
         status, report_reasons = _status(
             args.directory / filename,
             production_field=production_field,
+            coverage_report_path=args.coverage_report if name == "coverage" else None,
         )
         candidate[name] = status
         reasons.extend(f"{name}: {reason}" for reason in report_reasons)

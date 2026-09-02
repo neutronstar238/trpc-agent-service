@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -14,18 +16,22 @@ from trpc_service.cell.runtime import (
 from trpc_service.cell.scheduler import NodeSnapshot
 
 
+def _digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
 def _signed_capsule() -> tuple[AgentCapsule, Ed25519PrivateKey]:
     private_key = Ed25519PrivateKey.generate()
     capsule = AgentCapsule(
         metadata=CapsuleMetadata(tenant_id="tenant-a", name="customer-service"),
         spec=CapsuleSpec(
-            graph="sha256:graph",
-            prompt="sha256:prompt",
+            graph=_digest("graph"),
+            prompt=_digest("prompt"),
             model_policy="policy://model/v1",
-            tool_manifest="sha256:tools",
+            tool_manifest=_digest("tools"),
             governance_policy="policy://governance/v1",
-            knowledge_snapshot="sha256:knowledge",
-            storage_profile="enterprise-cn",
+            knowledge_snapshot=_digest("knowledge"),
+            storage_profile="storage://profiles/enterprise-cn",
             channel_capabilities=("wecom", "tool-sandbox"),
         ),
     ).sign(private_key, key_id="award-demo")
@@ -35,7 +41,8 @@ def _signed_capsule() -> tuple[AgentCapsule, Ed25519PrivateKey]:
 def _fabric_and_activation() -> tuple[AgentCellFabric, CellActivation, str]:
     capsule, private_key = _signed_capsule()
     fabric = AgentCellFabric(
-        trusted_capsule_keys={"award-demo": private_key.public_key()},
+        trusted_capsule_keys={"tenant-a": {"award-demo": private_key.public_key()}},
+        policy_judge=lambda _intent: PolicyDecision.ALLOW,
     )
     digest = fabric.register_capsule(capsule)
     activation = fabric.activate_cell(
@@ -51,6 +58,7 @@ def _fabric_and_activation() -> tuple[AgentCellFabric, CellActivation, str]:
                 node_id="node-us",
                 region="us-west",
                 capacity_cpu_millis=4_000,
+                observed_generation=1,
                 capacity_memory_mb=8_192,
                 max_cells=100,
                 capabilities=frozenset({"wecom", "tool-sandbox"}),
@@ -59,6 +67,7 @@ def _fabric_and_activation() -> tuple[AgentCellFabric, CellActivation, str]:
                 node_id="node-cn",
                 region="cn-shanghai",
                 capacity_cpu_millis=4_000,
+                observed_generation=1,
                 capacity_memory_mb=8_192,
                 max_cells=100,
                 capabilities=frozenset({"wecom", "tool-sandbox"}),
@@ -120,7 +129,9 @@ async def test_fabric_places_executes_once_and_replays() -> None:
     assert projection.state["status"] == "idle"
     assert projection.state["node_id"] == "node-cn"
     assert projection.state["last_effect_status"] == "succeeded"
-    assert projection.event_count == 9
+    # The duplicate intent reuses the same immutable event ids, so the
+    # causal stream grows only for the first externally visible execution.
+    assert projection.event_count == 6
 
 
 @pytest.mark.asyncio

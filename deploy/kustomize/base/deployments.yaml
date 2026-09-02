@@ -83,9 +83,17 @@ spec:
               cpu: 1000m
               memory: 1Gi
           volumeMounts:
+            - name: trpc-im-secrets
+              mountPath: /run/secrets
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: trpc-im-secrets
+          secret:
+            secretName: trpc-im-secrets
+            optional: true
+            defaultMode: 0400
         - name: tmp
           emptyDir: {}
 ---
@@ -525,9 +533,17 @@ spec:
               cpu: 2000m
               memory: 2Gi
           volumeMounts:
+            - name: trpc-im-secrets
+              mountPath: /run/secrets
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: trpc-im-secrets
+          secret:
+            secretName: trpc-im-secrets
+            optional: true
+            defaultMode: 0400
         - name: tmp
           emptyDir: {}
 ---
@@ -699,9 +715,17 @@ spec:
               cpu: 1000m
               memory: 1Gi
           volumeMounts:
+            - name: trpc-im-secrets
+              mountPath: /run/secrets
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: trpc-im-secrets
+          secret:
+            secretName: trpc-im-secrets
+            optional: true
+            defaultMode: 0400
         - name: tmp
           emptyDir: {}
 ---
@@ -873,8 +897,16 @@ spec:
               cpu: 1000m
               memory: 1Gi
           volumeMounts:
+            - name: trpc-im-secrets
+              mountPath: /run/secrets
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: trpc-im-secrets
+          secret:
+            secretName: trpc-im-secrets
+            optional: true
+            defaultMode: 0400
         - name: tmp
           emptyDir: {}
