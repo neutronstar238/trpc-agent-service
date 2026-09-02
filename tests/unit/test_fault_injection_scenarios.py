@@ -526,7 +526,7 @@ def test_real_command_forwards_isolated_compose_and_toxiproxy_selectors(tmp_path
     fencing = _real_command(args, "fencing", tmp_path / "fencing.json")
     assert "--use-toxiproxy" in fencing
     ambiguous = _real_command(args, "ambiguous", tmp_path / "ambiguous.json")
-    assert ambiguous[1].endswith("scripts\\ambiguous_provider_acceptance.py")
+    assert Path(ambiguous[1]).name == "ambiguous_provider_acceptance.py"
     assert "--execute" in ambiguous
     assert ["--project", "fault-project"] == ambiguous[
         ambiguous.index("--project") : ambiguous.index("--project") + 2
@@ -1319,7 +1319,7 @@ def test_fault_stage_child_runs_once_and_maps_all_three_exact_cases(monkeypatch,
 
     assert len(calls) == 1
     command = calls[0]
-    assert command[1].endswith("scripts\\fault_stage_acceptance.py")
+    assert Path(command[1]).name == "fault_stage_acceptance.py"
     assert command[command.index("--project") + 1] == "trpc-fault-test-run"
     assert command[command.index("--worker-container") + 1] == "worker-container-verified"
     assert "--allow-process-kill" in command

@@ -925,7 +925,10 @@ def _windows_pid_alive(pid: int) -> bool:
 
     process_query_limited_information = 0x1000
     still_active = 259
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return False
+    kernel32 = win_dll("kernel32", use_last_error=True)
     open_process = kernel32.OpenProcess
     open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     open_process.restype = wintypes.HANDLE
@@ -2498,7 +2501,8 @@ def _available_memory_bytes() -> int | None:
         status = MemoryStatus()
         status.length = ctypes.sizeof(MemoryStatus)
         try:
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            windll = getattr(ctypes, "windll", None)
+            if windll is not None and windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
                 return int(status.available_physical)
         except (AttributeError, OSError):
             return None

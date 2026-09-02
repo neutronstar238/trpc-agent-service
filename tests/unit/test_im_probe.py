@@ -48,6 +48,7 @@ def probe_fixture(
         for name, value in values.items():
             path = tmp_path / f"{channel.lower()}-{name.lower()}"
             path.write_text(value, encoding="utf-8")
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
             credential_paths[channel][name] = path
 
     private_key = Ed25519PrivateKey.generate()
@@ -58,6 +59,7 @@ def probe_fixture(
         ).decode("ascii"),
         encoding="ascii",
     )
+    signing_key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     control_profile_paths: dict[str, Path] = {}
     for channel, contents in CONTROL_PROFILE_CONTENTS.items():
         path = tmp_path / f"{channel}-control-profile.json"

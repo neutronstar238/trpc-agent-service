@@ -19,7 +19,9 @@ _VALIDATE_TRUSTED_PARENT_CHAIN = broker._validate_trusted_parent_chain
 
 
 @pytest.fixture(autouse=True)
-def _allow_non_root_test_artifacts(monkeypatch: pytest.MonkeyPatch) -> None:
+def _allow_non_root_test_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    if os.name == "posix":
+        tmp_path.chmod(0o750)
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
         return
     monkeypatch.setattr(broker, "_validate_posix_file_owner", lambda _metadata: None)

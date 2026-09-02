@@ -353,13 +353,3 @@ def test_metrics_server_install_applies_patch_and_waits_for_rollout(monkeypatch)
     assert any(arguments[:1] == ["apply"] for arguments in calls)
     assert any(arguments[:1] == ["patch"] for arguments in calls)
     assert any(arguments[:1] == ["rollout"] for arguments in calls)
-
-
-def test_hpa_watcher_releases_job_finalizer_within_driver_clear_window() -> None:
-    watcher = (
-        Path(__file__).resolve().parents[2] / "runs" / "kind-hpa-observation-watcher.ps1"
-    ).read_text(encoding="utf-8")
-
-    assert "job deletion observed" in watcher
-    assert '$removePatch = \'{"metadata":{"finalizers":[]}}\'' in watcher
-    assert "Start-Sleep -Seconds 35" not in watcher

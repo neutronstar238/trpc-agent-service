@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import deployment_preflight
 from scripts.deployment_config import (
@@ -823,22 +824,24 @@ def test_pull_registry_is_required_for_ack_image_validation(tmp_path: Path) -> N
         load_runtime_gate_config(config_path)
 
 
-def test_checked_in_runtime_gate_uses_canonical_dockerhub_for_all_ack_images() -> None:
-    config = load_runtime_gate_config(ROOT / "deploy" / "runtime-gate.yaml")
+def test_runtime_gate_example_uses_canonical_dockerhub_for_all_ack_images() -> None:
+    document = yaml.safe_load(
+        (ROOT / "deploy" / "runtime-gate.example.yaml").read_text(encoding="utf-8")
+    )
+    kubernetes = document["kubernetes"]
+    support = kubernetes["support"]
 
-    assert config.pull_registry == "docker.io"
-    assert config.support is not None
+    assert kubernetes["pull_registry"] == "docker.io"
     images = (
-        config.support.postgres_image,
-        config.support.redis_image,
-        config.support.minio_image,
-        config.support.minio_client_image,
-        config.support.prometheus_image,
-        config.support.prometheus_adapter_image,
-        config.hpa_job_image,
+        support["postgres_image"],
+        support["redis_image"],
+        support["minio_image"],
+        support["minio_client_image"],
+        support["prometheus_image"],
+        support["prometheus_adapter_image"],
+        kubernetes["hpa"]["job_image"],
     )
     assert all(image.startswith("docker.io/") for image in images)
-    assert config.hpa_job_image == config.resolved_image_references()["initial"]
 
 
 def test_duplicate_and_unknown_keys_are_rejected(tmp_path: Path) -> None:

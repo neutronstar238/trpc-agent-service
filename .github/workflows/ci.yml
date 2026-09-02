@@ -41,7 +41,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --extra dev --locked --python ${{ matrix.python }}
-      - run: uv run --python ${{ matrix.python }} pytest tests/unit --cov=trpc_service --cov-branch --cov-report=json:runs/multitenant/coverage.json
+      - name: prepare root-owned security-test temp directory
+        run: sudo install -d -m 0700 -o root -g root /opt/trpc-ci-pytest
+      - name: unit tests
+        run: >-
+          sudo --preserve-env=PATH,UV_CACHE_DIR
+          env TMPDIR=/opt/trpc-ci-pytest
+          uv run --python ${{ matrix.python }} pytest tests/unit
+          --cov=trpc_service --cov-branch
+          --cov-report=json:runs/multitenant/coverage.json
       - run: >-
           uv run --python ${{ matrix.python }} python scripts/check_coverage.py
           runs/multitenant/coverage.json
@@ -124,7 +132,7 @@ jobs:
             --build-arg TRPC_SOURCE_FINGERPRINT="$source_fingerprint" \
             --label io.trpc.agent-service.source-fingerprint="$source_fingerprint" \
             -t trpc-agent-service:ci .
-      - uses: aquasecurity/trivy-action@0.30.0
+      - uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: trpc-agent-service:ci
           format: sarif
