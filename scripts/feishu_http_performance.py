@@ -42,10 +42,25 @@ SCHEDULE_GRACE_SECONDS = 5.0
 MAX_RUN_SECONDS = MAX_SCHEDULE_SECONDS + MAX_TIMEOUT_SECONDS + SCHEDULE_GRACE_SECONDS
 DEFAULT_TOTAL_REQUESTS = 200
 DEFAULT_RATE_PER_SECOND = 100.0
-DEFAULT_CONCURRENCY = 32
+# The formal acceptance run offers 105 callbacks/s.  Keep the default HTTP
+# client cap aligned with the performance gate's load cap so request latency
+# cannot turn the scheduler into an accidental 32-request bottleneck.
+DEFAULT_CONCURRENCY = 64
 DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_LATENCY_THRESHOLD_MS = 200.0
+MAX_WARMUP_REQUESTS = MAX_TOTAL_REQUESTS
 _CHAT_TYPES = {"p2p", "group"}
 _SAFE_RUN_ID = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+_LATENCY_HISTOGRAM_BUCKETS: tuple[tuple[str, float | None], ...] = (
+    ("0_10ms", 10.0),
+    ("10_25ms", 25.0),
+    ("25_50ms", 50.0),
+    ("50_100ms", 100.0),
+    ("100_200ms", 200.0),
+    ("200_500ms", 500.0),
+    ("500_1000ms", 1_000.0),
+    ("gt_1000ms", None),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +120,16 @@ class FeishuHTTPPerformanceResult:
     accepted_external_message_ids: tuple[str, ...]
     session_identity_inputs: tuple[FeishuSessionIdentityInput, ...]
     timed_out: bool = False
+    warmup_requested: int = 0
+    warmup_accepted: int = 0
+    warmup_failed: int = 0
+    warmup_accepted_external_message_ids: tuple[str, ...] = ()
+    warmup_session_identity_inputs: tuple[FeishuSessionIdentityInput, ...] = ()
+    p90_latency_ms: float | None = None
+    p99_latency_ms: float | None = None
+    latency_threshold_ms: float = DEFAULT_LATENCY_THRESHOLD_MS
+    over_threshold_count: int = 0
+    latency_histogram: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +195,35 @@ def validate_options(options: FeishuHTTPPerformanceOptions) -> None:
     _callback_url(options.base_url, options.binding_id)
 
 
+def _validate_run_evidence_options(warmup_requests: int, latency_threshold_ms: float) -> None:
+    if (
+        not isinstance(warmup_requests, int)
+        or isinstance(warmup_requests, bool)
+        or not 0 <= warmup_requests <= MAX_WARMUP_REQUESTS
+    ):
+        raise ValueError(f"warmup requests must be between 0 and {MAX_WARMUP_REQUESTS}")
+    if (
+        not isinstance(latency_threshold_ms, (int, float))
+        or isinstance(latency_threshold_ms, bool)
+        or not math.isfinite(float(latency_threshold_ms))
+        or latency_threshold_ms <= 0
+    ):
+        raise ValueError("latency threshold must be a finite positive number of milliseconds")
+
+
+def _latency_histogram(values: list[float]) -> dict[str, int]:
+    """Return a fixed-cardinality, non-sensitive histogram of formal latencies."""
+
+    histogram = {label: 0 for label, _ in _LATENCY_HISTOGRAM_BUCKETS}
+    for value in values:
+        safe_value = value if math.isfinite(value) and value >= 0 else math.inf
+        for label, upper_bound in _LATENCY_HISTOGRAM_BUCKETS:
+            if upper_bound is None or safe_value <= upper_bound:
+                histogram[label] += 1
+                break
+    return histogram
+
+
 def _callback_url(base_url: str, binding_id: str) -> str:
     """Build the callback route while rejecting caller-supplied query data."""
 
@@ -191,10 +245,11 @@ def _run_id(value: str | None) -> str:
 
 
 def _callback_inputs(
-    options: FeishuHTTPPerformanceOptions, run_id: str
+    options: FeishuHTTPPerformanceOptions, run_id: str, *, count: int | None = None
 ) -> tuple[_CallbackInput, ...]:
     result: list[_CallbackInput] = []
-    for index in range(options.total_requests):
+    request_count = options.total_requests if count is None else count
+    for index in range(request_count):
         suffix = f"{run_id}-{index:05d}"
         user_id = f"ou_perf_{suffix}"
         chat_id = f"oc_perf_{suffix}"
@@ -322,21 +377,72 @@ async def run_feishu_http_performance(
     options: FeishuHTTPPerformanceOptions,
     *,
     client: httpx.AsyncClient | None = None,
+    warmup_requests: int = 0,
+    latency_threshold_ms: float = DEFAULT_LATENCY_THRESHOLD_MS,
 ) -> FeishuHTTPPerformanceResult:
     """Send a bounded, rate-limited callback workload through a Feishu gateway.
 
     The caller must opt into real network activity by calling this function.
     Tests should pass an ``httpx.AsyncClient`` using ``MockTransport``.  If no
     client is supplied, this function owns and closes a client before return.
+    Optional warmup requests use the same client and encrypted callback route,
+    but their independent identities and observations are kept separate from
+    the formal workload metrics.
     """
 
     validate_options(options)
+    _validate_run_evidence_options(warmup_requests, latency_threshold_ms)
     run_id = _run_id(options.run_id)
     url = _callback_url(options.base_url, options.binding_id)
     inputs = _callback_inputs(options, run_id)
+    warmup_inputs = _callback_inputs(options, f"{run_id}-warmup", count=warmup_requests)
     own_client = client is None
     http = client or _owned_http_client(options)
     semaphore = asyncio.Semaphore(options.concurrency)
+    warmup_semaphore = asyncio.Semaphore(max(1, min(options.concurrency, warmup_requests)))
+    warmup_outcomes: list[bool | None] = [None] * warmup_requests
+
+    async def send_warmup(item: _CallbackInput) -> None:
+        try:
+            request = _signed_request(item, options=options, url=url)
+            async with warmup_semaphore:
+                async with asyncio.timeout(options.timeout_seconds):
+                    response = await http.send(request)
+            if not 200 <= response.status_code < 300:
+                return
+            try:
+                acknowledgement = response.json()
+            except (TypeError, ValueError):
+                return
+            if isinstance(acknowledgement, Mapping) and acknowledgement.get("msg") == "success":
+                warmup_outcomes[item.index] = True
+        except TimeoutError:
+            return
+        except httpx.HTTPError:
+            return
+        except Exception:
+            # Keep provider/client exception text out of the report.
+            return
+
+    warmup_tasks: list[asyncio.Task[None]] = []
+    if warmup_requests:
+        warmup_tasks = [asyncio.create_task(send_warmup(item)) for item in warmup_inputs]
+        warmup_batches = math.ceil(warmup_requests / options.concurrency)
+        warmup_timeout = min(
+            MAX_RUN_SECONDS,
+            max(
+                options.timeout_seconds,
+                (warmup_batches * options.timeout_seconds) + SCHEDULE_GRACE_SECONDS,
+            ),
+        )
+        try:
+            await asyncio.wait_for(asyncio.gather(*warmup_tasks), timeout=warmup_timeout)
+        except TimeoutError:
+            for task in warmup_tasks:
+                task.cancel()
+            await asyncio.gather(*warmup_tasks, return_exceptions=True)
+
+    warmup_accepted = tuple(item for item in warmup_inputs if warmup_outcomes[item.index] is True)
     outcomes: list[_ResponseOutcome | None] = [None] * options.total_requests
     inflight = 0
     max_inflight = 0
@@ -365,9 +471,7 @@ async def run_feishu_http_performance(
                 inflight += 1
                 max_inflight = max(max_inflight, inflight)
                 submission_start_times.append(time.perf_counter())
-                submission_started_at.append(
-                    datetime.now(UTC).isoformat().replace("+00:00", "Z")
-                )
+                submission_started_at.append(datetime.now(UTC).isoformat().replace("+00:00", "Z"))
             request = _signed_request(item, options=options, url=url)
             request_started = time.perf_counter()
             status_code: int | None = None
@@ -433,6 +537,7 @@ async def run_feishu_http_performance(
         outcome.failure_kind for outcome in completed if outcome.failure_kind is not None
     )
     accepted = tuple(outcome for outcome in completed if outcome.success)
+    threshold = float(latency_threshold_ms)
     submission_span = (
         submission_start_times[-1] - submission_start_times[0]
         if len(submission_start_times) > 1
@@ -463,6 +568,16 @@ async def run_feishu_http_performance(
         accepted_external_message_ids=tuple(outcome.message_id for outcome in accepted),
         session_identity_inputs=tuple(outcome.identity for outcome in accepted),
         timed_out=timed_out,
+        warmup_requested=warmup_requests,
+        warmup_accepted=len(warmup_accepted),
+        warmup_failed=warmup_requests - len(warmup_accepted),
+        warmup_accepted_external_message_ids=tuple(item.message_id for item in warmup_accepted),
+        warmup_session_identity_inputs=tuple(item.identity for item in warmup_accepted),
+        p90_latency_ms=_percentile(latencies, 0.90),
+        p99_latency_ms=_percentile(latencies, 0.99),
+        latency_threshold_ms=threshold,
+        over_threshold_count=sum(latency > threshold for latency in latencies),
+        latency_histogram=_latency_histogram(latencies),
     )
 
 
@@ -485,6 +600,7 @@ def _actual_start_rate(start_times: list[float]) -> float:
 
 __all__ = [
     "DEFAULT_CONCURRENCY",
+    "DEFAULT_LATENCY_THRESHOLD_MS",
     "DEFAULT_RATE_PER_SECOND",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TOTAL_REQUESTS",
@@ -494,6 +610,7 @@ __all__ = [
     "MAX_SCHEDULE_SECONDS",
     "MAX_TIMEOUT_SECONDS",
     "MAX_TOTAL_REQUESTS",
+    "MAX_WARMUP_REQUESTS",
     "SCHEDULE_GRACE_SECONDS",
     "FeishuHTTPPerformanceOptions",
     "FeishuHTTPPerformanceResult",

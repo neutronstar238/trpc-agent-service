@@ -118,6 +118,16 @@ class OutboundEnvelope(EnvelopeModel):
         return value
 
 
+class RecallEnvelope(EnvelopeModel):
+    """A durable request to recall one provider message."""
+
+    outbound_id: str = Field(min_length=1, max_length=512)
+    tenant_id: str = Field(min_length=1, max_length=128)
+    binding_id: str = Field(min_length=1, max_length=256)
+    channel: Channel
+    provider_message_id: str = Field(min_length=1, max_length=512)
+
+
 class DeliveryReceipt(EnvelopeModel):
     outbound_id: str
     status: DeliveryStatus
@@ -141,6 +151,7 @@ __all__ = [
     "MediaReference",
     "OutboundEnvelope",
     "PayloadKind",
+    "RecallEnvelope",
     "VerifiedCallback",
 ]
 

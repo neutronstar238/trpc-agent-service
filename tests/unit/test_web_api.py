@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -56,6 +58,87 @@ class AdminRepository:
 
     async def dead_letters(self, tenant_id, **kwargs):
         return await self._result("dead", kwargs, [])
+
+    async def wecom_acceptance_snapshot(self, tenant_id, binding_id, **kwargs):
+        return await self._result(
+            "wecom_acceptance",
+            {"tenant_id": tenant_id, "binding_id": binding_id, **kwargs},
+            {
+                "state": {
+                    "owner_hash": "a" * 64,
+                    "epoch": 1,
+                    "phase": "authenticated",
+                },
+                "events": [],
+            },
+        )
+
+    async def im_acceptance_outbound_evidence(self, tenant_id, binding_id, **kwargs):
+        run_id = kwargs["run_id"]
+        outbound_id = kwargs["outbound_id"]
+        return await self._result(
+            "im_acceptance_evidence",
+            {"tenant_id": tenant_id, "binding_id": binding_id, **kwargs},
+            {
+                "schema_version": 1,
+                "tenant_id": tenant_id,
+                "binding_id": binding_id,
+                "requested_run_id_sha256": hashlib.sha256(run_id.encode()).hexdigest(),
+                "run_correlation": {"availability": "unavailable"},
+                "outbound": {
+                    "availability": "available",
+                    "outbound_id_sha256": hashlib.sha256(str(outbound_id).encode()).hexdigest(),
+                    "delivery_status": "delivered",
+                    "provider_message_id_sha256": "a" * 64,
+                    "attempt_count": 1,
+                    "attempts_truncated": False,
+                    "attempts": [
+                        {
+                            "attempt_number": 1,
+                            "status": "delivered",
+                            "provider_code": "0",
+                        }
+                    ],
+                    "pending_count": 0,
+                    "dlq_count": 0,
+                },
+                "artifact": {"availability": "unavailable"},
+            },
+        )
+
+    async def im_acceptance_event_evidence(self, tenant_id, binding_id, **kwargs):
+        return await self._result(
+            "im_acceptance_event_evidence",
+            {"tenant_id": tenant_id, "binding_id": binding_id, **kwargs},
+            {
+                "schema_version": 1,
+                "tenant_id": tenant_id,
+                "binding_id": binding_id,
+                "channel": kwargs["channel"].value,
+                "requested_run_id_sha256": "b" * 64,
+                "run_binding_sha256": "c" * 64,
+                "provider_event_hash": kwargs["provider_event_hash"],
+                "correlation": {"availability": "available"},
+                "outbounds": {"count": 1, "truncated": False, "items": []},
+                "artifact": {"availability": "not_found", "count": 0, "items": []},
+            },
+        )
+
+    async def register_im_acceptance_run(self, tenant_id, binding_id, **kwargs):
+        return await self._result(
+            "register_im_acceptance_run",
+            {"tenant_id": tenant_id, "binding_id": binding_id, **kwargs},
+            {
+                "schema_version": 1,
+                "tenant_id": tenant_id,
+                "binding_id": binding_id,
+                "channel": kwargs["channel"].value,
+                "run_id_sha256": "d" * 64,
+                "run_binding_sha256": "e" * 64,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": "2026-01-01T00:05:00+00:00",
+            },
+        )
 
     async def replay_outbound(self, **kwargs):
         return await self._result("replay", kwargs, {"tenant_control_version": 5})
@@ -214,6 +297,329 @@ def test_admin_not_found_and_safe_repository_errors() -> None:
     ).json() == {"error": "idempotency_conflict"}
     repo.error = ControlVersionConflict()
     assert admin_client(repo).get("/v1/tenants/tenant-1", headers=headers()).status_code == 412
+
+
+def test_wecom_acceptance_snapshot_route_is_read_only_scoped_and_not_cached() -> None:
+    repo = AdminRepository()
+    auditor = Authorizer(
+        Principal(
+            subject="auditor",
+            roles=frozenset({Role.AUDITOR}),
+            tenant_ids=frozenset({"tenant-1"}),
+        )
+    )
+    response = admin_client(repo, auditor).get(
+        "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/wecom?limit=17",
+        headers=headers(),
+    )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert repo.calls[-1] == (
+        "wecom_acceptance",
+        {"tenant_id": "tenant-1", "binding_id": "binding-1", "limit": 17},
+    )
+    assert "secret" not in response.text
+
+    operator = Authorizer(
+        Principal(
+            subject="operator",
+            roles=frozenset({Role.TENANT_ADMIN}),
+            tenant_ids=frozenset({"tenant-1"}),
+        )
+    )
+    assert (
+        admin_client(AdminRepository(), operator)
+        .get(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/wecom",
+            headers=headers(),
+        )
+        .status_code
+        == 200
+    )
+
+    outside = Authorizer(
+        Principal(
+            subject="outside",
+            roles=frozenset({Role.AUDITOR}),
+            tenant_ids=frozenset({"tenant-2"}),
+        )
+    )
+    assert (
+        admin_client(AdminRepository(), outside)
+        .get(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/wecom",
+            headers=headers(),
+        )
+        .status_code
+        == 403
+    )
+    assert (
+        admin_client()
+        .get(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/wecom?limit=201",
+            headers=headers(),
+        )
+        .status_code
+        == 422
+    )
+
+
+def test_wecom_acceptance_snapshot_unknown_binding_is_generic_not_found() -> None:
+    repo = AdminRepository()
+
+    async def missing(*_args, **_kwargs):
+        return None
+
+    repo.wecom_acceptance_snapshot = missing  # type: ignore[method-assign]
+    response = admin_client(repo).get(
+        "/v1/tenants/tenant-1/bindings/missing/im-acceptance/wecom",
+        headers=headers(),
+    )
+    assert response.status_code == 404
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["detail"] == "resource not found"
+
+
+def test_im_acceptance_evidence_route_is_scoped_hash_only_and_not_cached() -> None:
+    repo = AdminRepository()
+    auditor = Authorizer(
+        Principal(
+            subject="auditor",
+            roles=frozenset({Role.AUDITOR}),
+            tenant_ids=frozenset({"tenant-1"}),
+        )
+    )
+    outbound_id = "11111111-1111-1111-1111-111111111111"
+    response = admin_client(repo, auditor).get(
+        "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/evidence",
+        params={"run_id": "im-run-123", "outbound_id": outbound_id},
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert repo.calls[-1] == (
+        "im_acceptance_evidence",
+        {
+            "tenant_id": "tenant-1",
+            "binding_id": "binding-1",
+            "run_id": "im-run-123",
+            "outbound_id": repo.calls[-1][1]["outbound_id"],
+        },
+    )
+    assert str(repo.calls[-1][1]["outbound_id"]) == outbound_id
+    rendered = response.text
+    assert "im-run-123" not in rendered
+    assert outbound_id not in rendered
+    assert "raw-provider" not in rendered
+    assert "secret" not in rendered
+    assert response.json()["outbound"]["provider_message_id_sha256"] == "a" * 64
+
+    outside = Authorizer(
+        Principal(
+            subject="outside",
+            roles=frozenset({Role.AUDITOR}),
+            tenant_ids=frozenset({"tenant-2"}),
+        )
+    )
+    assert (
+        admin_client(AdminRepository(), outside)
+        .get(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/evidence",
+            params={"run_id": "im-run-123", "outbound_id": outbound_id},
+            headers=headers(),
+        )
+        .status_code
+        == 403
+    )
+    assert (
+        admin_client()
+        .get(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/evidence",
+            params={"run_id": "contains space", "outbound_id": outbound_id},
+            headers=headers(),
+        )
+        .status_code
+        == 422
+    )
+
+
+def test_im_acceptance_evidence_unknown_binding_is_generic_not_found() -> None:
+    repo = AdminRepository()
+
+    async def missing(*_args, **_kwargs):
+        return None
+
+    repo.im_acceptance_outbound_evidence = missing  # type: ignore[method-assign]
+    response = admin_client(repo).get(
+        "/v1/tenants/tenant-1/bindings/missing/im-acceptance/evidence",
+        params={
+            "run_id": "im-run-123",
+            "outbound_id": "11111111-1111-1111-1111-111111111111",
+        },
+        headers=headers(),
+    )
+    assert response.status_code == 404
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["detail"] == "resource not found"
+
+
+def test_im_acceptance_event_evidence_is_scoped_content_free_and_no_store() -> None:
+    repo = AdminRepository()
+    event_hash = "a" * 64
+    response = admin_client(repo).post(
+        "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/event-evidence",
+        json={
+            "channel": "feishu",
+            "run_id": "im-run-456",
+            "run_nonce": "acceptance-nonce-123456",
+            "provider_event_hash": event_hash,
+        },
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert repo.calls[-1] == (
+        "im_acceptance_event_evidence",
+        {
+            "tenant_id": "tenant-1",
+            "binding_id": "binding-1",
+            "channel": repo.calls[-1][1]["channel"],
+            "run_id": "im-run-456",
+            "run_nonce": "acceptance-nonce-123456",
+            "provider_event_hash": event_hash,
+        },
+    )
+    assert repo.calls[-1][1]["channel"].value == "feishu"
+    assert "im-run-456" not in response.text
+    assert "acceptance-nonce-123456" not in response.text
+    assert response.json()["provider_event_hash"] == event_hash
+
+    invalid = admin_client().post(
+        "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/event-evidence",
+        json={
+            "channel": "feishu",
+            "run_id": "contains space",
+            "run_nonce": "short",
+            "provider_event_hash": "A" * 64,
+        },
+        headers=headers(),
+    )
+    assert invalid.status_code == 422
+
+    auditor = Authorizer(
+        Principal(
+            subject="auditor",
+            roles=frozenset({Role.AUDITOR}),
+            tenant_ids=frozenset({"tenant-1"}),
+        )
+    )
+    assert (
+        admin_client(AdminRepository(), auditor)
+        .post(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/event-evidence",
+            json={
+                "channel": "feishu",
+                "run_id": "im-run-456",
+                "run_nonce": "acceptance-nonce-123456",
+                "provider_event_hash": event_hash,
+            },
+            headers=headers(),
+        )
+        .status_code
+        == 403
+    )
+
+
+def test_register_im_acceptance_run_is_tenant_admin_scoped_and_content_free() -> None:
+    repo = AdminRepository()
+    response = admin_client(repo).post(
+        "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/runs",
+        json={
+            "channel": "feishu",
+            "run_id": "raw-run-id",
+            "run_nonce": "acceptance-nonce-123456",
+            "expires_in_seconds": 300,
+        },
+        headers=headers(),
+    )
+
+    assert response.status_code == 201
+    assert response.headers["cache-control"] == "no-store"
+    assert repo.calls[-1][0] == "register_im_acceptance_run"
+    assert repo.calls[-1][1]["expires_in_seconds"] == 300
+    assert "raw-run-id" not in response.text
+    assert "acceptance-nonce-123456" not in response.text
+    assert response.json()["run_id_sha256"] == "d" * 64
+    assert response.json()["run_binding_sha256"] == "e" * 64
+
+    auditor = Authorizer(
+        Principal(
+            subject="auditor",
+            roles=frozenset({Role.AUDITOR}),
+            tenant_ids=frozenset({"tenant-1"}),
+        )
+    )
+    assert (
+        admin_client(AdminRepository(), auditor)
+        .post(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/runs",
+            json={
+                "channel": "feishu",
+                "run_id": "run",
+                "run_nonce": "acceptance-nonce-123456",
+                "expires_in_seconds": 300,
+            },
+            headers=headers(),
+        )
+        .status_code
+        == 403
+    )
+
+    expired_or_duplicate = AdminRepository()
+
+    async def missing(*_args, **_kwargs):
+        return None
+
+    expired_or_duplicate.register_im_acceptance_run = missing  # type: ignore[method-assign]
+    assert (
+        admin_client(expired_or_duplicate)
+        .post(
+            "/v1/tenants/tenant-1/bindings/binding-1/im-acceptance/runs",
+            json={
+                "channel": "feishu",
+                "run_id": "used-run",
+                "run_nonce": "acceptance-nonce-123456",
+                "expires_in_seconds": 300,
+            },
+            headers=headers(),
+        )
+        .status_code
+        == 409
+    )
+
+
+def test_im_acceptance_event_evidence_unknown_binding_is_generic_not_found() -> None:
+    repo = AdminRepository()
+
+    async def missing(*_args, **_kwargs):
+        return None
+
+    repo.im_acceptance_event_evidence = missing  # type: ignore[method-assign]
+    response = admin_client(repo).post(
+        "/v1/tenants/tenant-1/bindings/missing/im-acceptance/event-evidence",
+        json={
+            "channel": "wecom_ai_bot",
+            "run_id": "im-run-456",
+            "run_nonce": "acceptance-nonce-123456",
+            "provider_event_hash": "c" * 64,
+        },
+        headers=headers(),
+    )
+    assert response.status_code == 404
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["detail"] == "resource not found"
 
 
 def test_health_metrics_and_all_safe_error_shapes() -> None:

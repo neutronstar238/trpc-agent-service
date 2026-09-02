@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import httpx
@@ -32,6 +34,7 @@ from scripts.evidence_lineage import (
     validate_release_binding,
 )
 from scripts.report_io import atomic_write_json
+from trpc_service.channels.base import ChannelCapabilities
 from trpc_service.channels.dispatcher import ChannelDispatcher
 from trpc_service.channels.envelopes import (
     DeliveryReceipt,
@@ -39,13 +42,19 @@ from trpc_service.channels.envelopes import (
     InboundEnvelope,
     OutboundEnvelope,
     PayloadKind,
+    RecallEnvelope,
 )
 from trpc_service.channels.feishu import FeishuAdapter
-from trpc_service.channels.wecom import WeComConnector
+from trpc_service.channels.wecom import WeComClient, WeComConnector
 from trpc_service.config.secrets import LocalSecretProvider, SecretRef
 from trpc_service.runtime import TenantRuntime
 from trpc_service.storage.memory import InMemoryRuntimeRepository
-from trpc_service.storage.models import Acceptance, BindingRoute, OutboxRecord
+from trpc_service.storage.models import (
+    Acceptance,
+    BindingRoute,
+    OutboxRecord,
+    WeComBindingLeaseGrant,
+)
 from trpc_service.tenant.models import (
     Channel,
     ChannelBinding,
@@ -84,6 +93,17 @@ class CountingRepository(InMemoryRuntimeRepository):
 
 
 class SequenceAdapter:
+    capabilities = ChannelCapabilities(
+        outbound_payloads=frozenset({PayloadKind.TEXT}),
+        stream=False,
+        card=False,
+        media=False,
+        recall=False,
+        proactive=True,
+        text_split=False,
+        max_text_bytes=None,
+    )
+
     def __init__(self, receipts: list[DeliveryReceipt]) -> None:
         self._receipts = receipts
         self.calls = 0
@@ -98,6 +118,14 @@ class SequenceAdapter:
                 status=DeliveryStatus.DELIVERED,
             )
         return receipt.model_copy(update={"outbound_id": envelope.outbound_id})
+
+    async def recall(self, envelope: RecallEnvelope, _binding: ChannelBinding) -> DeliveryReceipt:
+        return DeliveryReceipt(
+            outbound_id=envelope.outbound_id,
+            status=DeliveryStatus.FAILED,
+            provider_code="unsupported_capability",
+            retryable=False,
+        )
 
 
 class _WeComSequenceClient:
@@ -124,18 +152,44 @@ class _TakeoverLease:
         self.owner: str | None = None
         self.acquired: list[str] = []
         self.released: list[str] = []
+        self._epoch = 0
+        self._grant: WeComBindingLeaseGrant | None = None
 
-    async def acquire_binding(self, _binding_id: str, owner_id: str) -> bool:
+    async def acquire_binding(
+        self, binding: ChannelBinding, owner_id: str
+    ) -> WeComBindingLeaseGrant | None:
         if self.owner is not None:
-            return False
+            return None
+        self._epoch += 1
         self.owner = owner_id
         self.acquired.append(owner_id)
-        return True
+        self._grant = WeComBindingLeaseGrant(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.binding_id,
+            owner_hash=hashlib.sha256(owner_id.encode("utf-8")).hexdigest(),
+            epoch=self._epoch,
+            acquired_at=datetime.now(UTC),
+        )
+        return self._grant
 
-    async def release_binding(self, _binding_id: str, owner_id: str) -> None:
-        if self.owner == owner_id:
+    async def mark_authenticated(self, grant: WeComBindingLeaseGrant) -> bool:
+        return grant == self._grant
+
+    async def record_provider_event(
+        self, grant: WeComBindingLeaseGrant, _provider_event_id: str
+    ) -> bool:
+        return grant == self._grant
+
+    async def mark_disconnected(self, grant: WeComBindingLeaseGrant) -> bool:
+        return grant == self._grant
+
+    async def release_binding(self, grant: WeComBindingLeaseGrant) -> None:
+        owner_id = self.owner
+        if grant == self._grant:
             self.owner = None
-        self.released.append(owner_id)
+            self._grant = None
+        if owner_id is not None:
+            self.released.append(owner_id)
 
 
 def _repository() -> tuple[CountingRepository, TenantRuntime, ChannelBinding, InboundEnvelope]:
@@ -305,7 +359,8 @@ async def _wecom_rate_limit_case() -> dict[str, Any]:
         _TakeoverLease(),
         owner_id="offline-wecom-dispatcher",
     )
-    connector._clients[binding.binding_id] = client
+    connector._clients[binding.binding_id] = cast(WeComClient, client)
+    connector._fenced_bindings.add(binding.binding_id)
     dispatcher = ChannelDispatcher(
         repository,
         {Channel.WECOM_AI_BOT: connector},
@@ -375,8 +430,8 @@ async def _wecom_disconnect_lock_takeover_case() -> dict[str, Any]:
 
     clients = [DisconnectingClient(), DisconnectingClient()]
 
-    def factory(_account: str, _secret: str) -> DisconnectingClient:
-        return clients.pop(0)
+    def factory(_account: str, _secret: str) -> WeComClient:
+        return cast(WeComClient, clients.pop(0))
 
     accepted: list[str] = []
 

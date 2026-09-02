@@ -50,12 +50,16 @@ class _Repository:
         self.dead_letters.append((record.outbox_id, f"{owner_id}:{reason}"))
 
 
-def _outbound_record() -> tuple[OutboxRecord, BindingRoute]:
+def _outbound_record(
+    *,
+    channel: Channel = Channel.FEISHU,
+    attempts: int = 0,
+) -> tuple[OutboxRecord, BindingRoute]:
     binding = ChannelBinding(
         binding_id="binding-a",
         tenant_id="tenant-a",
         app_id="app-a",
-        channel=Channel.FEISHU,
+        channel=channel,
         account_id="account-a",
     )
     envelope = OutboundEnvelope(
@@ -73,6 +77,7 @@ def _outbound_record() -> tuple[OutboxRecord, BindingRoute]:
         event_type="outbound.feishu.ready",
         aggregate_id=envelope.outbound_id,
         payload=envelope.model_dump(mode="json"),
+        attempts=attempts,
     )
     return record, BindingRoute(binding=binding, active_config_version=1)
 
@@ -190,6 +195,88 @@ async def test_dispatcher_uses_atomic_delivery_attempt_and_finish() -> None:
     assert repository.begin_calls == 1
     assert repository.finish_calls[0]["attempt_number"] == 2
     assert repository.finish_calls[0]["receipt"].status == DeliveryStatus.DELIVERED
+
+
+@pytest.mark.asyncio
+async def test_wecom_standby_releases_outbox_before_attempt_then_delivers_when_ready() -> None:
+    record, route = _outbound_record(channel=Channel.WECOM_AI_BOT)
+    attempt = DeliveryAttempt(
+        tenant_id=record.tenant_id,
+        outbound_id=record.aggregate_id,
+        attempt_number=1,
+        owner_id="dispatcher-a",
+    )
+    repository = _AtomicRepository(record, route, attempt)
+    adapter = _Adapter()
+    ready = False
+
+    def binding_ready(_binding: ChannelBinding) -> bool:
+        return ready
+
+    dispatcher = ChannelDispatcher(
+        repository,
+        {Channel.WECOM_AI_BOT: adapter},
+        owner_id="dispatcher-a",
+        event_type=record.event_type,
+        binding_ready=binding_ready,
+    )
+
+    assert await dispatcher.dispatch_once() == 0
+    assert repository.begin_calls == 0
+    assert adapter.calls == 0
+    assert repository.finish_calls == []
+    assert repository.dead_letters == []
+    assert repository.released == [
+        (
+            record.tenant_id,
+            record.outbox_id,
+            {
+                "owner_id": "dispatcher-a",
+                "delay": timedelta(milliseconds=100),
+                "error_type": "adapter_standby",
+            },
+        )
+    ]
+
+    ready = True
+    assert await dispatcher.dispatch_once() == 1
+    assert repository.begin_calls == 1
+    assert adapter.calls == 1
+    assert repository.finish_calls[0]["receipt"].status == DeliveryStatus.DELIVERED
+    assert repository.dead_letters == []
+
+
+@pytest.mark.asyncio
+async def test_atomic_retry_budget_uses_delivery_attempt_not_outbox_claim_count() -> None:
+    record, route = _outbound_record(attempts=99)
+    attempt = DeliveryAttempt(
+        tenant_id=record.tenant_id,
+        outbound_id=record.aggregate_id,
+        attempt_number=1,
+        owner_id="dispatcher-a",
+    )
+    repository = _AtomicRepository(record, route, attempt)
+    retryable = DeliveryReceipt(
+        outbound_id=record.aggregate_id,
+        status=DeliveryStatus.FAILED,
+        provider_code="rate_limit",
+        retryable=True,
+    )
+    dispatcher = ChannelDispatcher(
+        repository,
+        {Channel.FEISHU: _Adapter(retryable)},
+        owner_id="dispatcher-a",
+        event_type=record.event_type,
+        max_attempts=2,
+        retry_jitter=lambda seconds: seconds,
+    )
+
+    assert await dispatcher.dispatch_once() == 0
+    assert repository.begin_calls == 1
+    assert repository.dead_letters == []
+    assert repository.finish_calls[0]["attempt_number"] == 1
+    assert repository.finish_calls[0]["receipt"].retryable is True
+    assert repository.finish_calls[0]["retry_delay"] == timedelta(seconds=2)
 
 
 @pytest.mark.asyncio

@@ -76,8 +76,10 @@ from trpc_service.storage.services import (
     PostgresSummaryStore,
     PostgresTenantServiceFactory,
     ProfileServiceFactory,
+    RegisteredTenantServiceBundle,
     TenantDataServices,
     TenantServiceFactory,
+    TenantStorageProfileRegistry,
 )
 
 __all__ = [
@@ -131,6 +133,7 @@ __all__ = [
     "PreparedInbound",
     "ProfileServiceFactory",
     "RedisMigrationSource",
+    "RegisteredTenantServiceBundle",
     "RuntimeRepository",
     "S3ArtifactStore",
     "SessionClaim",
@@ -145,6 +148,7 @@ __all__ = [
     "TargetEmptyPreflight",
     "TenantDataServices",
     "TenantServiceFactory",
+    "TenantStorageProfileRegistry",
     "TurnCommit",
     "build_media_idempotency_key",
     "media_idempotency_key",

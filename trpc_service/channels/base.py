@@ -10,6 +10,8 @@ from trpc_service.channels.envelopes import (
     DeliveryReceipt,
     InboundEnvelope,
     OutboundEnvelope,
+    PayloadKind,
+    RecallEnvelope,
     VerifiedCallback,
 )
 from trpc_service.tenant.models import ChannelBinding
@@ -31,9 +33,29 @@ class WebhookChannelAdapter(Protocol):
     ) -> VerifiedCallback: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelCapabilities:
+    """Implemented outbound behavior, not the provider's theoretical surface."""
+
+    outbound_payloads: frozenset[PayloadKind]
+    stream: bool
+    card: bool
+    media: bool
+    recall: bool
+    proactive: bool
+    text_split: bool
+    max_text_bytes: int | None
+
+
 class ChannelAdapter(Protocol):
+    capabilities: ChannelCapabilities
+
     async def send(
         self, envelope: OutboundEnvelope, binding: ChannelBinding
+    ) -> DeliveryReceipt: ...
+
+    async def recall(
+        self, envelope: RecallEnvelope, binding: ChannelBinding
     ) -> DeliveryReceipt: ...
 
 
@@ -46,6 +68,7 @@ class StreamingChannelConnector(Protocol):
 
 __all__ = [
     "ChannelAdapter",
+    "ChannelCapabilities",
     "InboundSink",
     "StreamingChannelConnector",
     "WebhookChannelAdapter",

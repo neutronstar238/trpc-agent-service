@@ -116,6 +116,7 @@ _WORKER_DATABASE_ROLES = {
     "post-turn-projector",
     "wecom-connector",
     "session-recovery",
+    "artifact-gc",
 }
 _SUPPORTED_ROLES = frozenset(_REDIS_ROLES | _WORKER_DATABASE_ROLES | {"admin"})
 _DATABASE_FUNCTIONS = {
@@ -145,6 +146,7 @@ _DATABASE_FUNCTIONS = {
         "public.reconcile_session_mailboxes(integer)",
         "public.reconcile_session_mailboxes_v2(integer,integer)",
     ),
+    "artifact-gc": (),
 }
 _WORKER_TABLES = (
     "tenants",
@@ -176,7 +178,12 @@ _WORKER_TABLES = (
     "fault_stage_controls",
     "session_mailboxes",
     "session_mailbox_items",
+    "wecom_connection_state",
+    "im_acceptance_evidence_events",
 )
+_WORKER_TABLE_PRIVILEGES = {table: "SELECT,INSERT,UPDATE,DELETE" for table in _WORKER_TABLES}
+_WORKER_TABLE_PRIVILEGES["wecom_connection_state"] = "SELECT,INSERT,UPDATE"
+_WORKER_TABLE_PRIVILEGES["im_acceptance_evidence_events"] = "SELECT,INSERT"
 
 
 def _url_password(url: str, password: str | None) -> str:
@@ -220,9 +227,7 @@ async def check(role: str) -> bool:
         database_url = _resolve_reference("TRPC_SERVICE_DATABASE_DSN")
         if database_url is None:
             database_url = _resolve_reference("TRPC_SERVICE_DATABASE_DSN_REF")
-        password_configured = bool(
-            os.getenv("TRPC_SERVICE_DATABASE_PASSWORD_REF", "").strip()
-        )
+        password_configured = bool(os.getenv("TRPC_SERVICE_DATABASE_PASSWORD_REF", "").strip())
         password_reference = _resolve_reference("TRPC_SERVICE_DATABASE_PASSWORD_REF")
         expected_role = "trpc_runtime"
     if password_configured and password_reference is None:
@@ -236,6 +241,7 @@ async def check(role: str) -> bool:
     )
     connection: asyncpg.Connection | None = None
     redis = None
+    s3 = None
     try:
         connection = await asyncpg.connect(database_url, timeout=3, command_timeout=3)
         if await connection.fetchval("SELECT 1") != 1:
@@ -286,14 +292,35 @@ async def check(role: str) -> bool:
                     has_table_privilege(
                         current_user,
                         format('public.%I', table_name),
-                        'SELECT,INSERT,UPDATE,DELETE'
+                        privilege_list
                     )
                 )
-                  FROM unnest($1::text[]) AS table_name
+                  FROM unnest($1::text[], $2::text[])
+                    AS required(table_name, privilege_list)
             """,
-            list(_WORKER_TABLES),
+            list(_WORKER_TABLE_PRIVILEGES),
+            list(_WORKER_TABLE_PRIVILEGES.values()),
         ):
             return False
+        if role == "artifact-gc":
+            endpoint = os.getenv("TRPC_SERVICE_S3_ENDPOINT", "").strip()
+            access_key = os.getenv("TRPC_SERVICE_S3_ACCESS_KEY", "").strip()
+            secret_key = _resolve_reference("TRPC_SERVICE_S3_SECRET_KEY_REF")
+            bucket = os.getenv("TRPC_SERVICE_S3_BUCKET", "").strip()
+            if not endpoint or not access_key or not secret_key or not bucket:
+                return False
+            import boto3
+            from botocore.config import Config
+
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name="us-east-1",
+                config=Config(connect_timeout=3, read_timeout=3, retries={"max_attempts": 1}),
+            )
+            await asyncio.to_thread(s3.head_bucket, Bucket=bucket)
         if role in _REDIS_ROLES:
             assert redis_url is not None
             redis_password_configured = bool(
@@ -312,8 +339,9 @@ async def check(role: str) -> bool:
             )
             ping_result = redis.ping()
             if isinstance(ping_result, Awaitable):
-                ping_result = await ping_result
-            if not ping_result:
+                if not await ping_result:
+                    return False
+            elif not ping_result:
                 return False
         return True
     except Exception:
@@ -321,6 +349,8 @@ async def check(role: str) -> bool:
     finally:
         if redis is not None:
             await redis.aclose()
+        if s3 is not None:
+            s3.close()
         if connection is not None:
             await connection.close()
 

@@ -89,6 +89,14 @@ services:
           pids: 256
           cpus: "0.25"
           memory: 256M
+  artifact-gc:
+    <<: *acceptance-defaults
+    deploy:
+      resources:
+        limits:
+          pids: 256
+          cpus: "0.25"
+          memory: 256M
   postgres:
     <<: *acceptance-defaults
     deploy:

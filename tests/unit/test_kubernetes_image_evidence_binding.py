@@ -94,9 +94,7 @@ def _isolated_valid_report() -> dict[str, Any]:
 def test_valid_dealiased_image_evidence_is_accepted() -> None:
     report = _isolated_valid_report()
 
-    runtime_ok, runtime_reasons = runtime_gate._runtime_attestation_contract(
-        report["candidate"]
-    )
+    runtime_ok, runtime_reasons = runtime_gate._runtime_attestation_contract(report["candidate"])
     assert runtime_ok, runtime_reasons
     assert release_gate._validate_kubernetes_semantics(report, report["evidence"]) == (None, None)
 
@@ -137,9 +135,7 @@ def test_runtime_and_release_gates_fail_closed_on_image_evidence_mismatch(
     report = _isolated_valid_report()
     _apply_mutation(report, mutation)
 
-    runtime_ok, runtime_reasons = runtime_gate._runtime_attestation_contract(
-        report["candidate"]
-    )
+    runtime_ok, runtime_reasons = runtime_gate._runtime_attestation_contract(report["candidate"])
     assert runtime_ok is False, mutation
     assert runtime_reasons, mutation
 

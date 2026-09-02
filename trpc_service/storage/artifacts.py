@@ -6,13 +6,16 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Protocol
 from uuid import uuid4
 
 DEFAULT_MAX_ARTIFACT_SIZE = 25 * 1024 * 1024
+_STAGING_KEY_RE = re.compile(r"^tenants/[0-9a-f]{64}/staging/[0-9a-f-]{36}$")
 
 
 class S3Client(Protocol):
@@ -25,6 +28,8 @@ class S3Client(Protocol):
     def delete_object(self, **kwargs: Any) -> Any: ...
 
     def get_object(self, **kwargs: Any) -> Mapping[str, Any]: ...
+
+    def list_objects_v2(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,6 +471,51 @@ class S3ArtifactStore(_ArtifactStoreBase):
     async def discard(self, staged_key: str, *, tenant_id: str | None = None) -> None:
         if tenant_id is not None and not staged_key.startswith(self._staging_prefix(tenant_id)):
             raise ValueError("staged artifact does not belong to tenant")
+        await self._delete_any(staged_key)
+
+    async def list_staged(
+        self,
+        *,
+        older_than: datetime,
+        limit: int,
+        continuation_token: str | None = None,
+    ) -> tuple[tuple[str, ...], str | None]:
+        """Return one bounded S3 page of expired staging keys for orphan cleanup."""
+
+        if older_than.tzinfo is None or older_than.utcoffset() is None:
+            raise ValueError("older_than must be timezone-aware")
+        if limit < 1 or limit > 1_000:
+            raise ValueError("staging list limit must be between 1 and 1000")
+        options: dict[str, Any] = {
+            "Bucket": self._bucket,
+            "Prefix": "tenants/",
+            "MaxKeys": limit,
+        }
+        if continuation_token:
+            options["ContinuationToken"] = continuation_token
+        response = await asyncio.to_thread(self._client.list_objects_v2, **options)
+        keys: list[str] = []
+        for item in response.get("Contents", ()):
+            if not isinstance(item, Mapping):
+                continue
+            key = item.get("Key")
+            modified = item.get("LastModified")
+            if (
+                isinstance(key, str)
+                and _STAGING_KEY_RE.fullmatch(key) is not None
+                and isinstance(modified, datetime)
+                and modified.tzinfo is not None
+                and modified <= older_than
+            ):
+                keys.append(key)
+        next_token = response.get("NextContinuationToken")
+        return tuple(keys), str(next_token) if isinstance(next_token, str) else None
+
+    async def discard_unreferenced_staged(self, staged_key: str) -> None:
+        """Delete only a structurally valid staging key discovered by bucket scan."""
+
+        if _STAGING_KEY_RE.fullmatch(staged_key) is None:
+            raise ValueError("object is not a valid staged artifact key")
         await self._delete_any(staged_key)
 
     async def read(self, tenant_id: str, object_key: str) -> bytes:

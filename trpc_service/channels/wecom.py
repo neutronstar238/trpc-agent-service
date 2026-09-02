@@ -23,7 +23,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
-from trpc_service.channels.base import InboundSink
+from trpc_service.channels.base import ChannelCapabilities, InboundSink
 from trpc_service.channels.envelopes import (
     DeliveryReceipt,
     DeliveryStatus,
@@ -31,6 +31,7 @@ from trpc_service.channels.envelopes import (
     MediaReference,
     OutboundEnvelope,
     PayloadKind,
+    RecallEnvelope,
 )
 from trpc_service.channels.media_locator import (
     WeComMediaLocatorCipher,
@@ -41,6 +42,7 @@ from trpc_service.channels.wecom_download import (
     WeComDownloadError,
 )
 from trpc_service.config.secrets import SecretProvider, SecretRef
+from trpc_service.storage.models import WeComBindingLeaseGrant
 from trpc_service.tenant.models import Channel, ChannelBinding, ConversationKind
 
 logger = logging.getLogger(__name__)
@@ -53,9 +55,23 @@ _JITTER_RANDOM = random.SystemRandom()
 
 
 class BindingLease(Protocol):
-    async def acquire_binding(self, binding_id: str, owner_id: str) -> bool: ...
+    async def acquire_binding(
+        self, binding: ChannelBinding, owner_id: str
+    ) -> WeComBindingLeaseGrant | None: ...
 
-    async def release_binding(self, binding_id: str, owner_id: str) -> None: ...
+    async def mark_authenticated(self, grant: WeComBindingLeaseGrant) -> bool: ...
+
+    async def record_provider_event(
+        self, grant: WeComBindingLeaseGrant, provider_event_id: str
+    ) -> bool: ...
+
+    async def mark_disconnected(self, grant: WeComBindingLeaseGrant) -> bool: ...
+
+    async def release_binding(self, grant: WeComBindingLeaseGrant) -> None: ...
+
+
+class WeComBindingLeaseUnavailable(RuntimeError):
+    """Signal that a healthy peer currently owns the binding connection."""
 
 
 class WeComDownloadClient(Protocol):
@@ -66,6 +82,7 @@ class WeComDownloadClient(Protocol):
 
 class WeComClient(WeComDownloadClient, Protocol):
     is_connected: bool
+    is_authenticated: bool
 
     def on(self, event: str, handler: Callable[..., Awaitable[None] | None]) -> Any: ...
 
@@ -596,8 +613,7 @@ async def _download_wecom_media_with_retry(
 def _client_ready(client: object) -> bool:
     if not bool(getattr(client, "is_connected", False)):
         return False
-    authenticated = getattr(client, "is_authenticated", None)
-    return authenticated is not False
+    return getattr(client, "is_authenticated", False) is True
 
 
 def _safe_filename(value: object) -> str | None:
@@ -631,6 +647,17 @@ def _media_kind(media_type: str, reference: MediaReference) -> str:
 
 
 class WeComConnector:
+    capabilities = ChannelCapabilities(
+        outbound_payloads=frozenset({PayloadKind.TEXT}),
+        stream=False,
+        card=False,
+        media=False,
+        recall=False,
+        proactive=True,
+        text_split=False,
+        max_text_bytes=None,
+    )
+
     def __init__(
         self,
         secrets: SecretProvider,
@@ -643,11 +670,14 @@ class WeComConnector:
         media_timeout_seconds: float = 30.0,
         reconnect_delay_seconds: float = 0.5,
         max_reconnect_delay_seconds: float = 30.0,
+        authentication_timeout_seconds: float = 10.0,
     ) -> None:
         if max_media_bytes <= 0:
             raise ValueError("media byte limit must be positive")
         if media_timeout_seconds <= 0:
             raise ValueError("media timeout must be positive")
+        if authentication_timeout_seconds <= 0:
+            raise ValueError("authentication timeout must be positive")
         self._secrets = secrets
         self._binding_lease = binding_lease
         self._owner_id = owner_id
@@ -657,7 +687,9 @@ class WeComConnector:
         self._media_timeout_seconds = media_timeout_seconds
         self._reconnect_delay_seconds = reconnect_delay_seconds
         self._max_reconnect_delay_seconds = max_reconnect_delay_seconds
+        self._authentication_timeout_seconds = authentication_timeout_seconds
         self._clients: dict[str, WeComClient] = {}
+        self._fenced_bindings: set[str] = set()
 
     async def run(
         self,
@@ -666,9 +698,17 @@ class WeComConnector:
         stop_event: asyncio.Event | None = None,
         emergency_sink: InboundSink | None = None,
     ) -> None:
-        if not await self._binding_lease.acquire_binding(binding.binding_id, self._owner_id):
-            raise RuntimeError("another connector owns this channel binding")
+        grant = await self._binding_lease.acquire_binding(binding, self._owner_id)
+        if grant is None:
+            raise WeComBindingLeaseUnavailable("another connector owns this channel binding")
         client: WeComClient | None = None
+        authenticated = False
+        authentication_started = False
+        authentication_complete = asyncio.Event()
+        authentication_error: Exception | None = None
+        disconnected = asyncio.Event()
+        state_lock = asyncio.Lock()
+        closing = False
         try:
             secret_ref = binding.secret_refs.get("bot_secret")
             if secret_ref is None:
@@ -678,12 +718,63 @@ class WeComConnector:
                 _resolve_tenant_secret(self._secrets, secret_ref),
             )
             self._clients[binding.binding_id] = client
-            disconnected = asyncio.Event()
+
+            async def activate_if_authenticated() -> bool:
+                nonlocal authenticated, authentication_error, authentication_started
+                wait_for_existing = False
+                async with state_lock:
+                    if authenticated:
+                        return True
+                    if closing or disconnected.is_set() or authentication_complete.is_set():
+                        return False
+                    if authentication_started:
+                        wait_for_existing = True
+                    elif not _client_ready(client):
+                        return False
+                    else:
+                        authentication_started = True
+                if wait_for_existing:
+                    await authentication_complete.wait()
+                    return authenticated and binding.binding_id in self._fenced_bindings
+                try:
+                    fenced = await self._binding_lease.mark_authenticated(grant)
+                except Exception as error:
+                    async with state_lock:
+                        if not closing:
+                            authentication_error = error
+                        authentication_complete.set()
+                    return False
+                async with state_lock:
+                    if fenced and not closing and not disconnected.is_set():
+                        authenticated = True
+                        self._fenced_bindings.add(binding.binding_id)
+                    authentication_complete.set()
+                    return authenticated
+
+            async def on_authenticated(*_: object) -> None:
+                await activate_if_authenticated()
 
             async def on_disconnected(*_: object) -> None:
-                disconnected.set()
+                nonlocal closing
+                async with state_lock:
+                    closing = True
+                    self._fenced_bindings.discard(binding.binding_id)
+                    disconnected.set()
+                    authentication_complete.set()
+                try:
+                    await self._binding_lease.mark_disconnected(grant)
+                except Exception:
+                    logger.warning(
+                        "WeCom disconnect evidence failed",
+                        extra={"binding_id": binding.binding_id},
+                    )
 
             async def accept_frame(frame: object) -> None:
+                if not await activate_if_authenticated():
+                    if not authentication_complete.is_set():
+                        await authentication_complete.wait()
+                    if binding.binding_id not in self._fenced_bindings:
+                        return
                 envelope = parse_wecom_frame(frame, account_id=binding.account_id)
                 if self._locator_cipher is not None and envelope.media:
                     envelope = envelope.model_copy(
@@ -707,6 +798,7 @@ class WeComConnector:
                     # the explicit emergency sink owns durable encrypted
                     # buffering and may itself raise to trigger backpressure.
                     await emergency_sink(binding.binding_id, envelope)
+                await self._binding_lease.record_provider_event(grant, envelope.external_message_id)
 
             async def accept_video_frame(frame: object) -> None:
                 """Handle video through the SDK's generic message event."""
@@ -718,6 +810,7 @@ class WeComConnector:
                 if message_type == "video":
                     await accept_frame(frame)
 
+            client.on("authenticated", on_authenticated)
             client.on("disconnected", on_disconnected)
             client.on("event.disconnected_event", on_disconnected)
             for event_name in (
@@ -726,17 +819,39 @@ class WeComConnector:
                 "message.mixed",
                 "message.voice",
                 "message.file",
-                "event",
             ):
                 client.on(event_name, accept_frame)
+            # Lifecycle events such as ``enter_chat`` are not user prompts.
+            # They need a dedicated idempotent handler before they can produce
+            # outbound messages; routing them through the Agent duplicates the
+            # reply when the user's first text frame follows the event.
             client.on("message", accept_video_frame)
             await client.connect_async()
-            if client.is_connected:
+            await activate_if_authenticated()
+            activation = await _wait_for_authentication_or_end(
+                authentication_complete,
+                disconnected,
+                stop_event,
+                timeout_seconds=self._authentication_timeout_seconds,
+            )
+            if activation == "timeout":
+                raise TimeoutError("WeCom authentication timed out")
+            if activation == "authenticated":
+                if authentication_error is not None:
+                    raise authentication_error
+                if not authenticated:
+                    raise RuntimeError("WeCom authentication fencing rejected")
+                if not _client_ready(client):
+                    return
                 if stop_event is None:
                     await disconnected.wait()
                 else:
                     await _wait_for_disconnect_or_stop(disconnected, stop_event)
         finally:
+            async with state_lock:
+                closing = True
+                self._fenced_bindings.discard(binding.binding_id)
+                authentication_complete.set()
             try:
                 if client is not None:
                     result = client.disconnect()
@@ -744,7 +859,11 @@ class WeComConnector:
                         await result
             finally:
                 self._clients.pop(binding.binding_id, None)
-                await self._binding_lease.release_binding(binding.binding_id, self._owner_id)
+                try:
+                    if authenticated:
+                        await self._binding_lease.mark_disconnected(grant)
+                finally:
+                    await self._binding_lease.release_binding(grant)
 
     async def download_media(
         self,
@@ -773,7 +892,11 @@ class WeComConnector:
                 raise WeComMediaError("media_locator_invalid") from None
         _media_inputs(reference)
         connected_client = self._clients.get(binding.binding_id)
-        if connected_client is None or not _client_ready(connected_client):
+        if (
+            connected_client is None
+            or binding.binding_id not in self._fenced_bindings
+            or not _client_ready(connected_client)
+        ):
             raise WeComMediaError("connector_unavailable", retryable=True)
         client = BoundedWeComDownloadClient(
             self._max_media_bytes,
@@ -793,9 +916,23 @@ class WeComConnector:
         finally:
             await client.close()
 
+    def ready_for_delivery(self, binding: ChannelBinding) -> bool:
+        """Return whether this replica owns an authenticated client for a binding."""
+
+        client = self._clients.get(binding.binding_id)
+        return (
+            client is not None
+            and binding.binding_id in self._fenced_bindings
+            and _client_ready(client)
+        )
+
     async def send(self, envelope: OutboundEnvelope, binding: ChannelBinding) -> DeliveryReceipt:
         client = self._clients.get(binding.binding_id)
-        if client is None or not _client_ready(client):
+        if (
+            client is None
+            or binding.binding_id not in self._fenced_bindings
+            or not _client_ready(client)
+        ):
             return DeliveryReceipt(
                 outbound_id=envelope.outbound_id,
                 status=DeliveryStatus.FAILED,
@@ -843,6 +980,16 @@ class WeComConnector:
             )
         return _wecom_response_receipt(envelope, response)
 
+    async def recall(self, envelope: RecallEnvelope, binding: ChannelBinding) -> DeliveryReceipt:
+        """Fail closed because the AI Bot adapter has no recall protocol."""
+
+        del binding
+        return DeliveryReceipt(
+            outbound_id=envelope.outbound_id,
+            status=DeliveryStatus.FAILED,
+            provider_code="unsupported_capability",
+        )
+
 
 async def _wait_for_disconnect_or_stop(
     disconnected: asyncio.Event,
@@ -860,6 +1007,39 @@ async def _wait_for_disconnect_or_stop(
             if not task.done():
                 task.cancel()
         await asyncio.gather(stop_task, disconnect_task, return_exceptions=True)
+
+
+async def _wait_for_authentication_or_end(
+    authentication_complete: asyncio.Event,
+    disconnected: asyncio.Event,
+    stop_event: asyncio.Event | None,
+    *,
+    timeout_seconds: float,
+) -> str:
+    authentication_task = asyncio.create_task(authentication_complete.wait())
+    disconnect_task = asyncio.create_task(disconnected.wait())
+    tasks = [authentication_task, disconnect_task]
+    stop_task = asyncio.create_task(stop_event.wait()) if stop_event is not None else None
+    if stop_task is not None:
+        tasks.append(stop_task)
+    try:
+        await asyncio.wait(
+            tasks,
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnected.is_set():
+            return "disconnected"
+        if stop_event is not None and stop_event.is_set():
+            return "stopped"
+        if authentication_complete.is_set():
+            return "authenticated"
+        return "timeout"
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _runtime_error_receipt(envelope: OutboundEnvelope, error: BaseException) -> DeliveryReceipt:
@@ -1064,6 +1244,7 @@ def _response_retry_after(response: object) -> float | None:
 
 __all__ = [
     "BindingLease",
+    "WeComBindingLeaseUnavailable",
     "WeComClient",
     "WeComConnector",
     "WeComMediaDownloader",

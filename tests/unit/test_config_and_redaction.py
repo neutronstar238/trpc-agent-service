@@ -144,6 +144,38 @@ def test_timeout_lease_boundary_accepts_strictly_shorter_ack_deadline() -> None:
     assert settings.redis_ack_timeout_seconds == 9.999
 
 
+def test_feishu_send_api_root_is_online_only_and_canonical() -> None:
+    default = ServiceSettings(_env_file=None)
+    assert default.feishu_send_api_root == "https://open.feishu.cn"
+
+    custom = ServiceSettings(
+        _env_file=None,
+        online_tests_enabled=True,
+        feishu_send_api_root="https://probe.example/feishu-openapi",
+    )
+    assert custom.feishu_send_api_root.endswith("/feishu-openapi")
+
+    with pytest.raises(ValidationError, match="requires online tests"):
+        ServiceSettings(
+            _env_file=None,
+            feishu_send_api_root="https://probe.example/feishu-openapi",
+        )
+    for value in (
+        "http://probe.example/feishu-openapi",
+        "https://user@probe.example/feishu-openapi",
+        "https://probe.example/feishu-openapi/",
+        "https://probe.example/../feishu-openapi",
+        "https://probe.example/feishu-openapi?token=secret",
+        "https://probe.example:443/feishu-openapi",
+    ):
+        with pytest.raises(ValidationError, match="canonical HTTPS"):
+            ServiceSettings(
+                _env_file=None,
+                online_tests_enabled=True,
+                feishu_send_api_root=value,
+            )
+
+
 def test_production_and_fault_injection_safety_branches() -> None:
     production = {
         "environment": Environment.PRODUCTION,

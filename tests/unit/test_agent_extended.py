@@ -11,6 +11,7 @@ from trpc_agent_sdk.models import LLMModel, LlmRequest, LlmResponse
 from trpc_agent_sdk.tools import FunctionTool
 from trpc_agent_sdk.types import Blob, Content, Part
 
+import trpc_service.agent.wecom_manager as wecom_manager_module
 import trpc_service.agent.worker as worker_module
 from tests.conftest import binding, envelope, repository, tenant_config
 from trpc_service.agent.factory import DevelopmentAgentLoader, FallbackModel, ProductionAgentLoader
@@ -21,6 +22,7 @@ from trpc_service.agent.session import TurnBufferSessionService
 from trpc_service.agent.wecom_manager import WeComConnectionManager
 from trpc_service.agent.worker import AgentWorker, ProcessStatus, _record_usage, _target_id
 from trpc_service.channels.envelopes import MediaReference, PayloadKind
+from trpc_service.channels.wecom import WeComBindingLeaseUnavailable
 from trpc_service.config.secrets import LocalSecretProvider, SecretRef
 from trpc_service.runtime import TenantRuntime
 from trpc_service.storage.artifacts import InMemoryArtifactStore
@@ -156,9 +158,19 @@ async def test_production_loader_provider_selection_and_tools(monkeypatch) -> No
     assert len(agent.tools) == 1
     assert isinstance(agent.tools[0], GovernedTool)
     assert agent.generate_content_config.max_output_tokens == config.budget.max_tokens_per_turn
+    assert agent.generate_content_config.http_options.timeout == 60_000
     assert created[0] == ("primary", {"api_key": "key", "base_url": "https://model"})
     assert created[1][0] == "secondary"
     assert isinstance(loader._model(config.model), FallbackModel)
+    loader._model(ModelPolicy(provider="openai", model="reasoning", reasoning_effort="medium"))
+    assert created[-1] == (
+        "reasoning",
+        {
+            "api_key": "",
+            "use_responses_api": True,
+            "responses_api_params": {"reasoning": {"effort": "medium"}},
+        },
+    )
     loader._model(ModelPolicy(provider="anthropic", model="a"))
     loader._model(ModelPolicy(provider="litellm", model="l"))
     with pytest.raises(ValueError, match="unsupported"):
@@ -167,6 +179,59 @@ async def test_production_loader_provider_selection_and_tools(monkeypatch) -> No
     unsafe_loader = ProductionAgentLoader(secrets, tools={"a": FunctionTool(tool_a)})
     with pytest.raises(ValueError, match="governance"):
         await unsafe_loader(config)
+
+
+def test_model_generation_controls_are_validated_and_applied(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "trpc_service.agent.factory.LlmAgent", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    loader = ProductionAgentLoader(LocalSecretProvider(allow_literal=True))
+    config = tenant_config().model_copy(
+        update={
+            "model": ModelPolicy(
+                provider="anthropic",
+                model="claude-test",
+                timeout_seconds=12.5,
+                temperature=0.25,
+                top_p=0.8,
+                stop_sequences=("STOP",),
+                thinking_budget_tokens=2048,
+            )
+        }
+    )
+
+    agent = loader._build_agent(config, Model())
+
+    assert agent.generate_content_config.temperature == 0.25
+    assert agent.generate_content_config.top_p == 0.8
+    assert agent.generate_content_config.stop_sequences == ["STOP"]
+    assert agent.generate_content_config.http_options.timeout == 12_500
+    assert agent.planner.thinking_config.include_thoughts is True
+    assert agent.planner.thinking_config.thinking_budget == 2048
+
+    with pytest.raises(ValueError, match="at least 1024"):
+        ModelPolicy(provider="anthropic", model="claude-test", thinking_budget_tokens=512)
+    with pytest.raises(ValueError, match="requires the openai provider"):
+        ModelPolicy(provider="anthropic", model="claude-test", reasoning_effort="high")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ModelPolicy(
+            provider="openai",
+            model="gpt-test",
+            reasoning_effort="low",
+            thinking_budget_tokens=2048,
+        )
+    with pytest.raises(ValueError, match="1 to 256"):
+        ModelPolicy(provider="openai", model="gpt-test", stop_sequences=("",))
+    with pytest.raises(ValueError, match="smaller than max_tokens_per_turn"):
+        value = tenant_config()
+        payload = value.model_dump()
+        payload["model"] = {
+            "provider": "anthropic",
+            "model": "claude-test",
+            "thinking_budget_tokens": 2048,
+        }
+        payload["budget"]["max_tokens_per_turn"] = 2048
+        value.__class__.model_validate(payload)
 
 
 @pytest.mark.asyncio
@@ -1054,3 +1119,71 @@ async def test_wecom_manager_add_remove_failed_and_shutdown(monkeypatch) -> None
     with pytest.raises(asyncio.CancelledError):
         await manager.run(refresh_seconds=0)
     assert not [task for task in manager._tasks.values() if not task.done()]
+
+
+@pytest.mark.asyncio
+async def test_wecom_standby_retries_lease_contention_without_exponential_backoff(
+    monkeypatch,
+) -> None:
+    value = binding(channel="wecom_ai_bot")
+    attempts = 0
+    waits: list[float] = []
+
+    class StandbyConnector:
+        async def run(self, _binding, _sink) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise WeComBindingLeaseUnavailable("another connector owns this channel binding")
+            manager._stop_event.set()
+
+    async def record_wait(awaitable, **kwargs):
+        waits.append(kwargs["timeout"])
+        awaitable.close()
+        raise TimeoutError
+
+    manager = WeComConnectionManager(
+        Bindings((value,)),
+        StandbyConnector(),
+        object(),
+        reconnect_jitter_ratio=0,
+    )
+    monkeypatch.setattr(wecom_manager_module.asyncio, "wait_for", record_wait)
+
+    await manager._run_binding(value)
+
+    assert attempts == 4
+    assert waits == [0.5, 0.5, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_wecom_connection_errors_keep_exponential_backoff(monkeypatch) -> None:
+    value = binding(channel="wecom_ai_bot")
+    attempts = 0
+    waits: list[float] = []
+
+    class FailingConnector:
+        async def run(self, _binding, _sink) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise ConnectionError("provider unavailable")
+            manager._stop_event.set()
+
+    async def record_wait(awaitable, **kwargs):
+        waits.append(kwargs["timeout"])
+        awaitable.close()
+        raise TimeoutError
+
+    manager = WeComConnectionManager(
+        Bindings((value,)),
+        FailingConnector(),
+        object(),
+        reconnect_jitter_ratio=0,
+    )
+    monkeypatch.setattr(wecom_manager_module.asyncio, "wait_for", record_wait)
+
+    await manager._run_binding(value)
+
+    assert attempts == 4
+    assert waits == [0.5, 1.0, 2.0]

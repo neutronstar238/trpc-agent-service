@@ -75,6 +75,8 @@ CLEANUP_TABLES: tuple[str, ...] = (
     "session_turns",
     "inbound_messages",
     "channel_identities",
+    "im_acceptance_evidence_events",
+    "wecom_connection_state",
     "channel_bindings",
     "memories",
     "artifacts",
@@ -87,6 +89,7 @@ CLEANUP_TABLES: tuple[str, ...] = (
     "audit_logs",
     "migration_checkpoints",
     "migration_leases",
+    "migration_write_barriers",
     "migration_scope_manifests",
     "fault_stage_controls",
     "admin_idempotency",
@@ -98,8 +101,19 @@ CLEANUP_TABLES: tuple[str, ...] = (
     "agent_apps",
     "tenants",
 )
+_PRE_WRITE_BARRIER_CLEANUP_TABLES = tuple(
+    table for table in CLEANUP_TABLES if table != "migration_write_barriers"
+)
 _LEGACY_CLEANUP_TABLES_V1 = tuple(
-    table for table in CLEANUP_TABLES if table not in {"session_mailbox_items", "session_mailboxes"}
+    table
+    for table in _PRE_WRITE_BARRIER_CLEANUP_TABLES
+    if table
+    not in {
+        "session_mailbox_items",
+        "session_mailboxes",
+        "wecom_connection_state",
+        "im_acceptance_evidence_events",
+    }
 )
 
 _SUFFIX = re.compile(r"^[0-9a-f]{32}$")
@@ -449,7 +463,11 @@ def _validate_report(
     if report.get("manifest_checksum") != _manifest_checksum(report):
         raise FixtureValidationError("fixture report integrity check failed")
     recorded_cleanup_tables = tuple(report.get("cleanup_tables", ()))
-    if recorded_cleanup_tables not in {CLEANUP_TABLES, _LEGACY_CLEANUP_TABLES_V1}:
+    if recorded_cleanup_tables not in {
+        CLEANUP_TABLES,
+        _PRE_WRITE_BARRIER_CLEANUP_TABLES,
+        _LEGACY_CLEANUP_TABLES_V1,
+    }:
         raise FixtureValidationError("fixture report cleanup allowlist is inconsistent")
     recorded_path = report.get("report_path")
     requested_path = _safe_report_path(report_path)
@@ -490,16 +508,26 @@ async def _delete_fixture_rows(
         )
         if owned != 1:
             raise FixtureValidationError("fixture ownership proof is missing")
-        for table in CLEANUP_TABLES:
-            # ``table`` comes only from the literal allowlist above.
-            result = await connection.execute(
-                f"DELETE FROM {table} WHERE tenant_id=$1",  # noqa: S608
-                tenant_id,
-            )
+        raw_counts = await connection.fetchval(
+            "SELECT public.cleanup_performance_fixture($1, $2, $3)",
+            tenant_id,
+            run_id,
+            manifest_checksum,
+        )
+        if isinstance(raw_counts, str):
             try:
-                counts[table] = int(str(result).rsplit(" ", 1)[-1])
-            except (TypeError, ValueError):
-                counts[table] = 0
+                parsed_counts = json.loads(raw_counts)
+            except json.JSONDecodeError as error:
+                raise FixtureValidationError("fixture cleanup result is invalid") from error
+        else:
+            parsed_counts = raw_counts
+        if not isinstance(parsed_counts, Mapping) or set(parsed_counts) != set(CLEANUP_TABLES):
+            raise FixtureValidationError("fixture cleanup result is incomplete")
+        for table in CLEANUP_TABLES:
+            value = parsed_counts.get(table)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise FixtureValidationError("fixture cleanup result is invalid")
+            counts[table] = value
     return counts
 
 

@@ -9,9 +9,7 @@ from trpc_service.config import LocalSecretProvider, Role, SecretRef, ServiceSet
 def _settings(*, worker_ref: bool = True, worker_user: str = "trpc_worker") -> ServiceSettings:
     updates = {
         "_env_file": None,
-        "database_dsn_ref": SecretRef(
-            uri="literal://postgresql://trpc_runtime@db/service"
-        ),
+        "database_dsn_ref": SecretRef(uri="literal://postgresql://trpc_runtime@db/service"),
     }
     if worker_ref:
         updates["worker_database_dsn_ref"] = SecretRef(
@@ -45,6 +43,12 @@ def test_worker_dsn_username_is_pinned() -> None:
             _settings(worker_user="trpc_runtime"),
             LocalSecretProvider(allow_literal=True),
         )
+
+
+def test_worker_table_privileges_preserve_append_only_evidence() -> None:
+    assert cli._WORKER_TABLE_PRIVILEGES["wecom_connection_state"] == ("SELECT,INSERT,UPDATE")
+    assert cli._WORKER_TABLE_PRIVILEGES["im_acceptance_evidence_events"] == ("SELECT,INSERT")
+    assert cli._WORKER_TABLE_PRIVILEGES["inbound_messages"] == ("SELECT,INSERT,UPDATE,DELETE")
 
 
 def test_production_rejects_literal_worker_database_references() -> None:
@@ -114,12 +118,8 @@ class _Repository:
 
 @pytest.mark.asyncio
 async def test_identity_requires_worker_bypassrls_and_explicit_grants() -> None:
-    await cli._validate_database_identity(
-        _Repository(_Connection(bypasses_rls=True)), Role.WORKER
-    )
-    await cli._validate_database_identity(
-        _Repository(_Connection(bypasses_rls=False)), Role.ADMIN
-    )
+    await cli._validate_database_identity(_Repository(_Connection(bypasses_rls=True)), Role.WORKER)
+    await cli._validate_database_identity(_Repository(_Connection(bypasses_rls=False)), Role.ADMIN)
     wrong_bypass = _Connection(bypasses_rls=False)
     wrong_bypass.identity.update(current_user="trpc_worker", session_user="trpc_worker")
     with pytest.raises(RuntimeError, match="must bypass"):

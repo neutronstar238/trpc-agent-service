@@ -20,9 +20,25 @@ tests
 docs
 deploy
 data
-scripts
 .env
 .env.*
 *.log
 *.sh
 docker-compose.yml
+
+# The in-cluster performance Job runs the audited gate/fixture entrypoints
+# from the candidate image. Keep generated caches excluded while restoring
+# the source-controlled Python scripts needed by that Job and its imports.
+!scripts/
+scripts/*
+!scripts/*.py
+
+# The gate fingerprints these roots inside the immutable image.  Re-include
+# the same source material that is present in the host checkout; runtime-gate
+# input remains ignored by the fingerprint implementation itself.
+!deploy/
+!deploy/**
+!tests/
+!tests/integration/
+!tests/integration/**
+!docker-compose.yml

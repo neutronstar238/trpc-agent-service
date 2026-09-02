@@ -1,6 +1,28 @@
 $ErrorActionPreference = "Stop"
-Set-Location E:\trpc-agent-service
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+Set-Location $projectRoot
 $env:COMPOSE_DISABLE_ENV_FILE = "1"
+
+function Get-DockerInspectDocument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+    $raw = docker inspect @Arguments | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker inspect failed"
+    }
+    try {
+        $documents = @(($raw -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        throw "docker inspect returned invalid JSON"
+    }
+    if ($documents.Count -ne 1) {
+        throw "docker inspect returned an unexpected JSON document count"
+    }
+    return $documents[0]
+}
 
 $runStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $runtimeProject = "trpc-fault-runtime-$runStamp"
@@ -12,25 +34,33 @@ if (-not $env:TRPC_RELEASE_ID -or -not $env:TRPC_RELEASE_NONCE) {
     throw "release binding missing"
 }
 
-$sourceFingerprint = .venv\Scripts\python.exe -c "from pathlib import Path; from scripts.evidence_lineage import source_fingerprint; print(source_fingerprint(Path.cwd())['value'])"
-if ($LASTEXITCODE -ne 0 -or $sourceFingerprint -ne $fp) {
+& .venv\Scripts\python.exe scripts/candidate_lock.py verify | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "candidate lock verification failed"
+}
+$lockedCandidate = Get-Content -LiteralPath "runs/multitenant/candidate-lock.json" -Raw | ConvertFrom-Json
+$sourceFingerprint = [string]$lockedCandidate.source_fingerprint.value
+if ($sourceFingerprint -ne $fp) {
     throw "source fingerprint changed after lock"
 }
 $env:TRPC_SERVICE_IMAGE = $initial
-$imageEvidence = docker image inspect --format '{{.Id}}|{{index .Config.Labels "io.trpc.agent-service.source-fingerprint"}}' $env:TRPC_SERVICE_IMAGE
-if ($LASTEXITCODE -ne 0 -or $imageEvidence -ne "$initialId|$fp") {
+$imageDocument = Get-DockerInspectDocument -Arguments @($env:TRPC_SERVICE_IMAGE)
+$imageEvidence = "{0}|{1}" -f [string]$imageDocument.Id, [string]$imageDocument.Config.Labels.'io.trpc.agent-service.source-fingerprint'
+if ($imageEvidence -ne "$initialId|$fp") {
     throw "candidate image binding mismatch"
 }
 
 function New-SyntheticHexSecret {
     $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    [Convert]::ToHexString($bytes).ToLowerInvariant()
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+    (([BitConverter]::ToString($bytes)) -replace "-", "").ToLowerInvariant()
 }
 
 function New-SyntheticBase64UrlSecret {
     $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     ([Convert]::ToBase64String($bytes)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
@@ -45,25 +75,39 @@ function Get-HealthyWorkerInventory {
     if ($LASTEXITCODE -ne 0 -or $ids.Count -ne 4) {
         throw "$Project must expose exactly four worker container IDs"
     }
-    $format = '{{.Id}}|{{index .Config.Labels "io.trpc.agent-service.source-fingerprint"}}|{{.Image}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
-    $rows = @($ids | ForEach-Object { docker inspect --format $format $_ })
-    if ($LASTEXITCODE -ne 0 -or $rows.Count -ne 4) {
+    $rows = @(
+        $ids | ForEach-Object {
+            $document = Get-DockerInspectDocument -Arguments @($_)
+            $healthStatus = if ($document.State.Health) {
+                [string]$document.State.Health.Status
+            }
+            else {
+                "none"
+            }
+            [pscustomobject]@{
+                Id = [string]$document.Id
+                SourceFingerprint = [string]$document.Config.Labels.'io.trpc.agent-service.source-fingerprint'
+                Image = [string]$document.Image
+                StateStatus = [string]$document.State.Status
+                HealthStatus = $healthStatus
+            }
+        }
+    )
+    if ($rows.Count -ne 4) {
         throw "$Project worker inspect failed"
     }
     $imageIds = @()
     foreach ($row in $rows) {
-        $parts = $row -split '\|', 5
         if (
-            $parts.Count -ne 5 -or
-            $parts[0] -notmatch '^[0-9a-f]{64}$' -or
-            $parts[1] -ne $ExpectedSource -or
-            $parts[2] -notmatch '^sha256:[0-9a-f]{64}$' -or
-            $parts[3] -ne "running" -or
-            $parts[4] -ne "healthy"
+            $row.Id -notmatch '^[0-9a-f]{64}$' -or
+            $row.SourceFingerprint -ne $ExpectedSource -or
+            $row.Image -notmatch '^sha256:[0-9a-f]{64}$' -or
+            $row.StateStatus -ne "running" -or
+            $row.HealthStatus -ne "healthy"
         ) {
             throw "$Project worker attestation/health mismatch"
         }
-        $imageIds += $parts[2]
+        $imageIds += $row.Image
     }
     if (@($imageIds | Sort-Object -Unique).Count -ne 1) {
         throw "$Project workers use mixed images"
@@ -110,6 +154,7 @@ $runtimePostgresPassword = New-SyntheticHexSecret
 $runtimeDatabasePassword = New-SyntheticHexSecret
 $runtimeWorkerDatabasePassword = New-SyntheticHexSecret
 $runtimeMigrationPassword = New-SyntheticHexSecret
+$runtimeMetricsDatabasePassword = New-SyntheticHexSecret
 $runtimeRedisPassword = New-SyntheticHexSecret
 $runtimeMinioPassword = New-SyntheticHexSecret
 $runtimeSessionHmacKey = New-SyntheticBase64UrlSecret
@@ -133,6 +178,7 @@ $env:POSTGRES_PASSWORD = $runtimePostgresPassword
 $env:RUNTIME_DATABASE_PASSWORD = $runtimeDatabasePassword
 $env:WORKER_DATABASE_PASSWORD = $runtimeWorkerDatabasePassword
 $env:MIGRATION_DATABASE_PASSWORD = $runtimeMigrationPassword
+$env:METRICS_DATABASE_PASSWORD = $runtimeMetricsDatabasePassword
 $env:REDIS_PASSWORD = $runtimeRedisPassword
 $env:MINIO_ROOT_PASSWORD = $runtimeMinioPassword
 $env:SESSION_HMAC_KEY = $runtimeSessionHmacKey
@@ -158,7 +204,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $normalWorkerIds = @(Wait-HealthyWorkerInventory -ComposeArgs $normalCompose -Project $runtimeProject -ExpectedSource $sourceFingerprint -ExpectedImage $initialId)
-$normalImageDigest = (docker inspect --format '{{.Image}}' $normalWorkerIds[0]).Trim()
+$normalImageDocument = Get-DockerInspectDocument -Arguments @($normalWorkerIds[0])
+$normalImageDigest = [string]$normalImageDocument.Image
 if ($normalImageDigest -ne $initialId) {
     throw "normal candidate image ID mismatch"
 }
@@ -179,8 +226,8 @@ if ($normalFixture.gate -ne "pass" -or $normalFixture.synthetic -ne $true) {
 
 $env:TRPC_REAL_TENANT_ID = [string]$normalFixture.tenant_id
 $env:TRPC_REAL_BINDING_ID = [string]$normalFixture.binding_id
-$env:TRPC_REAL_DATABASE_DSN = "postgresql+asyncpg://{0}:{1}@127.0.0.1:15432/{2}" -f $env:TRPC_RUNTIME_USER, $runtimeDatabasePassword, $env:POSTGRES_DB
-$env:TRPC_REAL_REDIS_URL = "redis://:{0}@127.0.0.1:16379/0" -f $runtimeRedisPassword
+$env:TRPC_REAL_DATABASE_DSN = "postgresql+asyncpg://{0}:{1}@127.0.0.1:{2}/{3}" -f $env:TRPC_RUNTIME_USER, $runtimeDatabasePassword, $runtimeDbPort, $env:POSTGRES_DB
+$env:TRPC_REAL_REDIS_URL = "redis://:{0}@127.0.0.1:{1}/0" -f $runtimeRedisPassword, $runtimeRedisPort
 $env:TRPC_REAL_GLOBAL_WORKER_DATABASE_DSN = "postgresql+asyncpg://{0}:{1}@127.0.0.1:{2}/{3}" -f $env:TRPC_WORKER_USER, $runtimeWorkerDatabasePassword, $runtimeDbPort, $env:POSTGRES_DB
 $env:TRPC_REAL_GLOBAL_WORKER_DATABASE_ROLE = $env:TRPC_WORKER_USER
 $env:TRPC_REAL_RUNTIME_DATABASE_ROLE = $env:TRPC_RUNTIME_USER
@@ -191,6 +238,7 @@ $stagePostgresPassword = New-SyntheticHexSecret
 $stageDatabasePassword = New-SyntheticHexSecret
 $stageWorkerDatabasePassword = New-SyntheticHexSecret
 $stageMigrationPassword = New-SyntheticHexSecret
+$stageMetricsDatabasePassword = New-SyntheticHexSecret
 $stageRedisPassword = New-SyntheticHexSecret
 $stageMinioPassword = New-SyntheticHexSecret
 $stageSessionHmacKey = New-SyntheticBase64UrlSecret
@@ -210,6 +258,7 @@ $env:POSTGRES_PASSWORD = $stagePostgresPassword
 $env:RUNTIME_DATABASE_PASSWORD = $stageDatabasePassword
 $env:WORKER_DATABASE_PASSWORD = $stageWorkerDatabasePassword
 $env:MIGRATION_DATABASE_PASSWORD = $stageMigrationPassword
+$env:METRICS_DATABASE_PASSWORD = $stageMetricsDatabasePassword
 $env:REDIS_PASSWORD = $stageRedisPassword
 $env:MINIO_ROOT_PASSWORD = $stageMinioPassword
 $env:SESSION_HMAC_KEY = $stageSessionHmacKey
@@ -314,7 +363,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "normal runtime fixture cleanup failed; projects retained"
 }
 
-docker compose @stageCompose down
+docker compose @stageCompose down --volumes
 if ($LASTEXITCODE -ne 0) {
     throw "fault-stage Compose cleanup failed; volumes retained"
 }
@@ -331,12 +380,13 @@ $env:POSTGRES_PASSWORD = $runtimePostgresPassword
 $env:RUNTIME_DATABASE_PASSWORD = $runtimeDatabasePassword
 $env:WORKER_DATABASE_PASSWORD = $runtimeWorkerDatabasePassword
 $env:MIGRATION_DATABASE_PASSWORD = $runtimeMigrationPassword
+$env:METRICS_DATABASE_PASSWORD = $runtimeMetricsDatabasePassword
 $env:REDIS_PASSWORD = $runtimeRedisPassword
 $env:MINIO_ROOT_PASSWORD = $runtimeMinioPassword
 $env:SESSION_HMAC_KEY = $runtimeSessionHmacKey
 $env:EMERGENCY_QUEUE_KEY = $runtimeEmergencyQueueKey
 $env:DEVELOPMENT_TOKEN = $runtimeDevelopmentToken
-docker compose @normalCompose down
+docker compose @normalCompose down --volumes
 if ($LASTEXITCODE -ne 0) {
     throw "normal runtime Compose cleanup failed; volumes retained"
 }

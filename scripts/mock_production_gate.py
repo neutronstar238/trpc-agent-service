@@ -12,9 +12,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from scripts.report_io import atomic_write_json
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_IMPORT_ROOT))
 
-ROOT = Path(__file__).resolve().parents[1]
+from scripts.performance_gate import MAX_CONCURRENCY  # noqa: E402
+from scripts.report_io import atomic_write_json  # noqa: E402
+
+ROOT = _REPO_IMPORT_ROOT
 
 SCENARIOS = {
     "multinode_load": {
@@ -108,7 +113,7 @@ def _performance(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             "--turns",
             "200",
             "--concurrency",
-            "100",
+            str(MAX_CONCURRENCY),
             "--output",
             str(output),
         ],

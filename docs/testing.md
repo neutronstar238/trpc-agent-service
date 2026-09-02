@@ -11,12 +11,27 @@
   `TRPC_IM_ONLINE_IMAGE_DIGEST`；同时必须配置只含精确 HTTPS 基址的
   `TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST`（可用逗号或换行分隔多个固定地址）和固定的
   `TRPC_IM_ONLINE_PROBE_IDENTITY_SHA256`（或仅在 Secret 管理器内使用
-  `TRPC_IM_ONLINE_PROBE_IDENTITY`）。探针必须回传匹配 digest、运行 nonce 和身份指纹，并逐通道证明
-  往返、幂等、媒体、重连。探测器拒绝 userinfo/query/fragment，禁止 HTTP 重定向，也不会跟随重定向后
-  的最终 URL；探针响应严格使用有限 JSON，并且必须通过源码绑定的
+  `TRPC_IM_ONLINE_PROBE_IDENTITY`），以及飞书/企微各自不可变 control profile 的 SHA-256。探针必须
+  回传匹配 digest、运行 nonce、身份和 profile，并逐通道证明往返、幂等、媒体、重连、真实限流退避、
+  凭证轮换、至少 60 秒的单实例故障接管和供应商 ACK 后丢响应的 ambiguous 共 8 个 case。探测器拒绝
+  userinfo/query/fragment，禁止 HTTP 重定向，也不会跟随重定向后的最终 URL；探针响应严格使用有限
+  JSON，并且必须通过源码绑定的
   `deploy/im-probe-trust.json` Ed25519 公钥验证完整响应签名。缺少信任文件或签名时保持 `not_run`。
   `retry_after_seconds` 必须为有限的 0.001–3600 秒，
   `outage_seconds` 必须为有限的 0.001–604800 秒。
+- 在线 IM 的 `reconnect`/`prolonged_outage` 只按“单个 connector 进程不可用、冗余 owner 接管并继续
+  交付”验收：必须记录旧 owner 释放、新 owner 接管、重新订阅和接管后唯一 marker 的 provider 事件
+  与发送 ACK；`prolonged_outage` 的 connector 故障窗口至少 60 秒。两个 WSS 同时断开属于独立的
+  provider delivery gap，不能以恢复后新消息替代断线期间旧消息，也不能据此生成恢复 `pass`。
+- 在线 IM 的控制动作只能由 checkout 外的 host-only control broker 按固定 profile 调度。driver 不得
+  获得 Kubernetes、数据库、OIDC 或供应商管理凭据，也不得自行制造 observation。飞书入站必须与独立
+  callback observer 的哈希 receipt 核对，出站、限流与 ambiguous 必须与 OpenAPI witness 的真实 ACK
+  receipt 核对；企微不得建立第二条 WSS，只能把 broker 动作结果与当前 Connector 持久化的 connection
+  epoch、lease lifecycle 和 provider event 哈希快照核对。任一旁路证据缺失时该 case 必须非 `pass`。
+- “功能完成”的真实 IM 基础证据只要求当前候选在 Feishu/WeCom 各闭环唯一入站、唯一出站和供应商
+  回执。它不能冒充上述 `online_im` 生产 8-case；生产发布和 release manifest 始终要求两个通道的完整
+  8-case。默认还要求 destructive DR 真实通过；只有显式 `--allow-functional-dr` 可在当前候选功能灾备
+  `pass` 时授权 destructive DR 保持 `not_run`，不能豁免 destructive DR `fail`、`online_im` 或其他门禁。
 - 性能：100 callback/s、200 turn，并生成机器可读 JSON。
 
 本地门禁：
@@ -36,7 +51,7 @@ python scripts/contract_gate.py fault
 python scripts/contract_gate.py migration
 python scripts/deployment_gate.py
 python scripts/kubernetes_runtime_gate.py
-python scripts/release_gate.py --output runs/multitenant/release-gate-final.json
+python scripts/release_gate.py --output runs/multitenant/release-gate-current-final.json
 ```
 
 `deployment_gate.py` 默认只做静态部署检查：静态清单通过时返回 0，但报告明确为
@@ -77,11 +92,16 @@ Secret 注入，命令和报告不能打印其值。
 
 `scripts/release_gate.py` 汇总所有 JSON 证据。默认允许开发门禁通过但保留生产 `not_run`；CI/CD
 发布阶段必须使用 `--require-production`，任何真实 IM、生产负载、故障注入、迁移或 Kubernetes 运行
-报告缺失都会返回非零状态。发布时应显式把结果写到
-`runs/multitenant/release-gate-final.json`；只有这次聚合生成、通过 current-candidate lineage、
+报告缺失都会返回非零状态。`run-current-final-acceptance.ps1` 的 Stage 8 实际把聚合结果写到
+`runs/multitenant/release-gate-current-final.json`；只有这次聚合生成、通过 current-candidate lineage、
 源码指纹和 24 小时 TTL 校验的最新 final 文件才是当前候选结论。历史组件 JSON 的顶层 `pass`、
 旧的 `release-gate.json` 或 `release-gate-current.json` 都只是输入/历史记录，不能单独升级候选状态。
 过期或来自其他 checkout 的生产 evidence 必须降级为 `not_run`。
+
+默认的 `--require-production` 仍要求真实破坏性生产灾备 `pass`。本项目 Stage 8 固定同时传入
+`--allow-functional-dr`；这时必须验证 `disaster-recovery-functional.json` 的三个恢复组件、cleanup、
+lineage 和 producer，且只可把破坏性 DR 的 `not_run` 记入
+`authorized_not_run_gates=[disaster_recovery]`。破坏性 DR 为 `fail` 时不能豁免，`online_im=not_run` 仍阻断。
 
 所有真实生产报告必须使用同一个 `TRPC_RELEASE_ID`、同一个高熵
 `TRPC_RELEASE_NONCE` 和同一个不可变候选镜像 digest。报告全部完成后运行
@@ -89,6 +109,8 @@ Secret 注入，命令和报告不能打印其值。
 `runs/multitenant/release-manifest.json`。该 manifest 按 canonical JSON SHA-256
 绑定每个生产报告的内容、producer、run ID、时间、源码指纹、release nonce 哈希和镜像。
 manifest 缺失时最终生产门禁保持 `not_run`；报告被替换、混入其他运行或镜像不一致时门禁为 `fail`。
+显式功能 DR 模式必须给 manifest 命令同样传入 `--allow-functional-dr`；manifest 的 `policy` 会绑定功能
+灾备报告和 `authorized_not_run_gates`，并排除未运行的破坏性报告，缺失或篡改该 policy 都会失败。
 
 Pytest 默认清除从当前 Shell 继承的真实负载、故障、迁移、Kubernetes 和在线 IM 环境变量。
 只有在隔离验收环境中明确添加 `--allow-real-tests` 才会保留这些变量；普通 CI 只运行
@@ -113,15 +135,15 @@ Kubernetes 控制面。真实运行态验收由 `scripts/kubernetes_runtime_gate
 ```bash
 export TRPC_K8S_RUNTIME_TESTS_ENABLED=true
 export TRPC_K8S_RUNTIME_CONTEXT=your-context
-export TRPC_K8S_RUNTIME_IMAGE=registry.example/trpc-agent-service@sha256:<64-hex-digest-a>
-export TRPC_K8S_RUNTIME_UPGRADE_IMAGE=registry.example/trpc-agent-service@sha256:<64-hex-digest-b>
+export TRPC_K8S_RUNTIME_IMAGE=<registry-host>/<org>/trpc-agent-service@sha256:<64-hex-digest-a>
+export TRPC_K8S_RUNTIME_UPGRADE_IMAGE=<registry-host>/<org>/trpc-agent-service@sha256:<64-hex-digest-b>
 export TRPC_K8S_RUNTIME_SECRET_MANIFEST=/secure/trpc-runtime-secrets.yaml
 export TRPC_K8S_RUNTIME_HPA_DRIVER=E:/trpc-agent-service/scripts/kubernetes_hpa_load_driver.py
 export TRPC_K8S_RUNTIME_HPA_DRIVER_SHA256=<64-hex-sha256-of-driver>
 export TRPC_K8S_RUNTIME_HPA_DRIVER_KUBECONFIG=/secure/hpa-driver-kubeconfig
 export TRPC_K8S_RUNTIME_HPA_DRIVER_SUBJECT=system:serviceaccount:runtime-gate:hpa-driver
 export TRPC_K8S_RUNTIME_HPA_DRIVER_CONTEXT=dedicated-driver-context
-export TRPC_K8S_RUNTIME_HPA_JOB_IMAGE=registry.example/trpc-hpa-backlog@sha256:<64-hex-digest>
+export TRPC_K8S_RUNTIME_HPA_JOB_IMAGE=<registry-host>/<org>/trpc-hpa-backlog@sha256:<64-hex-digest>
 export TRPC_K8S_RUNTIME_HPA_JOB_COMMAND='["python","-m","your_bounded_backlog_probe"]'
 export TRPC_K8S_RUNTIME_NODE_NAME=dedicated-runtime-node
 export TRPC_K8S_RUNTIME_NODE_LABEL=trpc-runtime-gate=dedicated-gate
@@ -133,18 +155,25 @@ python scripts/kubernetes_runtime_gate.py --timeout-seconds 900 --require-runtim
 
 PowerShell 等价写法是 `$env:TRPC_K8S_RUNTIME_TESTS_ENABLED = "true"`。Secret 清单必须由外部
 Secret 管理系统生成，至少包含 `trpc-service-secrets` 和 `trpc-migration-secrets`；文件内容不会被
-写入报告、日志或命令输出。镜像必须带不同的不可变 sha256 digest；tag-only、example/replace
-占位镜像会被拒绝，升级镜像必须是可拉取的不同 digest。
+写入报告、日志或命令输出。生产镜像必须带 registry host 的完整
+`registry/repository@sha256:<64-hex-digest>` 引用；本地 Docker image ID、未限定名、tag-only、
+example/replace 占位镜像会被拒绝，升级镜像必须是可拉取的不同 digest。
 
-运行器会先执行 server-side dry-run，然后在随机的 `trpc-runtime-gate-*` namespace 中部署生产
-overlay，检查所有 Deployment readiness、滚动升级、worker 扩容、HPA `AbleToScale=True`、
+运行器会先对完整 production overlay 执行静态契约检查，再在随机的 `trpc-runtime-gate-*` namespace
+中部署隔离运行态。正式拓扑把 Gateway、Channel Dispatcher、Feishu/WeCom Connector 全部绑定到
+production cluster；隔离 namespace 为避免争抢真实 provider 连接，只把 `trpc-wecom-connector` 缩为
+0，并在证据中同时记录 `scope=unified_cluster_runtime`、`im_deployment=production_cluster`、完整正式
+Deployment 集与本次实际测试集。真实飞书回调和企业微信长连接由同一集群的 online IM gate 验收，
+签名 provider evidence 来自独立探针主机。运行器检查其余 Deployment readiness、滚动升级、worker 扩容、HPA `AbleToScale=True`、
 Prometheus Adapter/KEDA 提供的 backlog external metric 必须存在且 `ScalingActive=True`；仅有
 metrics-server 的 CPU/内存指标不满足本门禁，
 namespace-scoped Pod Eviction/PDB 恢复、专用节点 cordon/drain/uncordon 和非强制优雅终止，最后无论
 成功失败都删除该 namespace。节点 drain 只允许在显式标签、全量 Pod inventory 和二次 cordon 后
 preflight 均证明专用的节点上执行；该测试允许删除这些生产 Pod 的临时 `/tmp` `emptyDir` 数据，
 不会触碰其他 namespace 的工作负载。`--require-runtime` 用于发布门禁；未设置 opt-in 或缺少集群、权限、镜像、Secret
-时，报告为 `gate=not_run` 并返回非零。默认本地调用对这种未请求的 `not_run` 返回零，避免离线开发
+时，报告为 `gate=not_run` 并返回非零。运行器还会在隔离 namespace 中用一个不可用的 registry
+digest 注入一次失败 rollout，要求 `rollout undo` 后 readiness 和已知良好 digest 恢复，再继续
+Pod 驱逐与节点 drain。默认本地调用对这种未请求的 `not_run` 返回零，避免离线开发
 误触发集群操作。
 
 HPA 负载触发器必须是当前 checkout `scripts/` 目录下的绝对路径、非符号链接 Python 文件；默认驱动
@@ -185,7 +214,7 @@ kube context 使用专用测试权限，并确认镜像、数据库、Redis、�
 和至少一个 NodeMetrics 样本：
 
 ```powershell
-Set-Location E:\trpc-agent-service
+Set-Location C:\path\to\trpc-agent-service
 $ErrorActionPreference = "Stop"
 $kindName = "trpc-runtime-gate-$PID"
 $kindContext = "kind-$kindName"

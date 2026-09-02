@@ -41,10 +41,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --extra dev --locked --python ${{ matrix.python }}
-      - run: uv run --python ${{ matrix.python }} pytest tests/unit --cov=trpc_service --cov-branch --cov-report=json:runs/multitenant/coverage.json
+      - name: prepare root-owned security-test temp directory
+        run: sudo install -d -m 0700 -o root -g root /root/trpc-ci-pytest
+      - name: unit tests
+        run: >-
+          sudo --preserve-env=PATH,UV_CACHE_DIR
+          env TMPDIR=/root/trpc-ci-pytest
+          uv run --python ${{ matrix.python }} pytest tests/unit
+          --cov=trpc_service --cov-branch
+          --cov-report=json:runs/multitenant/coverage.json
       - run: >-
           uv run --python ${{ matrix.python }} python scripts/check_coverage.py
           runs/multitenant/coverage.json
+          --branch-minimum 88.0
           --output runs/multitenant/coverage-gate.json
       - run: uv run --python ${{ matrix.python }} trpc-service doctor --output runs/multitenant/sdk-upgrade.json
       - uses: actions/upload-artifact@v4
@@ -83,6 +92,7 @@ jobs:
       SESSION_HMAC_KEY: ci-session-hmac-key-with-32-bytes
       EMERGENCY_QUEUE_KEY: ci-emergency-key-exactly-32bytes
       DEVELOPMENT_TOKEN: ci-development-token
+      MODEL_API_KEY: ci-model-key-not-used-for-network-calls
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
@@ -124,13 +134,14 @@ jobs:
             --build-arg TRPC_SOURCE_FINGERPRINT="$source_fingerprint" \
             --label io.trpc.agent-service.source-fingerprint="$source_fingerprint" \
             -t trpc-agent-service:ci .
-      - uses: aquasecurity/trivy-action@0.30.0
+      - uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: trpc-agent-service:ci
           format: sarif
           output: runs/multitenant/image-vulnerabilities.sarif.json
           exit-code: "0"
           severity: CRITICAL,HIGH
+          limit-severities-for-sarif: true
       - uses: anchore/sbom-action@v0
         with:
           image: trpc-agent-service:ci
@@ -150,6 +161,7 @@ jobs:
             --output runs/multitenant/supply-chain.json \
             --require-production
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: sbom
           path: runs/multitenant/*

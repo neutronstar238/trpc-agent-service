@@ -12,10 +12,20 @@ from trpc_service.channels.envelopes import (
     OutboundEnvelope,
 )
 from trpc_service.runtime import TenantRuntime
-from trpc_service.storage.models import SessionLease, SessionSnapshot, StoredEvent, TurnCommit
-from trpc_service.storage.postgres import PostgresBindingLease, PostgresRuntimeRepository
+from trpc_service.storage.models import (
+    SessionLease,
+    SessionSnapshot,
+    StoredEvent,
+    TurnCommit,
+    WeComBindingLeaseGrant,
+)
+from trpc_service.storage.postgres import (
+    PostgresBindingLease,
+    PostgresRuntimeRepository,
+    _im_provider_event_hash,
+)
 from trpc_service.storage.protocols import FencingConflict
-from trpc_service.tenant.models import Channel
+from trpc_service.tenant.models import Channel, ChannelBinding
 
 
 class Connection:
@@ -59,7 +69,10 @@ class Connection:
 
     async def execute(self, *args):
         self.calls.append(("execute", args))
-        return self.executes.pop(0) if self.executes else "UPDATE 1"
+        value = self.executes.pop(0) if self.executes else "UPDATE 1"
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
 
 class Acquire:
@@ -175,7 +188,13 @@ async def test_repository_construction_binding_config_and_reads(monkeypatch) -> 
     created_pool = Pool(Connection())
 
     async def create_pool(*args, **kwargs):
-        assert kwargs["server_settings"]["application_name"] == "trpc-agent-service"
+        assert kwargs["server_settings"] == {
+            "application_name": "trpc-agent-service",
+            "tcp_keepalives_idle": "10",
+            "tcp_keepalives_interval": "5",
+            "tcp_keepalives_count": "3",
+            "tcp_user_timeout": "30000",
+        }
         return created_pool
 
     monkeypatch.setattr("trpc_service.storage.postgres.asyncpg.create_pool", create_pool)
@@ -221,6 +240,14 @@ async def test_accept_inbound_new_and_duplicate() -> None:
     )
     assert value.context == accepted.context
     assert len([call for call in connection.calls if call[0] == "execute"]) == 4
+    insert = next(call for call in connection.calls if call[0] == "fetchrow")
+    assert "provider_event_hash" in insert[1][0]
+    assert insert[1][-1] == _im_provider_event_hash(
+        accepted.context.tenant_id,
+        accepted.context.channel_binding_id,
+        accepted.envelope.channel,
+        accepted.envelope.external_message_id,
+    )
 
     duplicate_connection = Connection(fetchrows=[None, row])
     duplicate = await PostgresRuntimeRepository(Pool(duplicate_connection)).accept_inbound(
@@ -229,6 +256,46 @@ async def test_accept_inbound_new_and_duplicate() -> None:
         trace_headers={},
     )
     assert duplicate.duplicate
+    duplicate_update = duplicate_connection.calls[2]
+    assert duplicate_update[0] == "fetchrow"
+    assert "SET delivery_count=delivery_count+1" in duplicate_update[1][0]
+    assert "provider_event_hash=COALESCE(provider_event_hash,$5)" in duplicate_update[1][0]
+    assert duplicate_update[1][-2] == _im_provider_event_hash(
+        accepted.context.tenant_id,
+        accepted.context.channel_binding_id,
+        accepted.envelope.channel,
+        accepted.envelope.external_message_id,
+    )
+    assert duplicate_update[1][-1] == accepted.context.channel_binding_id
+
+
+@pytest.mark.asyncio
+async def test_accept_inbound_v2_duplicate_backfills_legacy_provider_hash() -> None:
+    accepted = await acceptance()
+    row = inbound_row(accepted)
+    connection = Connection(fetchrows=[None, row])
+
+    duplicate = await PostgresRuntimeRepository(Pool(connection)).accept_inbound_v2(
+        context=accepted.context,
+        envelope=accepted.envelope,
+        trace_headers={},
+    )
+
+    assert duplicate.duplicate
+    duplicate_update = connection.calls[2]
+    assert duplicate_update[0] == "fetchrow"
+    assert "provider_event_hash=COALESCE(provider_event_hash,$5)" in duplicate_update[1][0]
+    assert "provider_event_hash IS NULL OR provider_event_hash=$5" in duplicate_update[1][0]
+    assert duplicate_update[1][-1] == accepted.context.channel_binding_id
+
+
+def test_im_provider_event_hash_matches_independent_provider_domains() -> None:
+    assert _im_provider_event_hash("tenant", "binding", Channel.FEISHU, "event") == (
+        "14987a7e30c7a7a80301413f4cfa45d1a1e5280a8a696abf31d06c65da4b7758"
+    )
+    assert _im_provider_event_hash("tenant", "binding", Channel.WECOM_AI_BOT, "event") == (
+        "39a415957b53e983f84fae1c8f3f92d10eea72e2a1e49fb50ed3c477f7582625"
+    )
 
 
 @pytest.mark.asyncio
@@ -545,21 +612,114 @@ async def test_outbox_claim_mark_release() -> None:
 
 @pytest.mark.asyncio
 async def test_postgres_binding_lease_ownership_and_release() -> None:
-    connection = Connection(fetchvals=[True])
+    acquired_at = datetime.now(UTC)
+    connection = Connection(
+        fetchrows=[
+            None,
+            {"epoch": 1, "acquired_at": acquired_at},
+            {"event_id": "authenticated"},
+            {"event_id": "provider"},
+            {"event_id": "disconnected"},
+            {"event_id": "released"},
+        ],
+        fetchvals=[True],
+    )
     pool = Pool(connection)
     lease = PostgresBindingLease(pool)
-    assert await lease.acquire_binding("binding", "owner")
-    assert await lease.acquire_binding("binding", "owner")
-    assert not await lease.acquire_binding("binding", "other")
-    await lease.release_binding("binding", "other")
-    await lease.release_binding("binding", "owner")
+    binding = ChannelBinding(
+        binding_id="binding",
+        tenant_id="tenant-a",
+        app_id="support",
+        channel=Channel.WECOM_AI_BOT,
+        account_id="account",
+    )
+    grant = await lease.acquire_binding(binding, "owner")
+    assert isinstance(grant, WeComBindingLeaseGrant)
+    assert grant.epoch == 1
+    assert grant.tenant_id == "tenant-a"
+    assert grant.owner_hash != "owner"
+    assert await lease.acquire_binding(binding, "owner") == grant
+    assert await lease.acquire_binding(binding, "other") is None
+    assert await lease.mark_authenticated(grant)
+    assert await lease.record_provider_event(grant, "provider-event")
+    assert await lease.mark_disconnected(grant)
+    await lease.release_binding(grant)
     assert pool.released == [connection]
+    statements = "\n".join(str(call[1][0]) for call in connection.calls)
+    assert "hashtextextended($1, 0)" in statements
+    advisory_keys = [
+        call[1][1]
+        for call in connection.calls
+        if call[0] in {"fetchval", "execute"} and "hashtextextended" in str(call[1][0])
+    ]
+    assert len(advisory_keys) == 2
+    assert advisory_keys[0] == advisory_keys[1]
+    assert len(advisory_keys[0]) == 64
+    assert "\x00" not in advisory_keys[0]
+    parameters = [call[1][1:] for call in connection.calls]
+    assert "provider-event" not in repr(parameters)
+    assert "'owner'" not in repr(parameters)
 
     unavailable_pool = Pool(Connection(fetchvals=[False]))
-    assert not await PostgresBindingLease(unavailable_pool).acquire_binding("b", "o")
+    unavailable = binding.model_copy(update={"binding_id": "b"})
+    assert await PostgresBindingLease(unavailable_pool).acquire_binding(unavailable, "o") is None
     assert unavailable_pool.released
 
     broken_pool = Pool(Connection(fetchvals=[RuntimeError("db")]))
     with pytest.raises(RuntimeError, match="db"):
-        await PostgresBindingLease(broken_pool).acquire_binding("b", "o")
+        await PostgresBindingLease(broken_pool).acquire_binding(unavailable, "o")
     assert broken_pool.released
+
+
+@pytest.mark.asyncio
+async def test_postgres_binding_lease_takeover_is_monotonic_and_old_epoch_is_fenced() -> None:
+    acquired_at = datetime.now(UTC)
+    connection = Connection(
+        fetchrows=[
+            {"epoch": 4, "released_at": None},
+            {"epoch": 5, "acquired_at": acquired_at},
+            None,
+            None,
+        ],
+        fetchvals=[True],
+    )
+    pool = Pool(connection)
+    lease = PostgresBindingLease(pool)
+    binding = ChannelBinding(
+        binding_id="binding",
+        tenant_id="tenant-a",
+        app_id="support",
+        channel=Channel.WECOM_AI_BOT,
+        account_id="account",
+    )
+    grant = await lease.acquire_binding(binding, "new-owner")
+    assert grant is not None and grant.epoch == 5
+    stale = grant.model_copy(update={"epoch": 4, "owner_hash": "f" * 64})
+    assert not await lease.mark_authenticated(stale)
+    assert not await lease.record_provider_event(stale, "stale-event")
+    await lease.release_binding(grant)
+    assert pool.released == [connection]
+
+
+@pytest.mark.asyncio
+async def test_postgres_binding_release_returns_connection_when_unlock_fails() -> None:
+    acquired_at = datetime.now(UTC)
+    connection = Connection(
+        fetchrows=[None, {"epoch": 1, "acquired_at": acquired_at}, None],
+        fetchvals=[True],
+        executes=["SELECT 1", "INSERT 0 1", "SELECT 1", RuntimeError("unlock")],
+    )
+    pool = Pool(connection)
+    lease = PostgresBindingLease(pool)
+    binding = ChannelBinding(
+        binding_id="binding",
+        tenant_id="tenant-a",
+        app_id="support",
+        channel=Channel.WECOM_AI_BOT,
+        account_id="account",
+    )
+    grant = await lease.acquire_binding(binding, "owner")
+    assert grant is not None
+    with pytest.raises(RuntimeError, match="unlock"):
+        await lease.release_binding(grant)
+    assert pool.released == [connection]

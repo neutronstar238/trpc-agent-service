@@ -4,7 +4,110 @@
 
 每个启用 binding 创建一个官方 `wecom-aibot-sdk-python` WebSocket 客户端，凭证由 `SecretProvider`
 按需解析。PostgreSQL advisory lock 防止两个副本同时连接同一 Bot；断线后 SDK 自动重连，失去锁时
-主动断开。适配器标准化单聊/群聊、文本、语音转写、mixed、图片、文件、视频和事件/撤回。
+主动断开。适配器标准化入站单聊/群聊、文本、语音转写、mixed、图片、文件、视频和撤回事件；这不表示
+出站支持媒体发送或撤回。
+
+### WebSocket 完整时序
+
+企业微信长连接和飞书回调不是同一种入口。它没有进入 Gateway 的 HTTP callback，也没有“收到消息后
+返回 2xx”这一步；连接、认证、心跳、入站和最终回复都在同一条出站建立的 WSS 通道上完成：
+
+```mermaid
+sequenceDiagram
+    accTitle: WeCom AI Bot WebSocket lifecycle
+    accDescr: One connector owns a binding lock, authenticates an outbound WSS connection, persists callbacks before asynchronous processing, sends the final reply from the outbox, and reconnects only after releasing connection state.
+
+    participant manager as Connection manager
+    participant pg as PostgreSQL
+    participant sdk as WeCom SDK
+    participant wecom as openws.work.weixin.qq.com
+    participant runtime as Inbox / mailbox runtime
+    participant worker as Worker
+    participant dispatcher as Channel dispatcher
+
+    manager->>pg: pg_try_advisory_lock(hash(tenant_id, binding_id))
+    alt another replica owns the binding
+        pg-->>manager: false; do not connect
+    else lock acquired
+        pg-->>manager: true; retain lock connection
+        manager->>sdk: create client(bot_id, SecretRef value)
+        sdk->>wecom: TLS WebSocket connect (wss:443)
+        wecom-->>sdk: connection open
+        sdk->>wecom: cmd=aibot_subscribe, req_id, bot_id + secret
+        wecom-->>sdk: same req_id, errcode=0
+        sdk-->>manager: authenticated; start heartbeat
+
+        loop authenticated connection
+            sdk->>wecom: cmd=ping, unique req_id (default 30s)
+            wecom-->>sdk: same req_id, errcode=0
+            Note over sdk: reset consecutive missed-heartbeat count
+        end
+
+        wecom->>sdk: cmd=aibot_msg_callback, req_id, message/event body
+        sdk->>runtime: dispatch typed frame
+        runtime->>runtime: bound shape/timestamp; normalize; seal media locator
+        runtime->>pg: short transaction: dedupe inbound + mailbox + outbox
+        pg-->>runtime: COMMIT (durable acceptance)
+        Note over runtime,wecom: no HTTP 2xx; callback delivery is a WebSocket frame
+
+        runtime->>worker: SessionReady wake-up then PG claim
+        worker->>pg: fenced turn commit + outbound outbox
+        dispatcher->>pg: claim outbound.wecom_ai_bot.ready
+        dispatcher->>sdk: send_message(chatid, markdown + client_msg_id)
+        sdk->>wecom: cmd=aibot_send_msg, new req_id, body
+        wecom-->>sdk: same req_id, errcode/errmsg ACK
+        sdk-->>dispatcher: delivery receipt
+        dispatcher->>pg: delivered / retryable / ambiguous
+
+        alt socket closes or two heartbeat ACKs are missed
+            sdk-->>manager: disconnected; pending ACKs fail
+            manager->>sdk: close client
+            manager->>pg: pg_advisory_unlock(hash(tenant_id, binding_id))
+            manager->>manager: bounded exponential backoff + jitter
+            Note over manager,pg: reacquire lock before every new WSS connection
+        else provider sends disconnected_event (new connection took over)
+            wecom->>sdk: event.disconnected_event
+            sdk-->>manager: stop this connection; do not fight the new owner
+            manager->>pg: release advisory lock
+        end
+    end
+```
+
+认证帧是 `aibot_subscribe`；SDK 只有在相同 `req_id` 返回 `errcode=0` 后才进入 authenticated 并开始
+业务心跳。心跳是应用层 `ping` 帧，不是依赖 WebSocket 库默认 ping；连续两次没有成功 ACK 会把连接
+判为异常。入站命令是 `aibot_msg_callback`。本服务的 Agent 执行是异步的，因此最终回复从 PostgreSQL
+Outbound Outbox 通过 `aibot_send_msg` 主动发送，并等待同 `req_id` 的 ACK；明确限流可按
+`Retry-After` 重试，发送后超时或断线属于结果未知，只记为 `ambiguous`，不会自动盲重放。
+
+这里的 advisory lock 是服务侧的第一道单连接约束；企业微信侧也只允许同一机器人同时存在一个有效
+长连接。凭证轮换或 binding control version 变化时，manager 先取消旧任务、断开并释放锁，再用新的
+SecretRef 建立连接，不在日志或报告中保存 Bot Secret。
+
+每次连接取得租约后都会在 `wecom_connection_state` 以 fenced epoch 记录 owner 哈希和认证状态，并把
+`acquired`、`takeover`、`authenticated`、`provider_event`、`disconnected`、`released` 生命周期写入
+`im_acceptance_evidence_events`。两个表都受 tenant RLS 和最小权限约束；验收 API 只返回域分离哈希、
+epoch 与时间，不返回 owner、原始 provider ID、消息正文或 Secret。它们证明现有 Connector 的真实
+接管过程，不允许 driver 另开第二条 WSS 来制造一份旁路连接证据。
+
+### 断线恢复的验收边界
+
+本项目把“断线恢复”分成两种不能混写的情况：
+
+1. **单实例故障/高可用接管（可验收）**：只停止当前持有 binding lease 的一个 connector，另一个
+   connector 保持运行并取得 PostgreSQL advisory lock，重新完成 `aibot_subscribe`。至少保持故障窗口
+   60 秒；探针必须记录旧 owner 释放、新 owner 接管、接管后的 WSS 认证，以及一个接管后新产生的
+   唯一测试消息从入站到 `aibot_send_msg` ACK 的一次交付。这个结果证明的是服务侧 HA 和 Outbox
+   收敛，不是供应商重放历史消息。
+2. **全部 WSS 同时断开（供应商投递缺口）**：两个 connector 都没有有效长连接时，企业微信没有可供
+   本服务接收的 `aibot_msg_callback` 通道。官方协议和 SDK 没有为入站消息定义 replay cursor、resume
+   token 或 history pull；因此不能假设供应商会在重连后补投断线期间的消息。断线窗口内未收到的消息
+   必须保留为未接收/失败证据，不能标记为恢复成功，也不能用恢复后新发送的消息冒充旧消息。恢复后
+   发送的验收 marker 必须使用新的 provider `msgid`/事件 ID，并单独记录为新消息。
+
+   这两种情况的报告字段和 gate 结论必须分别表达：单实例接管可以 `pass`；全部 WSS 断开只能记录
+   provider delivery gap（按当前外部能力为 `not_run` 或 `fail`），不能把热备接管的回复倒推为断线
+   期间旧消息已恢复。若必须保证这类消息不丢，需要供应商侧可验证的缓冲/重放能力或业务侧另建可重放
+   入口；本项目不能凭空重建未收到的消息正文。
 
 单聊 Session HMAC 输入为 tenant + binding + user，群聊为 tenant + binding + chat；principal 仍由外部
 user 单独映射，所以同群 Session 共享历史但审计能区分发言人。可丢失流式进度不参与正确性，最终
@@ -41,26 +144,9 @@ CorpID/AgentID/Secret。操作步骤：
 }
 ```
 
-`yqzl` 已提供不把凭证放入进程参数的配置脚本。在服务器上创建一个仅 root 可读的临时文件，填入
-Bot ID 和 Secret，然后从标准输入执行脚本：
-
-```bash
-install -m 0600 /dev/null /root/wecom-credentials.json
-# 用本机编辑器填入两项真实值后保存
-python3 /www/wwwroot/tx.nstarzx.cn/app/deploy/yqzl/configure_wecom_binding.py \
-  </root/wecom-credentials.json
-rm -f /root/wecom-credentials.json
-```
-
-输入结构如下。脚本会安全写入 Secret、创建启用的 binding 并输出 binding ID；企业微信长连接模式
-没有需要填写的回调 URL：
-
-```json
-{
-  "wecom_bot_id": "...",
-  "wecom_bot_secret": "..."
-}
-```
+正式部署把 Secret 写入同一集群的 `trpc-im-secrets`，把 Bot ID 写入 PostgreSQL channel binding；不要在
+命令参数、ConfigMap 或 binding JSON 中传递 Secret。完整的 Secret 创建与 Admin API binding 模板见根
+目录 README。企业微信长连接模式没有需要填写的回调 URL。
 
 ## 飞书应用机器人
 
@@ -69,6 +155,13 @@ rm -f /root/wecom-credentials.json
 密钥解密，最后同时校验 Verification Token 和回调中的 App ID。URL challenge 直接返回；普通消息在
 PostgreSQL 完成 Inbox/Outbox 原子提交后立即确认，Agent 的最终回复由 Channel Dispatcher 调用飞书
 OpenAPI 异步发送。消息 ID 是幂等键，应用或机器人自己发送的消息会被忽略，避免回复环路。
+
+在线验收时，Nginx 会把同一份加密 callback 异步镜像给 checkout 外的独立 observer；observer 独立
+验签、解密和校验 token/App ID，仅保留有界、带 TTL 的事件/消息/marker 域分离哈希。Channel
+Dispatcher 的飞书 OpenAPI 根地址只在 `TRPC_SERVICE_ONLINE_TESTS_ENABLED=true` 时可临时切到独立
+OpenAPI witness；witness 将允许的鉴权/消息路径转发到 `open.feishu.cn`，仅保留状态码、平台码、
+Retry-After 和请求 ID 哈希，并可在真实供应商 ACK 后一次性丢弃下游响应以证明 ambiguous。正常运行
+始终使用官方根地址，不能无意经过验收代理。
 
 单聊 Session HMAC 输入为 tenant + binding + Open ID，群聊为 tenant + binding + Chat ID；同一用户在
 不同 tenant 或 binding 下不会共享会话。首版标准化文本、富文本、图片、文件、音频、视频和贴纸；
@@ -120,35 +213,14 @@ tenant config 固定，下载层还有相同或更低的进程级硬上限。扫
     "verification_token": {"uri": "file:///run/secrets/feishu_verification_token"},
     "encrypt_key": {"uri": "file:///run/secrets/feishu_encrypt_key"}
   },
-  "capabilities": ["media", "proactive"],
+  "capabilities": ["text", "proactive"],
   "enabled": true
 }
 ```
 
-`yqzl` 已提供不把凭证放入进程参数的配置脚本。先由 `provision.sh` 生成不可枚举 binding ID，再在
-服务器上创建一个仅 root 可读的临时 JSON 文件：
-
-```bash
-install -m 0600 /dev/null /root/feishu-credentials.json
-# 用本机编辑器填入四项真实值后保存
-python3 /www/wwwroot/tx.nstarzx.cn/app/deploy/yqzl/configure_feishu_binding.py \
-  </root/feishu-credentials.json
-rm -f /root/feishu-credentials.json
-```
-
-输入结构如下；脚本输出的 `callback_url` 就是飞书后台应填写的完整请求地址：
-
-```json
-{
-  "feishu_app_id": "cli_...",
-  "feishu_app_secret": "...",
-  "feishu_verification_token": "...",
-  "feishu_encrypt_key": "..."
-}
-```
-
-配置完成后运行 `verify_feishu_callback.py`。它会从服务器 Secret 文件构造一次加密 challenge，经公网
-HTTPS/Nginx/Gateway 往返验证，但输出中不包含凭证。
+正式部署把三项 Secret 写入同一集群的 `trpc-im-secrets`，把 App ID 写入 PostgreSQL channel binding；
+飞书后台回调地址指向同一集群 Gateway Ingress。完整的 Secret、Admin API binding 和 callback 模板见根
+目录 README。真实 challenge 必须经公网 HTTPS/Ingress/Gateway 往返验证，验证日志不得包含凭证。
 
 在 PowerShell 中可把 `.env.example` 复制为被 Git 忽略的 `.env.im`，填入真实值后显式启动：
 
@@ -185,23 +257,57 @@ provider evidence）的 SHA-256，不包含签名字段、原始消息正文、�
 WebSocket 事件与 send ack。`rate_limit_retry_after` 观察项必须包含平台限流码（飞书通常为
 `99991400` 等平台码或对应 HTTP 429；企微通常为 `45009`/`45011` 或 HTTP 429）、供应商返回的
 `Retry-After`、至少两次发送尝试和实际等待时长；门禁会拒绝只有 `status=pass` 而没有这些字段的
-探针响应。`reconnect` 还必须证明断线后的锁释放、下一 owner 接管和新 epoch，`prolonged_outage`
-至少保持 60 秒后才恢复。`ambiguous` 还必须由探针明确标记
+探针响应。飞书 `reconnect` 必须证明旧 Gateway endpoint 消失、replacement EndpointSlice 连续稳定且
+callback/ACK 经新 endpoint 完成；企微 `reconnect` 必须证明断线后的锁释放、下一 owner 接管、epoch
+递增及重新认证。`prolonged_outage` 的最小语义是单实例不可用且冗余 owner 持续服务，至少保持 60 秒
+后才恢复，并要有接管后的新消息与发送 ACK。
+全部 WSS 同时断开时，探针不得把恢复后新消息计入断线窗口；应单独记录 provider delivery gap。
+`ambiguous` 还必须由探针明确标记
 `drop_response_observed=true`，证明已发生响应丢失/结果未知，并保持自动重放次数为零、生成
 人工复核标识。生产执行必须同时注入当前 `TRPC_RELEASE_ID` 与高熵
 `TRPC_RELEASE_NONCE`，以便与同一候选的其他生产报告绑定。离线 fake resilience 报告只能是
 `production_gate=not_run`，不能替代这两条真实通道的限流、长断线、响应丢失和锁接管窗口。
 
+幂等证据也按通道区分：飞书必须由平台真实重投同一个 event/message ID，observer 至少观察到两次；
+企微协议没有入站重投接口，因此只允许把已经由当前 WSS 持久化的 provider event 交给服务侧 replay，
+并证明两个不同 processing ID 仍只提交一份业务结果。用两条新消息、driver 自报 duplicate 或恢复后新
+marker 都不能算幂等通过。
+
 ## 通用投递规则
 
-`ChannelCapabilities` 表示 stream/card/media/recall/proactive 能力。适配器负责长度拆分、速率限制和
-平台错误映射；Dispatcher 记录每次 delivery attempt。明确失败可按退避策略重试，并优先遵守供应商
-`Retry-After`（包括平台 JSON 中的 retry hint）；HTTP 超时、连接
+`ChannelCapabilities` 是代码实际实现的**出站**能力，不是供应商理论 API，也不会被
+`ChannelBinding.capabilities` 扩大。后者当前只表达 binding 的声明/要求，不是独立的发送授权执行点；
+发送权限必须在创建 Outbox 前由租户策略/业务入口校验。如果 binding 声明了适配器没有实现的能力，调用
+仍必须失败关闭。
+
+| 通道 | text | stream | card | media | recall | proactive | 文本拆分/本地供应商长度 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 飞书 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 | 支持 | 不拆分；未声明供应商上限 |
+| 企业微信 AI Bot | 支持（markdown body） | 不支持 | 不支持 | 不支持 | 不支持 | 支持 | 不拆分；未声明供应商上限 |
+
+这里的 `media` 只指**出站**媒体。两条通道都能规范化并安全下载受支持的入站媒体，但当前
+`send()` 只接受 `PayloadKind.TEXT`。企业微信的 markdown body 仍是文本消息，不作为 card；飞书适配器
+也没有实现 interactive card。两条适配器的 `recall()` 都固定返回非重试的
+`FAILED/unsupported_capability`，不会把入站撤回事件或供应商可能存在的其他 API 冒充成已审计的出站
+撤回。
+
+当前也不在适配器内拆分超长文本。一次 Outbound Outbox 记录只产生一个供应商发送请求，并继续使用同一个
+飞书 `uuid` 或企业微信 `client_msg_id`。现有 delivery attempt 没有持久化分片游标；若前一片已成功、后
+一片失败或结果未知，整条重试可能制造重复回复。因此 `max_text_bytes=None` 表示“本实现没有宣称经验证的
+供应商长度上限”，不是无限长度保证；供应商的明确拒绝仍按失败映射。未来只有在增加持久化分片状态、逐片
+稳定幂等键和部分成功恢复协议后，才能把 `text_split` 改为 `true`。
+
+适配器继续负责供应商错误和限流映射；Dispatcher 记录每次 delivery attempt。明确失败可按退避策略重试，
+并优先遵守供应商 `Retry-After`（包括平台 JSON 中的 retry hint）；HTTP 超时、连接
 断开等结果未知状态标记 `ambiguous`，必须由 tenant admin 带 `If-Match`、`Idempotency-Key` 和人工
 确认调用 replay。所有日志只记录 tenant/binding/message 哈希和状态，不记录正文或凭证。
 
 ## 平台参考
 
+- [企业微信 AI Bot 官方协议文档](https://developer.work.weixin.qq.com/document/path/101463)
+- [企业微信官方 Node SDK（固定提交 `80615b987ef69c6028ad764924609247c0725955`）](https://github.com/WecomTeam/aibot-node-sdk/tree/80615b987ef69c6028ad764924609247c0725955)
+- [官方 Node SDK WebSocket 实现（固定提交）](https://github.com/WecomTeam/aibot-node-sdk/blob/80615b987ef69c6028ad764924609247c0725955/src/ws.ts)
+- [企业微信官方 Python SDK WebSocket 实现（固定提交 `6bcb59a9a636c566f4c6ea5268b228e3def1611a`）](https://github.com/WecomTeam/wecom-aibot-python-sdk/blob/6bcb59a9a636c566f4c6ea5268b228e3def1611a/aibot/ws.py)
 - [企业微信 AI Bot Python SDK（WecomTeam）](https://github.com/WecomTeam/wecom-aibot-python-sdk)
 - [腾讯云：长连接方式接入企业微信智能机器人](https://cloud.tencent.cn/document/product/1759/121473)
 - [飞书官方 Channel SDK](https://github.com/larksuite/channel-sdk-python)

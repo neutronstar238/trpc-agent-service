@@ -17,9 +17,13 @@ Session Reconciler 三个有界循环。它只依赖 PostgreSQL；Compose 只等
 减少无必要的数据库竞争。收到 SIGTERM 时停止新轮次并取消三个循环，终止宽限建议至少 30 秒。
 
 Worker 接收媒体时必须配置 S3-compatible Artifact 后端，否则不会在未持久化原文件的情况下继续处理。
-`yqzl` 基线用固定版本 MinIO 容器，仅监听 `127.0.0.1:9000`，数据位于
-`/www/wwwroot/tx.nstarzx.cn/data/minio`，凭证位于只读 `secrets/`；容器设置 512 MiB 内存、1 CPU
-和 256 PID 上限。小规模图片/PDF 验收时 Worker 常驻约几十 MiB，峰值额外内存主要由当前下载项、
+`artifact-gc` 使用独立 worker 数据库身份，每轮通过 `FOR UPDATE SKIP LOCKED` 清理超过 24 小时仍为
+`staged` 的元数据与对象，并分页检查 S3 staging 前缀，回收上传成功但元数据事务未提交的孤儿对象。
+默认每轮最多 100 项、每 60 秒轮询；对象删除成功后才把元数据 CAS 为 `deleted`，供应商故障会保留
+记录供下轮幂等重试。Compose/Kubernetes 均以单副本启动，也可依靠行锁安全扩容。
+Production overlay 使用 digest-pinned MinIO StatefulSet、独立 application identity 和 retained PVC；
+凭据来自 `trpc-infrastructure-secrets`，应用不能使用 MinIO root 身份。小规模图片/PDF 验收时 Worker
+常驻约几十 MiB，峰值额外内存主要由当前下载项、
 PDF 解析和模型 SDK 决定；每个 Worker 当前顺序消费消息，默认单项 20 MiB 硬上限可避免并发倍增。
 更高吞吐应通过增加无状态 Worker 副本扩展，而不是放宽单文件限制。
 
@@ -53,7 +57,39 @@ PDF 解析和模型 SDK 决定；每个 Worker 当前顺序消费消息，默认
 
 发布门禁要求 callback ack p95 <200ms、已接受消息零丢失、错误率 <0.1%、突发结束后队列归零。
 PDB 保持关键角色可用，preStop 停止拉新任务并等待当前 turn；终止宽限必须大于 lease 续期间隔和常见
-turn p95。备份需要同时验证 PG PITR、对象版本和密钥恢复，季度执行按租户恢复演练。
+turn p95。备份需要同时验证 PG PITR、对象版本和密钥恢复，季度执行按租户恢复演练。三个隔离恢复作业
+分别输出 `runs/drill/postgres_pitr.json`、`artifact_restore.json`、`key_restore.json` 后，显式设置
+`TRPC_DR_DRILL_ENABLED=true` 并运行 `scripts/disaster_recovery_gate.py --require-production`。三份证据
+必须共享同一 drill/tenant canary，恢复前后 SHA-256 一致，绑定当前 candidate lock，并同时满足配置的
+RPO/RTO；未执行或只写一份“通过”摘要时门禁保持 `not_run`。
+
+没有跨区 OSS、KMS 或持久卷时，可运行零成本功能灾备检查来验证三条恢复代码路径。它从同一个
+`deploy/runtime-gate.yaml` 读取 kubeconfig、context、`image_pull_secret`、support 镜像和当前
+candidate lock，在集群内创建临时 `trpc-dr-functional-*` Namespace；Namespace 只使用 `emptyDir`，
+不挂 PVC/hostPath，也不接触生产数据。PostgreSQL 检查是合成数据的逻辑快照恢复，MinIO 检查对象版本
+恢复，密钥检查使用临时 Secret 中的合成 wrapping key；因此它只能证明功能链路，不能代替生产 PITR、
+异地对象冗余或外部 KMS。三个 Job 会一起提交，完成后收集 Kubernetes API 与 Job 输出证据，成功或失败
+都会按 Namespace UID 校验后清理临时 Namespace，报告固定为 `production_gate=not_run`。
+
+执行时先准备配置文件和当前 nonce，再显式开启：
+
+```powershell
+$env:TRPC_DR_FUNCTIONAL_ENABLED = "true"
+python -m scripts.kubernetes_functional_disaster_recovery `
+  --config deploy/runtime-gate.yaml `
+  --require-functional
+```
+
+Job 内部入口必须使用 `python -m scripts.dr_functional_job`，不要改成脚本文件路径；这样容器从
+`/app` 启动时能正确解析 `scripts` 包。报告写入
+`runs/multitenant/disaster-recovery-functional.json`，功能检查通过也不能用于
+`scripts.disaster_recovery_gate.py --require-production`。
+
+发布聚合默认仍要求上述破坏性生产灾备真实 `pass`。只有发布者显式给 release gate 和 manifest 都传入
+`--allow-functional-dr`，才能用当前候选的功能灾备 `pass` 授权破坏性报告保持 `not_run`；聚合结果必须
+记录 `authorized_not_run_gates=[disaster_recovery]`。破坏性报告为 `fail`、功能报告缺少三个组件、cleanup、
+lineage 或正确 producer 时都不能授权，`online_im` 和其他门禁也不受影响。该模式的 manifest 绑定功能
+灾备报告和 policy，排除未运行的破坏性报告；policy 或所绑定报告被篡改时最终门禁失败。
 
 调度器 `v1` 与 `v2` 的 Redis stream、consumer group 和数据库处理语义不同。相同版本的
 代码升级可以使用 Kubernetes RollingUpdate；`v1↔v2` 是协议切换，必须先停入站、排空旧
@@ -62,32 +98,14 @@ turn p95。备份需要同时验证 PG PITR、对象版本和密钥恢复，季�
 和应急队列处理见 [调度器切换运行手册](scheduler-cutover.md)。禁止以 `DEL`、`XTRIM`、
 `XGROUP DESTROY` 或直接改状态字段的方式伪造排空。
 
-## yqzl 服务器发布顺序
+## Kubernetes 正式发布顺序
 
-在 `/www/wwwroot/tx.nstarzx.cn` 上，发布必须按以下顺序执行：
+正式发布只使用 `deploy/kustomize/overlays/production`。先创建六类 Secret 和镜像拉取凭据，再应用
+基础设施并等待 PostgreSQL、Redis、MinIO、Prometheus ready；随后重建并等待 schema migration 与
+MinIO bootstrap Job，最后启动 Gateway、Admin、Worker、两个 Dispatcher、Projector、Recovery、GC、
+Exporter 和 WeCom Connector。裸 `kubectl` 与 Argo CD 的精确顺序、等待命令和回滚步骤见根目录
+README。不得以单机 systemd、面板数据库或临时域名替代正式集群模板。
 
-1. 更新代码并重建 `.venv`，确认 `trpc-service doctor` 与锁文件一致。
-2. 由 root 执行 `deploy/yqzl/provision.sh`；生产配置使用
-   `deploy/yqzl/runtime.env.example` 复制后的 host-specific 文件，不能使用
-   `TRPC_SERVICE_ENVIRONMENT=development` 或 development token。
-   同时保留 `TRPC_SERVICE_RUNTIME_STATE_DIR=/tmp/trpc-agent-service`，将
-   `TRPC_SERVICE_TENANT_SECRET_ROOT` 指向站点 `secrets/` 目录，并只在确有
-   `env://` 租户 Secret 时把对应的 `TRPC_TENANT_*` 名称加入
-   `TRPC_SERVICE_TENANT_SECRET_ENV_NAMES`；空列表是 fail-closed 默认值。
-   `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` 必须列出实际批准的 HTTPS 主机，
-   `TRPC_SERVICE_FEISHU_ALLOW_STALE_BINDING_CACHE=false` 不得被生产配置覆盖。
-   应急队列使用 `TRPC_SERVICE_EMERGENCY_QUEUE_KEY_VERSION` 标识当前密钥；
-   轮换期间才填写 `TRPC_SERVICE_EMERGENCY_QUEUE_PREVIOUS_KEY_REFS`，且每个
-   引用的旧密钥必须同时存在并在轮换完成后移除。
-3. 使用独立 `trpc_migration` 账号执行 `trpc-service migrate --revision head`，确认
-   `alembic_version` 为 checkout head；运行角色使用非 owner 的 `trpc_runtime`。
-4. 启动 Redis/MinIO，再启动 `gateway`、`admin`、`session-recovery`、`worker`、两个
-   dispatcher、projector 和 `wecom-connector` 全部 systemd role。
-5. 设置 `TRPC_VERIFY_TENANT_ID` 与 `TRPC_VERIFY_BINDING_ID` 后执行
-   `deploy/yqzl/verify_runtime.sh`。该脚本会检查 binding/secret 引用、WeCom connector、
-   PostgreSQL/Redis/MinIO 连接、服务重启和日志泄漏；未提供 ID 会 fail-closed，不再使用
-   仓库内硬编码租户。
-
-Worker 的 systemd drop-in 将内存上限提升到 2 GiB；其他角色保留 768 MiB 上限。变更
-runtime.env 或 secret 后应先执行 verify，再按 role 滚动重启，不能通过重启次数正常来掩盖
-配置错误。
+变更 ConfigMap 或 Secret 后按角色滚动，并重新验证 EndpointSlice、HPA、binding/SecretRef、
+PostgreSQL/Redis/MinIO 连通性和日志脱敏。企业微信两个 Connector 副本必须跨节点，且同一 binding
+只能有一个 advisory-lock owner；飞书回调必须经正式 Ingress HTTPS 验签。

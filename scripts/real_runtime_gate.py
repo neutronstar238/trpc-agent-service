@@ -158,6 +158,8 @@ MAX_REAL_TIMEOUT_SECONDS = 900.0
 HEALTH_POLL_INTERVAL_SECONDS = 0.5
 MAX_HEALTH_WAIT_SECONDS = 120.0
 WORKER_TERMINATION_POLL_INTERVAL_SECONDS = 0.25
+ACTIVE_TURN_POLL_INTERVAL_SECONDS = 0.05
+MAX_KILL_TARGET_AGE_SECONDS = 0.2
 REAL_COMPOSE_PROJECT = "trpc-agent-service"
 DEDICATED_RUNTIME_PROJECT_RE = re.compile(r"trpc-fault-[a-z0-9][a-z0-9-]{0,47}")
 REAL_RUNTIME_REPORT_SCHEMA_VERSION = 1
@@ -408,9 +410,11 @@ def _runtime_inputs_from_report(
     participating_worker_identity_keys: set[tuple[str, int, str, str]] = set()
     for service in PARTICIPATING_SERVICES:
         containers = participating_services.get(service)
-        if not isinstance(containers, Sequence) or isinstance(
-            containers, (str, bytes, bytearray)
-        ) or not containers:
+        if (
+            not isinstance(containers, Sequence)
+            or isinstance(containers, (str, bytes, bytearray))
+            or not containers
+        ):
             return None
         for container in containers:
             if not isinstance(container, Mapping):
@@ -440,9 +444,7 @@ def _runtime_inputs_from_report(
             participating_pids.add(pid)
             if service == "worker":
                 participating_worker_ids.add(container_id)
-                participating_worker_identity_keys.add(
-                    (container_id, pid, image_id, source_label)
-                )
+                participating_worker_identity_keys.add((container_id, pid, image_id, source_label))
             participating_identities.append(
                 {
                     "role": service,
@@ -1081,14 +1083,11 @@ def _connection_routes_match(
     database = routes.get("database")
     redis = routes.get("redis")
     worker_database = routes.get("worker_database")
-    worker_route_valid = (
-        expected_role not in PARTICIPATING_SERVICES
-        or (
-            isinstance(worker_database, dict)
-            and worker_database.get("role") == WORKER_DATABASE_ROLE
-            and worker_database.get("host") == expected["host"]
-            and worker_database.get("port") == expected["database_port"]
-        )
+    worker_route_valid = expected_role not in PARTICIPATING_SERVICES or (
+        isinstance(worker_database, dict)
+        and worker_database.get("role") == WORKER_DATABASE_ROLE
+        and worker_database.get("host") == expected["host"]
+        and worker_database.get("port") == expected["database_port"]
     )
     return (
         isinstance(database, dict)
@@ -1742,9 +1741,7 @@ def _role_evidence_check(
         if set(functions) != set(all_expected):
             return False
         return all(
-            isinstance(item, Mapping)
-            and item.get("exists") is True
-            for item in functions.values()
+            isinstance(item, Mapping) and item.get("exists") is True for item in functions.values()
         )
 
     def _function_access(
@@ -2447,17 +2444,28 @@ async def _active_turn_evidence(
     tenant_id: str,
     session_id: str,
     inbound_ids: Sequence[str],
+    *,
+    turn_id: str | None = None,
+    inbound_id: str | None = None,
+    max_started_age_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     """Return processing evidence scoped to this acceptance batch only."""
 
     if not inbound_ids:
         return None
+    if max_started_age_seconds is not None and max_started_age_seconds <= 0:
+        raise ValueError("max_started_age_seconds must be positive")
     rows = await _scoped_fetch(
         pool,
         tenant_id,
         """
         SELECT session.lease_owner, session.lease_epoch,
-               turn.turn_id, turn.inbound_id, turn.attempt, turn.fencing_token
+               turn.turn_id, turn.inbound_id, turn.attempt, turn.fencing_token,
+               turn.started_at,
+               GREATEST(
+                   0,
+                   EXTRACT(EPOCH FROM (statement_timestamp() - turn.started_at))
+               ) AS processing_age_seconds
           FROM session_turns turn
           JOIN sessions session
             ON session.tenant_id=turn.tenant_id AND session.session_id=turn.session_id
@@ -2465,14 +2473,75 @@ async def _active_turn_evidence(
            AND turn.inbound_id = ANY($3::uuid[])
            AND turn.status='processing'
            AND session.lease_owner IS NOT NULL
-         ORDER BY turn.started_at
+           AND turn.fencing_token=session.lease_epoch
+           AND ($4::uuid IS NULL OR turn.turn_id=$4::uuid)
+           AND ($5::uuid IS NULL OR turn.inbound_id=$5::uuid)
+           AND (
+               $6::double precision IS NULL
+               OR turn.started_at >= statement_timestamp() - ($6 * interval '1 second')
+           )
+         ORDER BY turn.started_at DESC
          LIMIT 1
         """,
         tenant_id,
         session_id,
         [UUID(item) for item in inbound_ids],
+        UUID(turn_id) if turn_id else None,
+        UUID(inbound_id) if inbound_id else None,
+        max_started_age_seconds,
     )
-    return dict(rows[0]) if rows else None
+    if not rows:
+        return None
+    evidence = dict(rows[0])
+    for name in ("turn_id", "inbound_id"):
+        if evidence.get(name) is not None:
+            evidence[name] = str(evidence[name])
+    if evidence.get("started_at") is not None:
+        evidence["started_at"] = _utc_timestamp(evidence["started_at"])
+    if evidence.get("processing_age_seconds") is not None:
+        evidence["processing_age_seconds"] = float(evidence["processing_age_seconds"])
+    return evidence
+
+
+async def _turn_state_evidence(
+    pool: asyncpg.Pool,
+    *,
+    tenant_id: str,
+    session_id: str,
+    turn_id: str,
+    inbound_id: str,
+) -> dict[str, Any] | None:
+    """Return the exact targeted turn state after worker termination."""
+
+    rows = await _scoped_fetch(
+        pool,
+        tenant_id,
+        """
+        SELECT turn.turn_id, turn.inbound_id, turn.status, turn.attempt,
+               turn.started_at, turn.committed_at,
+               session.lease_owner, session.lease_epoch
+          FROM session_turns turn
+          JOIN sessions session
+            ON session.tenant_id=turn.tenant_id AND session.session_id=turn.session_id
+         WHERE turn.tenant_id=$1 AND turn.session_id=$2
+           AND turn.turn_id=$3::uuid AND turn.inbound_id=$4::uuid
+         LIMIT 1
+        """,
+        tenant_id,
+        session_id,
+        UUID(turn_id),
+        UUID(inbound_id),
+    )
+    if not rows:
+        return None
+    evidence = dict(rows[0])
+    for name in ("turn_id", "inbound_id"):
+        if evidence.get(name) is not None:
+            evidence[name] = str(evidence[name])
+    for name in ("started_at", "committed_at"):
+        if evidence.get(name) is not None:
+            evidence[name] = _utc_timestamp(evidence[name])
+    return evidence
 
 
 async def _active_turn_owner(
@@ -2502,6 +2571,8 @@ async def _wait_for_takeover(
     inbound_ids: Sequence[str],
     killed_owner: str,
     previous_epoch: int,
+    target_turn_id: str,
+    target_inbound_id: str,
     wait_seconds: float,
 ) -> dict[str, Any]:
     """Observe a live replacement lease before the session is committed.
@@ -2513,7 +2584,15 @@ async def _wait_for_takeover(
     deadline = time.monotonic() + wait_seconds
     latest: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        latest = await _active_turn_evidence(pool, tenant_id, session_id, inbound_ids)
+        latest = await _active_turn_evidence(
+            pool,
+            tenant_id,
+            session_id,
+            inbound_ids,
+            turn_id=target_turn_id,
+            inbound_id=target_inbound_id,
+            max_started_age_seconds=MAX_KILL_TARGET_AGE_SECONDS,
+        )
         if latest:
             epoch = int(latest.get("lease_epoch") or 0)
             owner = str(latest.get("lease_owner") or "")
@@ -2530,7 +2609,7 @@ async def _wait_for_takeover(
                     "attempt": attempt,
                     "turn_id": str(latest.get("turn_id")),
                 }
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(ACTIVE_TURN_POLL_INTERVAL_SECONDS)
     return {
         "status": "not_run",
         "reason": "replacement lease was not observed while processing",
@@ -2568,7 +2647,14 @@ async def _probe_stale_fencing_rejection(
     if not all((tenant_id, session_id, inbound_id, old_owner, old_turn_id, old_epoch, new_owner)):
         return {"status": "not_run", "reason": "old/new lease evidence is incomplete"}
     try:
-        current = await _active_turn_evidence(pool, tenant_id, session_id, inbound_ids)
+        current = await _active_turn_evidence(
+            pool,
+            tenant_id,
+            session_id,
+            inbound_ids,
+            turn_id=old_turn_id,
+            inbound_id=inbound_id,
+        )
         if not current or str(current.get("lease_owner")) != new_owner:
             return {
                 "status": "not_run",
@@ -2605,7 +2691,14 @@ async def _probe_stale_fencing_rejection(
         )
     except FencingConflict:
         try:
-            current_after = await _active_turn_evidence(pool, tenant_id, session_id, inbound_ids)
+            current_after = await _active_turn_evidence(
+                pool,
+                tenant_id,
+                session_id,
+                inbound_ids,
+                turn_id=old_turn_id,
+                inbound_id=inbound_id,
+            )
         except (asyncpg.PostgresError, OSError, RuntimeError, ValueError, TypeError) as error:
             return {
                 "status": "not_run",
@@ -2698,6 +2791,7 @@ async def _wait_for_worker_termination(
                     "termination_verified": True,
                     "termination_status": status,
                     "termination_pid": inspected.get("pid"),
+                    "termination_observed_at": _utc_timestamp(),
                 }
             last_error = f"container remained {status or 'unknown'}"
         await asyncio.sleep(
@@ -2772,6 +2866,7 @@ async def _load_phase(
                 str(batch["tenant_id"]),
                 str(batch["session_id"]),
                 batch["unique_inbound_ids"],
+                max_started_age_seconds=MAX_KILL_TARGET_AGE_SECONDS,
             )
             active_owner = (
                 str(active_evidence["lease_owner"])
@@ -2780,7 +2875,7 @@ async def _load_phase(
             )
             if active_owner:
                 break
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(ACTIVE_TURN_POLL_INTERVAL_SECONDS)
         stage_markers.append(
             _stage_marker(
                 "turn.processing_observed",
@@ -2814,29 +2909,7 @@ async def _load_phase(
             kill["old_owner"] = active_owner
             kill["old_lease_epoch"] = int(active_evidence.get("lease_epoch") or 0)
             kill["old_fencing_token"] = int(active_evidence.get("fencing_token") or 0)
-            if kill.get("status") == "pass" and active_evidence is not None:
-                assert active_owner is not None
-                takeover_observation = await _wait_for_takeover(
-                    pool,
-                    tenant_id=str(batch["tenant_id"]),
-                    session_id=str(batch["session_id"]),
-                    inbound_ids=batch["unique_inbound_ids"],
-                    killed_owner=active_owner,
-                    previous_epoch=int(active_evidence.get("lease_epoch") or 0),
-                    wait_seconds=min(120.0, max(30.0, args.timeout_seconds / 2)),
-                )
-                if takeover_observation.get("status") == "pass":
-                    stale_token_rejection = await _probe_stale_fencing_rejection(
-                        pool,
-                        repository,
-                        batch=batch,
-                        old_evidence=active_evidence,
-                        takeover_observation=takeover_observation,
-                    )
-            kill["kill_completed_at"] = _utc_timestamp()
-            kill["old_token_rejected"] = stale_token_rejection.get("status") == "pass"
-            kill["new_owner"] = takeover_observation.get("takeover_owner")
-            kill["new_lease_epoch"] = takeover_observation.get("lease_epoch_after")
+            kill["kill_completed_at"] = str(kill.get("termination_observed_at") or _utc_timestamp())
             stage_markers.append(
                 _stage_marker(
                     "worker.kill_completed",
@@ -2848,6 +2921,75 @@ async def _load_phase(
                     ),
                 )
             )
+            if kill.get("status") == "pass" and active_evidence is not None:
+                assert active_owner is not None
+                target_turn_id = str(active_evidence.get("turn_id") or "")
+                target_inbound_id = str(active_evidence.get("inbound_id") or "")
+                target_state = await _turn_state_evidence(
+                    pool,
+                    tenant_id=str(batch["tenant_id"]),
+                    session_id=str(batch["session_id"]),
+                    turn_id=target_turn_id,
+                    inbound_id=target_inbound_id,
+                )
+                kill["target_turn_state_after_kill"] = target_state
+                target_status = str(target_state.get("status") or "") if target_state else ""
+                if target_state is None:
+                    takeover_observation = {
+                        "status": "not_run",
+                        "reason": "target turn evidence was missing after worker termination",
+                        "target_turn_id": target_turn_id,
+                        "target_inbound_id": target_inbound_id,
+                        "target_status_after_kill": "missing",
+                    }
+                elif target_status == "committed":
+                    takeover_observation = {
+                        "status": "not_run",
+                        "reason": (
+                            "kill window missed: targeted turn committed before worker "
+                            "termination was observed"
+                        ),
+                        "target_turn_id": target_turn_id,
+                        "target_inbound_id": target_inbound_id,
+                        "target_status_after_kill": target_status,
+                    }
+                elif target_status != "processing":
+                    takeover_observation = {
+                        "status": "not_run",
+                        "reason": (
+                            "targeted turn entered an unexpected state after worker termination: "
+                            f"{target_status or 'unknown'}"
+                        ),
+                        "target_turn_id": target_turn_id,
+                        "target_inbound_id": target_inbound_id,
+                        "target_status_after_kill": target_status or "unknown",
+                    }
+                else:
+                    kill["takeover_wait_started_at"] = _utc_timestamp()
+                    takeover_observation = await _wait_for_takeover(
+                        pool,
+                        tenant_id=str(batch["tenant_id"]),
+                        session_id=str(batch["session_id"]),
+                        inbound_ids=batch["unique_inbound_ids"],
+                        killed_owner=active_owner,
+                        previous_epoch=int(active_evidence.get("lease_epoch") or 0),
+                        target_turn_id=target_turn_id,
+                        target_inbound_id=target_inbound_id,
+                        wait_seconds=min(120.0, max(30.0, args.timeout_seconds / 2)),
+                    )
+                    if takeover_observation.get("status") == "pass":
+                        stale_token_rejection = await _probe_stale_fencing_rejection(
+                            pool,
+                            repository,
+                            batch=batch,
+                            old_evidence=active_evidence,
+                            takeover_observation=takeover_observation,
+                        )
+                    kill["takeover_wait_completed_at"] = _utc_timestamp()
+                kill["takeover_decision_completed_at"] = _utc_timestamp()
+            kill["old_token_rejected"] = stale_token_rejection.get("status") == "pass"
+            kill["new_owner"] = takeover_observation.get("takeover_owner")
+            kill["new_lease_epoch"] = takeover_observation.get("lease_epoch_after")
         elif active_owner:
             kill = {
                 "status": "not_run",

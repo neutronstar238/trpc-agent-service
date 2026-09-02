@@ -47,6 +47,9 @@ def spy_type(name: str) -> type[Any]:
         async def serve(self) -> None:
             return None
 
+        def ready_for_delivery(self, *_args: Any, **_kwargs: Any) -> bool:
+            return True
+
     Spy.__name__ = name
     return Spy
 

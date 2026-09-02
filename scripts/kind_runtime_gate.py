@@ -334,6 +334,7 @@ def _kind_node_safety_contract(
     cluster_name = _kind_cluster_name(context)
     if cluster_name is None:
         return False, evidence, "node safety requires a valid kind-* context"
+    assert context is not None
     evidence["cluster_name"] = cluster_name
 
     node_code, node_stdout = _run_kubectl(

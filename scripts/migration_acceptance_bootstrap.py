@@ -13,6 +13,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -33,7 +34,10 @@ from trpc_service.tenant.models import ModelPolicy, StorageSelection, TenantConf
 EXPECTED_RECORDS = 200
 SESSIONS = 100
 MEMORIES = 100
+_CLIENT_TIMEOUT_SECONDS = 30.0
+_CLOSE_TIMEOUT_SECONDS = 5.0
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_LOGGER = logging.getLogger(__name__)
 _REQUIRED = (
     "TRPC_MIGRATION_SOURCE_REDIS_URL",
     "TRPC_MIGRATION_TARGET_DATABASE_DSN",
@@ -191,6 +195,7 @@ async def _assert_redis_empty(client: Any, tenant_id: str) -> None:
 
 
 async def _assert_database_scope_empty(pool: asyncpg.Pool, scope: BootstrapScope) -> None:
+    guard = PostgresMigrationGuard(pool)
     async with pool.acquire() as connection, connection.transaction():
         await connection.execute("SELECT set_config('app.tenant_id', $1, true)", scope.tenant_id)
         if await connection.fetchval(
@@ -201,7 +206,11 @@ async def _assert_database_scope_empty(pool: asyncpg.Pool, scope: BootstrapScope
             "SELECT EXISTS (SELECT 1 FROM agent_apps WHERE tenant_id=$1)", scope.tenant_id
         ):
             raise ValueError(f"acceptance app scope already exists: {scope.tenant_id}")
-        preflight = await PostgresMigrationGuard(pool).preflight_target_empty(scope.tenant_id)
+        # Reuse this transaction's connection.  Calling the public guard
+        # preflight here would acquire a second pooled connection while this
+        # transaction is still open; through an ACK port-forward that leaves
+        # an idle transaction checked out and can exhaust the small pool.
+        preflight = await guard._target_empty_preflight(connection, scope.tenant_id)
         if not preflight.empty:
             raise ValueError(f"target guarded tables are not empty for {scope.tenant_id}")
 
@@ -340,8 +349,24 @@ async def bootstrap() -> dict[str, Any]:
     target_endpoint = _endpoint(target_dsn)
     if source_endpoint[1:] == target_endpoint[1:]:
         raise ValueError("source and target endpoints must be independent")
-    redis = redis_async.from_url(source_url, decode_responses=False)
-    pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=4)
+    redis = redis_async.from_url(
+        source_url,
+        decode_responses=False,
+        socket_connect_timeout=_CLIENT_TIMEOUT_SECONDS,
+        socket_timeout=_CLIENT_TIMEOUT_SECONDS,
+    )
+    pool = await asyncpg.create_pool(
+        target_dsn,
+        min_size=1,
+        max_size=4,
+        command_timeout=_CLIENT_TIMEOUT_SECONDS,
+        timeout=_CLIENT_TIMEOUT_SECONDS,
+        server_settings={
+            "application_name": "trpc-migration-acceptance-bootstrap",
+            "statement_timeout": str(int(_CLIENT_TIMEOUT_SECONDS * 1000)),
+            "lock_timeout": "5000",
+        },
+    )
     try:
         for scope in (base, phase):
             await _assert_redis_empty(redis, scope.tenant_id)
@@ -371,8 +396,25 @@ async def bootstrap() -> dict[str, Any]:
             },
         }
     finally:
-        await redis.aclose()
-        await pool.close()
+        try:
+            await asyncio.wait_for(redis.aclose(), timeout=_CLOSE_TIMEOUT_SECONDS)
+        except BaseException:
+            connection_pool = getattr(redis, "connection_pool", None)
+            disconnect = getattr(connection_pool, "disconnect", None)
+            if callable(disconnect):
+                try:
+                    await asyncio.wait_for(
+                        disconnect(inuse_connections=True), timeout=_CLOSE_TIMEOUT_SECONDS
+                    )
+                except BaseException as error:
+                    _LOGGER.warning(
+                        "migration bootstrap Redis pool termination failed: %s",
+                        type(error).__name__,
+                    )
+        try:
+            await asyncio.wait_for(pool.close(), timeout=_CLOSE_TIMEOUT_SECONDS)
+        except BaseException:
+            pool.terminate()
 
 
 def main() -> int:

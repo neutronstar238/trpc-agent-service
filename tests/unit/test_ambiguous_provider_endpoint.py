@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from pathlib import Path
 
@@ -89,6 +90,32 @@ def test_same_uuid_different_body_is_rejected_without_new_side_effect(tmp_path: 
             )
             assert conflict.status_code == 409
             assert client.get(f"{url}/state/ambiguous-id").json()["receive_count"] == 1
+    finally:
+        _stop(server, thread)
+
+
+def test_auth_endpoint_waits_for_complete_request_body(tmp_path: Path) -> None:
+    server, thread, _url = _serve(tmp_path / "provider.sqlite3")
+    body = json.dumps({"app_id": "acceptance", "app_secret": "test-only"}).encode()
+    headers = (
+        "POST /open-apis/auth/v3/tenant_access_token/internal HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    try:
+        with socket.create_connection(server.server_address, timeout=2) as client:
+            client.sendall(headers + body[:1])
+            client.settimeout(0.1)
+            with pytest.raises((TimeoutError, socket.timeout)):
+                client.recv(1)
+            client.settimeout(2)
+            client.sendall(body[1:])
+            response = bytearray()
+            while chunk := client.recv(4096):
+                response.extend(chunk)
+        assert b" 200 " in response.split(b"\r\n", 1)[0]
     finally:
         _stop(server, thread)
 

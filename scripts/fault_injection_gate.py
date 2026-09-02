@@ -712,9 +712,7 @@ def _fault_production_contract_errors(
                     "independent healthy workers"
                 )
             image_attestation = (
-                preflight.get("image_attestation")
-                if isinstance(preflight, dict)
-                else None
+                preflight.get("image_attestation") if isinstance(preflight, dict) else None
             )
             source_fingerprint = (
                 evidence.get("source_fingerprint", {}).get("value")
@@ -749,16 +747,17 @@ def _fault_production_contract_errors(
             selected = item.get("evidence")
             if not isinstance(selected, dict) or selected.get("status") != "pass":
                 errors.append(f"{name}: selected child evidence is not pass")
+            selected_evidence = selected if isinstance(selected, dict) else {}
             if name == "republish":
                 probe = item.get("duplicate_publish_probe")
                 if not isinstance(probe, dict) or probe.get("status") != "pass":
                     errors.append("republish: duplicate_publish_probe must be pass")
             if name == "ambiguous":
-                ledger = selected.get("provider_ledger") if isinstance(selected, dict) else None
+                ledger = selected_evidence.get("provider_ledger")
                 if (
-                    selected.get("manual_confirmation_required") is not True
-                    or selected.get("automatic_replay_count") != 0
-                    or selected.get("confirmed_replay_status") != "pass"
+                    selected_evidence.get("manual_confirmation_required") is not True
+                    or selected_evidence.get("automatic_replay_count") != 0
+                    or selected_evidence.get("confirmed_replay_status") != "pass"
                     or not isinstance(ledger, dict)
                     or ledger.get("accepted_count") != 1
                     or ledger.get("side_effect_count") != 1
@@ -810,9 +809,11 @@ def _fault_production_contract_errors(
             ):
                 errors.append(f"evidence.{field} must be an available sha256 fingerprint")
         runtime_fingerprint_value = evidence.get("runtime_fingerprint")
-        if not isinstance(runtime_fingerprint_value, dict) or not isinstance(
-            runtime_fingerprint_value.get("worker_count"), int
-        ) or runtime_fingerprint_value.get("worker_count", 0) < MIN_REAL_WORKERS:
+        if (
+            not isinstance(runtime_fingerprint_value, dict)
+            or not isinstance(runtime_fingerprint_value.get("worker_count"), int)
+            or runtime_fingerprint_value.get("worker_count", 0) < MIN_REAL_WORKERS
+        ):
             errors.append(
                 f"evidence.runtime_fingerprint must record at least {MIN_REAL_WORKERS} workers"
             )
@@ -1498,9 +1499,7 @@ def _runtime_worker_recovery(
             "status": "not_run",
             "reason": "runtime worker preflight attestation is unavailable",
         }
-    expected_source = (
-        preflight.get("source_fingerprint") if isinstance(preflight, dict) else None
-    )
+    expected_source = preflight.get("source_fingerprint") if isinstance(preflight, dict) else None
     expected_image = preflight.get("image_id")
     if not isinstance(expected_source, str) or not expected_source.strip():
         return {"status": "not_run", "reason": "runtime worker source attestation is unavailable"}
@@ -1936,9 +1935,7 @@ def _run_fault_stage_acceptance(
             if isinstance(preflight, dict):
                 preflight["image_attestation"] = dict(worker_image_attestation)
                 preflight["image_id"] = worker_image_attestation.get("image_id")
-                preflight["source_fingerprint"] = worker_image_attestation.get(
-                    "source_fingerprint"
-                )
+                preflight["source_fingerprint"] = worker_image_attestation.get("source_fingerprint")
         return results
 
     command_output = getattr(args, "output", Path("runs/multitenant/fault-injection.json"))
@@ -2004,9 +2001,7 @@ def _run_fault_stage_acceptance(
     if expected_source_fingerprint is not None:
         expected_source = expected_source_fingerprint.get("value")
         if not isinstance(expected_source, str):
-            return _not_run_for_requested(
-                "fault-stage current source fingerprint is unavailable"
-            )
+            return _not_run_for_requested("fault-stage current source fingerprint is unavailable")
         worker_image_attestation = _fault_stage_worker_image_attestation(
             project,
             worker_container,
@@ -2054,45 +2049,49 @@ def _run_fault_stage_acceptance(
             if restored
             else "worker restoration was not confirmed"
         )
-        return _finish({
-            scenario: _fault_stage_result(
-                scenario,
-                status="fail",
-                reason=reason,
-                child_output=retained_child_output,
-                run_id=expected_run_id,
-                observation=_child_observation(
+        return _finish(
+            {
+                scenario: _fault_stage_result(
+                    scenario,
+                    status="fail",
+                    reason=reason,
                     child_output=retained_child_output,
-                    child=None,
-                    report_directory=retained_scope,
-                    started_at=child_started_at,
-                    ended_at=child_ended_at,
-                    observed_exit_code=None,
-                ),
-            )
-            for scenario in requested_scenarios
-        })
+                    run_id=expected_run_id,
+                    observation=_child_observation(
+                        child_output=retained_child_output,
+                        child=None,
+                        report_directory=retained_scope,
+                        started_at=child_started_at,
+                        ended_at=child_ended_at,
+                        observed_exit_code=None,
+                    ),
+                )
+                for scenario in requested_scenarios
+            }
+        )
     except OSError as error:
         child_ended_at = _utc_timestamp()
         reason = f"fault-stage acceptance child could not start: {type(error).__name__}"
-        return _finish({
-            scenario: _fault_stage_result(
-                scenario,
-                status="fail",
-                reason=reason,
-                child_output=retained_child_output,
-                run_id=expected_run_id,
-                observation=_child_observation(
+        return _finish(
+            {
+                scenario: _fault_stage_result(
+                    scenario,
+                    status="fail",
+                    reason=reason,
                     child_output=retained_child_output,
-                    child=None,
-                    report_directory=retained_scope,
-                    started_at=child_started_at,
-                    ended_at=child_ended_at,
-                    observed_exit_code=None,
-                ),
-            )
-            for scenario in requested_scenarios
-        })
+                    run_id=expected_run_id,
+                    observation=_child_observation(
+                        child_output=retained_child_output,
+                        child=None,
+                        report_directory=retained_scope,
+                        started_at=child_started_at,
+                        ended_at=child_ended_at,
+                        observed_exit_code=None,
+                    ),
+                )
+                for scenario in requested_scenarios
+            }
+        )
     child_ended_at = _utc_timestamp()
     if completed.returncode != 0:
         restored = _restore_fault_stage_workers(project, worker_container)
@@ -2101,25 +2100,27 @@ def _run_fault_stage_acceptance(
             if restored
             else "worker restoration was not confirmed"
         )
-        return _finish({
-            scenario: _fault_stage_result(
-                scenario,
-                status="fail",
-                reason=reason,
-                child_output=retained_child_output,
-                run_id=expected_run_id,
-                exit_code=completed.returncode,
-                observation=_child_observation(
+        return _finish(
+            {
+                scenario: _fault_stage_result(
+                    scenario,
+                    status="fail",
+                    reason=reason,
                     child_output=retained_child_output,
-                    child=None,
-                    report_directory=retained_scope,
-                    started_at=child_started_at,
-                    ended_at=child_ended_at,
-                    observed_exit_code=completed.returncode,
-                ),
-            )
-            for scenario in requested_scenarios
-        })
+                    run_id=expected_run_id,
+                    exit_code=completed.returncode,
+                    observation=_child_observation(
+                        child_output=retained_child_output,
+                        child=None,
+                        report_directory=retained_scope,
+                        started_at=child_started_at,
+                        ended_at=child_ended_at,
+                        observed_exit_code=completed.returncode,
+                    ),
+                )
+                for scenario in requested_scenarios
+            }
+        )
     try:
         child_output = _assert_safe_report_path(child_output, within=report_directory)
         child_stat = child_output.stat()
@@ -2154,25 +2155,27 @@ def _run_fault_stage_acceptance(
             if restored
             else "; worker restoration was not confirmed"
         )
-        return _finish({
-            scenario: _fault_stage_result(
-                scenario,
-                status="fail",
-                reason=reason,
-                child_output=retained_child_output,
-                run_id=expected_run_id,
-                exit_code=completed.returncode,
-                observation=_child_observation(
+        return _finish(
+            {
+                scenario: _fault_stage_result(
+                    scenario,
+                    status="fail",
+                    reason=reason,
                     child_output=retained_child_output,
-                    child=None,
-                    report_directory=retained_scope,
-                    started_at=child_started_at,
-                    ended_at=child_ended_at,
-                    observed_exit_code=completed.returncode,
-                ),
-            )
-            for scenario in requested_scenarios
-        })
+                    run_id=expected_run_id,
+                    exit_code=completed.returncode,
+                    observation=_child_observation(
+                        child_output=retained_child_output,
+                        child=None,
+                        report_directory=retained_scope,
+                        started_at=child_started_at,
+                        ended_at=child_ended_at,
+                        observed_exit_code=completed.returncode,
+                    ),
+                )
+                for scenario in requested_scenarios
+            }
+        )
     by_stage, validation_errors = _validate_fault_stage_child(
         child,
         expected_run_id=expected_run_id,
@@ -2183,25 +2186,27 @@ def _run_fault_stage_acceptance(
     if validation_errors:
         status = "not_run" if child_gate == "not_run" else "fail"
         reason = "; ".join(validation_errors)
-        return _finish({
-            scenario: _fault_stage_result(
-                scenario,
-                status=status,
-                reason=reason,
-                child=child,
-                child_output=retained_child_output,
-                child_mtime_ns=child_stat.st_mtime_ns,
-                exit_code=completed.returncode,
-                run_id=expected_run_id,
-                markers=(
-                    by_stage.get(FAULT_STAGE_SCENARIOS[scenario], {}).get("markers")
-                    if isinstance(by_stage.get(FAULT_STAGE_SCENARIOS[scenario]), dict)
-                    else None
-                ),
-                observation=observation,
-            )
-            for scenario in requested_scenarios
-        })
+        return _finish(
+            {
+                scenario: _fault_stage_result(
+                    scenario,
+                    status=status,
+                    reason=reason,
+                    child=child,
+                    child_output=retained_child_output,
+                    child_mtime_ns=child_stat.st_mtime_ns,
+                    exit_code=completed.returncode,
+                    run_id=expected_run_id,
+                    markers=(
+                        by_stage.get(FAULT_STAGE_SCENARIOS[scenario], {}).get("markers")
+                        if isinstance(by_stage.get(FAULT_STAGE_SCENARIOS[scenario]), dict)
+                        else None
+                    ),
+                    observation=observation,
+                )
+                for scenario in requested_scenarios
+            }
+        )
     result: dict[str, dict[str, Any]] = {}
     for scenario in requested_scenarios:
         stage = FAULT_STAGE_SCENARIOS[scenario]
@@ -2212,8 +2217,10 @@ def _run_fault_stage_acceptance(
         # selected case timed out.  Preserve each case's independently
         # validated status instead of dragging earlier evidence down with it.
         status = case_status if case_status in {"pass", "fail", "not_run"} else "fail"
-        reason = "" if status == "pass" else str(
-            case.get("reason") or child.get("reason") or "fault-stage child did not run"
+        reason = (
+            ""
+            if status == "pass"
+            else str(case.get("reason") or child.get("reason") or "fault-stage child did not run")
         )
         result[scenario] = _fault_stage_result(
             scenario,
@@ -2567,8 +2574,8 @@ def _run_real_scenario(args: argparse.Namespace, scenario: str) -> dict[str, Any
     phase_name = (
         "ambiguous" if scenario == "ambiguous" else "load" if scenario == "fencing" else "fault"
     )
-    child_phase_key = phase_name if scenario == "ambiguous" else (
-        "load" if scenario == "fencing" else "faults"
+    child_phase_key = (
+        phase_name if scenario == "ambiguous" else ("load" if scenario == "fencing" else "faults")
     )
     child_phase = child.get("candidate", {}).get(child_phase_key, {})
     phase_markers = child_phase.get("stage_markers", []) if isinstance(child_phase, dict) else []
@@ -2939,11 +2946,14 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as error:
                 report = _not_run_report([str(error)], args)
             else:
-                report = _real_report(
-                    args,
-                    expected_source_fingerprint=source_fingerprint(ROOT),
-                    expected_release_binding=expected_release_binding,
-                )
+                if expected_release_binding is None:
+                    report = _not_run_report(["current release binding is unavailable"], args)
+                else:
+                    report = _real_report(
+                        args,
+                        expected_source_fingerprint=source_fingerprint(ROOT),
+                        expected_release_binding=expected_release_binding,
+                    )
     _write(args.output, report)
     if report.get("gate") == "fail":
         return 1

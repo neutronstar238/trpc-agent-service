@@ -60,8 +60,10 @@ class FakeConnection:
         self.calls.append((query, args))
         return "DELETE 1" if query.startswith("DELETE") else "SELECT 1"
 
-    async def fetchval(self, query: str, *args: Any) -> int:
+    async def fetchval(self, query: str, *args: Any) -> Any:
         self.calls.append((query, args))
+        if "cleanup_performance_fixture" in query:
+            return json.dumps({table: 1 for table in fixture.CLEANUP_TABLES})
         return self.ownership_result
 
 
@@ -226,7 +228,7 @@ def test_partial_create_returns_exact_cleanup_report_after_tenant_commit(tmp_pat
     assert pool.closed
 
 
-def test_cleanup_uses_only_literal_allowlist_and_sets_rls(tmp_path: Path) -> None:
+def test_cleanup_uses_bounded_database_function_and_sets_rls(tmp_path: Path) -> None:
     suffix = "b" * 32
     report_path = tmp_path / "fixture.json"
     report = fixture._fixture_report(fixture._ids(suffix), report_path)
@@ -253,14 +255,11 @@ def test_cleanup_uses_only_literal_allowlist_and_sets_rls(tmp_path: Path) -> Non
     assert "admin_idempotency" not in ownership_queries[0]
     assert "audit.user_id=$3" in ownership_queries[0]
     assert "audit.trace_id=$6" in ownership_queries[0]
-    delete_queries = [query for query in queries if query.startswith("DELETE FROM ")]
-    assert len(delete_queries) == len(fixture.CLEANUP_TABLES)
-    assert all(
-        query.startswith("DELETE FROM ") and " WHERE tenant_id=$1" in query
-        for query in delete_queries
-    )
-    assert all(query.split()[2] in fixture.CLEANUP_TABLES for query in delete_queries)
+    cleanup_queries = [query for query in queries if "cleanup_performance_fixture" in query]
+    assert cleanup_queries == ["SELECT public.cleanup_performance_fixture($1, $2, $3)"]
+    assert not any(query.startswith("DELETE FROM ") for query in queries)
     assert result["deleted_rows"]["tenants"] == 1
+    assert result["deleted_rows"]["migration_write_barriers"] == 1
     assert pool.closed
 
 
@@ -330,6 +329,8 @@ def test_cleanup_allowlist_is_child_before_parent_for_all_foreign_keys() -> None
         ("delivery_attempts", "outbound_messages"),
         ("outbound_messages", "channel_bindings"),
         ("channel_identities", "channel_bindings"),
+        ("im_acceptance_evidence_events", "channel_bindings"),
+        ("wecom_connection_state", "channel_bindings"),
         ("inbound_messages", "channel_bindings"),
         ("inbound_messages", "config_revisions"),
         ("turn_intents", "session_turns"),
@@ -342,6 +343,7 @@ def test_cleanup_allowlist_is_child_before_parent_for_all_foreign_keys() -> None
         ("knowledge_embeddings", "knowledge_items"),
         ("knowledge_items", "storage_profiles"),
         ("migration_leases", "migration_scope_manifests"),
+        ("migration_write_barriers", "migration_scope_manifests"),
         ("config_revisions", "agent_apps"),
         ("channel_bindings", "agent_apps"),
         ("session_mailboxes", "tenants"),
@@ -370,7 +372,7 @@ def test_cleanup_refuses_to_delete_without_exact_ownership_proof(tmp_path: Path)
                 run_id=f"perf-fixture-{suffix}",
             )
         )
-    assert not any(query.startswith("DELETE FROM ") for query, _args in pool.connection.calls)
+    assert not any("cleanup_performance_fixture" in query for query, _args in pool.connection.calls)
     assert pool.closed
 
 

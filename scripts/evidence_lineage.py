@@ -52,6 +52,14 @@ FINGERPRINT_IGNORED_DIRS = frozenset(
     }
 )
 FINGERPRINT_IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
+# These files are operator-local runtime inputs rather than candidate source
+# inputs.  Keep this list exact: broad deploy-directory exclusions would allow
+# release-relevant manifests to drift without changing the candidate binding.
+FINGERPRINT_IGNORED_FILES = frozenset(
+    {
+        "deploy/runtime-gate.yaml",
+    }
+)
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_KIND = "current_candidate"
 DEFAULT_EVIDENCE_TTL_SECONDS = 24 * 60 * 60
@@ -128,6 +136,9 @@ def validate_release_binding(
 
 
 def _is_ignored_path(relative_path: Path) -> bool:
+    normalized_path = relative_path.as_posix().lower()
+    if normalized_path in FINGERPRINT_IGNORED_FILES:
+        return True
     return any(part.lower() in FINGERPRINT_IGNORED_DIRS for part in relative_path.parts)
 
 

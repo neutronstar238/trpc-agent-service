@@ -22,14 +22,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, unquote
 
 import httpx
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from trpc_service.channels.base import WebhookRequest
+from trpc_service.channels.base import ChannelCapabilities, WebhookRequest
 from trpc_service.channels.envelopes import (
     DeliveryReceipt,
     DeliveryStatus,
@@ -37,6 +37,7 @@ from trpc_service.channels.envelopes import (
     MediaReference,
     OutboundEnvelope,
     PayloadKind,
+    RecallEnvelope,
 )
 from trpc_service.config.secrets import SecretProvider, SecretRef
 from trpc_service.tenant.models import Channel, ChannelBinding, ConversationKind
@@ -130,6 +131,16 @@ class FeishuAdapter:
     """Verify Feishu callbacks and deliver durable outbound messages."""
 
     API_ROOT = "https://open.feishu.cn"
+    capabilities = ChannelCapabilities(
+        outbound_payloads=frozenset({PayloadKind.TEXT}),
+        stream=False,
+        card=False,
+        media=False,
+        recall=False,
+        proactive=True,
+        text_split=False,
+        max_text_bytes=None,
+    )
 
     def __init__(
         self,
@@ -249,6 +260,16 @@ class FeishuAdapter:
             )
         refreshed, _ = self._receipt(envelope, response, attempts=2)
         return refreshed
+
+    async def recall(self, envelope: RecallEnvelope, binding: ChannelBinding) -> DeliveryReceipt:
+        """Fail closed because this adapter has no audited recall implementation."""
+
+        del binding
+        return DeliveryReceipt(
+            outbound_id=envelope.outbound_id,
+            status=DeliveryStatus.FAILED,
+            provider_code="unsupported_capability",
+        )
 
     async def download_resource(
         self,
@@ -614,9 +635,7 @@ class FeishuAdapter:
                     f"token_{code}",
                     retryable=retryable,
                     retry_after_seconds=(
-                        _retry_after_seconds(response, payload=payload)
-                        if retryable
-                        else None
+                        _retry_after_seconds(response, payload=payload) if retryable else None
                     ),
                 )
             if not isinstance(token, str) or not token or expires <= 0:
@@ -868,7 +887,7 @@ def _coerce_retry_after(raw: object, *, now: float | None = None) -> float | Non
     if raw is None or isinstance(raw, bool):
         return None
     try:
-        seconds = float(raw)
+        seconds = float(cast(Any, raw))
     except (TypeError, ValueError, OverflowError):
         if not isinstance(raw, str):
             return None

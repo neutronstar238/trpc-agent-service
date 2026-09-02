@@ -54,10 +54,7 @@ def test_global_functions_are_worker_only_and_tenant_lookup_stays_minimal() -> N
         "reconcile_session_mailboxes_v2(integer,integer)",
     )
     for function_name in global_functions:
-        assert (
-            f"revoke execute on function public.{function_name} from public, trpc_runtime"
-            in sql
-        )
+        assert f"revoke execute on function public.{function_name} from public, trpc_runtime" in sql
         assert f"grant execute on function public.{function_name} to trpc_worker" in sql
 
     # Binding resolution is the one pre-tenant callback lookup.  It remains

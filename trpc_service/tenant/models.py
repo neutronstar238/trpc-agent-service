@@ -6,10 +6,10 @@ import ipaddress
 from collections.abc import Collection
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from trpc_service.config.secrets import SecretRef
 
@@ -150,6 +150,13 @@ class ModelPolicy(ImmutableModel):
     api_key_ref: SecretRef | None = None
     base_url: str | None = None
     timeout_seconds: float = Field(default=60, gt=0, le=600)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    stop_sequences: tuple[str, ...] = Field(default=(), max_length=8)
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = (
+        None
+    )
+    thinking_budget_tokens: int | None = None
     fallback_model: str | None = None
 
     @field_validator("base_url")
@@ -158,6 +165,31 @@ class ModelPolicy(ImmutableModel):
         if value is not None:
             validate_model_base_url(value)
         return value
+
+    @field_validator("stop_sequences")
+    @classmethod
+    def validate_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item or len(item) > 256 for item in value):
+            raise ValueError("model stop sequences must contain 1 to 256 characters")
+        return value
+
+    @field_validator("thinking_budget_tokens")
+    @classmethod
+    def validate_thinking_budget(cls, value: int | None) -> int | None:
+        if value is not None and value not in {-1, 0} and value < 1024:
+            raise ValueError("thinking budget must be -1, 0, or at least 1024 tokens")
+        return value
+
+    @model_validator(mode="after")
+    def validate_reasoning_controls(self) -> ModelPolicy:
+        provider = self.provider.lower()
+        if self.reasoning_effort is not None and provider != "openai":
+            raise ValueError("reasoning_effort requires the openai provider")
+        if self.thinking_budget_tokens is not None and provider not in {"openai", "anthropic"}:
+            raise ValueError("thinking_budget_tokens requires the openai or anthropic provider")
+        if self.reasoning_effort is not None and self.thinking_budget_tokens is not None:
+            raise ValueError("reasoning_effort and thinking_budget_tokens are mutually exclusive")
+        return self
 
 
 class BudgetPolicy(ImmutableModel):
@@ -197,6 +229,14 @@ class MediaPolicy(ImmutableModel):
 
 
 class StorageSelection(ImmutableModel):
+    """Descriptive storage selection used by revisions and migration evidence.
+
+    Production workers must validate this value as a
+    :class:`ProductionStorageSelection` before constructing built-in services.
+    The wider backend vocabulary is retained here for offline migration source
+    descriptions; it does not imply a runnable adapter exists.
+    """
+
     profile_id: str
     session_backend: str = "postgresql"
     memory_backend: str = "postgresql"
@@ -207,6 +247,15 @@ class StorageSelection(ImmutableModel):
     @classmethod
     def validate_backend(cls, value: str) -> str:
         return validate_storage_backend(value)
+
+
+class ProductionStorageSelection(StorageSelection):
+    """Storage backends implemented by the built-in production worker."""
+
+    session_backend: Literal["postgresql"] = "postgresql"
+    memory_backend: Literal["postgresql"] = "postgresql"
+    artifact_backend: Literal["s3"] = "s3"
+    knowledge_backend: Literal["pgvector"] = "pgvector"
 
 
 class TenantConfig(ImmutableModel):
@@ -224,6 +273,14 @@ class TenantConfig(ImmutableModel):
     instructions: str = ""
     policy_version: int = Field(default=1, ge=1)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def validate_model_token_budget(self) -> TenantConfig:
+        thinking_budget = self.model.thinking_budget_tokens
+        if thinking_budget is not None and thinking_budget > 0:
+            if thinking_budget >= self.budget.max_tokens_per_turn:
+                raise ValueError("thinking budget must be smaller than max_tokens_per_turn")
+        return self
 
 
 class ChannelBinding(ImmutableModel):
@@ -283,6 +340,7 @@ __all__ = [
     "ConversationKind",
     "MediaPolicy",
     "ModelPolicy",
+    "ProductionStorageSelection",
     "StorageSelection",
     "TenantConfig",
     "TenantContext",

@@ -29,11 +29,13 @@ import importlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import sys
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
@@ -104,6 +106,49 @@ REQUIRED_ENV = (
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = "scripts.migration_full_acceptance"
 _LOGGER = logging.getLogger(__name__)
+
+# Live acceptance talks through operator-managed Redis/PostgreSQL endpoints.
+# Neither client is allowed to wait forever when a port-forward or lock stops
+# making progress.  The overall deadline is deliberately generous enough for
+# the 200-record fixture while still making an interrupted run fail closed.
+DEFAULT_LIVE_TIMEOUT_SECONDS = 300.0
+MAX_LIVE_TIMEOUT_SECONDS = 3600.0
+DEFAULT_DB_COMMAND_TIMEOUT_SECONDS = 30.0
+MAX_DB_COMMAND_TIMEOUT_SECONDS = 300.0
+DEFAULT_CLOSE_TIMEOUT_SECONDS = 5.0
+_DB_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(slots=True)
+class _LiveProgress:
+    """In-memory, secret-free progress for diagnosing a bounded live run."""
+
+    last_phase: str = "not_started"
+    last_operation: str = "not_started"
+    last_completed_phase: str = "not_started"
+    last_completed_operation: str = "not_started"
+
+    def started(self, phase: str, operation: str) -> None:
+        self.last_phase = phase
+        self.last_operation = operation
+
+    def completed_operation(self, phase: str, operation: str) -> None:
+        del phase
+        self.last_completed_operation = operation
+
+    def completed_phase(self, phase: str, operation: str = "phase_complete") -> None:
+        self.last_completed_phase = phase
+        self.last_completed_operation = operation
+
+    def case_deltas(self) -> dict[str, str]:
+        """Return only fixed labels suitable for a sanitized failure report."""
+
+        return {
+            "last_phase": self.last_phase,
+            "last_operation": self.last_operation,
+            "last_completed_phase": self.last_completed_phase,
+            "last_completed_operation": self.last_completed_operation,
+        }
 
 
 class ObservableMigrationControl(MigrationControl, Protocol):
@@ -210,6 +255,87 @@ class _FailOnceAfterBatchTarget:
         await self._inner.rollback(tenant_id)
 
 
+class _PhaseAwareTarget:
+    """Defer expensive target enumeration until shadow-read verification.
+
+    ``MigrationCoordinator`` asks a target for a complete snapshot after every
+    phase.  The PostgreSQL adapter implements that snapshot as a paginated
+    query followed by one read transaction per row.  Through a port-forward,
+    repeating that independent enumeration for control-only phases can spend
+    the whole acceptance deadline in serial round trips.  Independent
+    enumeration remains enabled for ``SHADOW_READ`` and ``VERIFY`` (and
+    ``_compare_all`` still verifies every source record when it is disabled),
+    so this wrapper only removes redundant intermediate snapshots from
+    control-only phases.
+    """
+
+    def __init__(self, inner: MigrationTarget) -> None:
+        self._inner = inner
+        self._enumeration_enabled = False
+
+    def set_enumeration_enabled(self, enabled: bool) -> None:
+        self._enumeration_enabled = enabled
+
+    def bind_migration_lease(self, lease: MigrationLease) -> None:
+        bind_lease = getattr(self._inner, "bind_migration_lease", None)
+        if callable(bind_lease):
+            bind_lease(lease)
+
+    async def prepare(self, tenant_id: str) -> None:
+        await self._inner.prepare(tenant_id)
+
+    async def upsert(self, tenant_id: str, record: MigrationRecord) -> None:
+        await self._inner.upsert(tenant_id, record)
+
+    async def read(self, tenant_id: str, kind: str, resource_id: str) -> MigrationRecord | None:
+        return await self._inner.read(tenant_id, kind, resource_id)
+
+    async def list_records(
+        self, tenant_id: str, kind: str, *, limit: int = 10000
+    ) -> tuple[MigrationRecord, ...]:
+        self._require_enumeration()
+        list_records = getattr(self._inner, "list_records", None)
+        if not callable(list_records):
+            raise ValueError("migration target does not support target enumeration")
+        return cast(
+            tuple[MigrationRecord, ...],
+            await list_records(tenant_id, kind, limit=limit),
+        )
+
+    async def list_records_page(
+        self,
+        tenant_id: str,
+        kind: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[tuple[MigrationRecord, ...], str | None]:
+        self._require_enumeration()
+        list_page = getattr(self._inner, "list_records_page", None)
+        if not callable(list_page):
+            raise ValueError("migration target does not support target pagination")
+        return cast(
+            tuple[tuple[MigrationRecord, ...], str | None],
+            await list_page(tenant_id, kind, cursor=cursor, limit=limit),
+        )
+
+    async def set_dual_write(self, tenant_id: str, enabled: bool) -> None:
+        await self._inner.set_dual_write(tenant_id, enabled)
+
+    async def cutover(self, tenant_id: str) -> None:
+        await self._inner.cutover(tenant_id)
+
+    async def cleanup(self, tenant_id: str) -> None:
+        await self._inner.cleanup(tenant_id)
+
+    async def rollback(self, tenant_id: str) -> None:
+        await self._inner.rollback(tenant_id)
+
+    def _require_enumeration(self) -> None:
+        if not self._enumeration_enabled:
+            raise ValueError("target enumeration is deferred until SHADOW_READ")
+
+
 def _phase_evidence(
     result: MigrationResult, checkpoint: MigrationCheckpoint | None
 ) -> dict[str, Any]:
@@ -253,6 +379,7 @@ async def execute_full_acceptance(
     manifest: MigrationScopeManifest | None = None,
     branch_scope_factory: BranchScopeFactory | None = None,
     release_branch: BranchScopeRelease | None = None,
+    progress: _LiveProgress | None = None,
 ) -> dict[str, Any]:
     """Execute and validate all phases against injected source/target services.
 
@@ -292,7 +419,11 @@ async def execute_full_acceptance(
     if snapshot_method is not None and not callable(snapshot_method):
         raise AssertionError("migration source snapshot must be callable")
     if callable(snapshot_method):
+        if progress is not None:
+            progress.started("acceptance", "initial_source_snapshot")
         source_snapshot = await snapshot_method(tenant_id)
+        if progress is not None:
+            progress.completed_operation("acceptance", "initial_source_snapshot")
         if source_snapshot.source_count != expected_records:
             raise AssertionError("source snapshot count differs from expected fixture count")
     elif require_source_snapshot:
@@ -323,17 +454,25 @@ async def execute_full_acceptance(
             guard=guard,
             lease=branch_lease,
             manifest=branch_manifest,
+            progress=progress,
         )
         if branch_scope_factory is not None:
             if release_branch is None or branch_lease is None:
                 raise AssertionError("live branch did not return a releasable lease")
+            if progress is not None:
+                progress.started("branch_release", "release_branch")
             await release_branch(branch_lease)
+            if progress is not None:
+                progress.completed_operation("branch_release", "release_branch")
         return result
 
     if branch_scope_factory is not None:
-        rollback_target, rollback_control, rollback_manifest, rollback_lease = (
-            await branch_scope_factory("rollback")
-        )
+        (
+            rollback_target,
+            rollback_control,
+            rollback_manifest,
+            rollback_lease,
+        ) = await branch_scope_factory("rollback")
         rollback_branch = await run_branch(
             "rollback",
             target=rollback_target,
@@ -343,9 +482,12 @@ async def execute_full_acceptance(
             branch_manifest=rollback_manifest,
             branch_lease=rollback_lease,
         )
-        cleanup_target, cleanup_control, cleanup_manifest, cleanup_lease = (
-            await branch_scope_factory("cleanup")
-        )
+        (
+            cleanup_target,
+            cleanup_control,
+            cleanup_manifest,
+            cleanup_lease,
+        ) = await branch_scope_factory("cleanup")
         cleanup_branch = await run_branch(
             "cleanup",
             target=cleanup_target,
@@ -394,7 +536,11 @@ async def execute_full_acceptance(
             raise AssertionError("migration checksum differs from the immutable source snapshot")
         if not callable(snapshot_method):
             raise AssertionError("migration source snapshot disappeared during acceptance")
+        if progress is not None:
+            progress.started("acceptance", "final_source_snapshot")
         final_snapshot = await snapshot_method(tenant_id)
+        if progress is not None:
+            progress.completed_operation("acceptance", "final_source_snapshot")
         if final_snapshot != source_snapshot:
             raise AssertionError("migration source changed during full acceptance")
 
@@ -484,7 +630,9 @@ async def _run_branch(
     guard: PostgresMigrationGuard | None,
     lease: MigrationLease | None,
     manifest: MigrationScopeManifest | None,
+    progress: _LiveProgress | None = None,
 ) -> dict[str, Any]:
+    tracker = progress or _LiveProgress()
     migration_target: MigrationTarget = target
     if resume_probe:
         migration_target = _FailOnceAfterBatchTarget(target, fail_after=batch_size)
@@ -502,29 +650,57 @@ async def _run_branch(
     control_evidence: dict[str, dict[str, Any]] = {}
     checkpoint_resume = "not_run"
 
-    async def assert_source_snapshot() -> None:
-        if expected_source_snapshot is None:
+    async def assert_source_snapshot(phase: MigrationPhase) -> None:
+        # A manifest-bound coordinator already validates this exact immutable
+        # snapshot before and after every phase.  Repeating the same full
+        # Redis discovery/read here doubles the port-forward round trips; keep
+        # the wrapper check for unguarded/offline adapters only.
+        if expected_source_snapshot is None or manifest is not None:
             return
+        tracker.started(phase.value, "source_snapshot")
         snapshot_method = getattr(source, "snapshot", None)
         if not callable(snapshot_method):
             raise AssertionError("migration source snapshot disappeared during acceptance")
         observed = await snapshot_method(tenant_id)
+        tracker.completed_operation(phase.value, "source_snapshot")
         if observed != expected_source_snapshot:
             raise AssertionError("migration source changed during full acceptance")
 
+    async def read_control_state(phase: MigrationPhase) -> Mapping[str, Any]:
+        tracker.started(phase.value, "control_read_state")
+        state = await control.read_state(tenant_id, migration_id)
+        tracker.completed_operation(phase.value, "control_read_state")
+        return state
+
     async def run_phase(phase: MigrationPhase) -> MigrationResult:
-        await assert_source_snapshot()
+        set_enumeration_enabled = getattr(target, "set_enumeration_enabled", None)
+        target_enumeration_enabled = phase in {
+            MigrationPhase.SHADOW_READ,
+            MigrationPhase.VERIFY,
+        }
+        if callable(set_enumeration_enabled):
+            set_enumeration_enabled(target_enumeration_enabled)
+        await assert_source_snapshot(phase)
+        tracker.started(phase.value, "coordinator_run")
         result = await coordinator.run(tenant_id, migration_id, phase)
-        await assert_source_snapshot()
-        evidence[phase.value] = _phase_evidence(
-            result, await checkpoints.load(tenant_id, migration_id)
-        )
+        tracker.completed_operation(phase.value, "coordinator_run")
+        await assert_source_snapshot(phase)
+        tracker.started(phase.value, "checkpoint_load")
+        checkpoint = await checkpoints.load(tenant_id, migration_id)
+        tracker.completed_operation(phase.value, "checkpoint_load")
+        phase_evidence = _phase_evidence(result, checkpoint)
+        if callable(set_enumeration_enabled):
+            phase_evidence["target_enumeration"] = (
+                "independent" if target_enumeration_enabled else "deferred_until_shadow_read"
+            )
+        evidence[phase.value] = phase_evidence
         _require_phase_pass(result)
+        tracker.completed_phase(phase.value)
         return result
 
     await run_phase(MigrationPhase.PREPARE)
     control_evidence["after_prepare"] = _checked_control_state(
-        await control.read_state(tenant_id, migration_id),
+        await read_control_state(MigrationPhase.PREPARE),
         dual_write=False,
         active_profile="source",
         cleaned=False,
@@ -532,13 +708,17 @@ async def _run_branch(
         mailbox_v2="ready",
     )
     if resume_probe:
-        await assert_source_snapshot()
+        await assert_source_snapshot(MigrationPhase.BACKFILL)
+        tracker.started(MigrationPhase.BACKFILL.value, "resume_probe")
         try:
             await coordinator.run(tenant_id, migration_id, MigrationPhase.BACKFILL)
         except ConnectionError as error:
             if str(error) != "migration acceptance resume probe interruption":
                 raise
+        tracker.completed_operation(MigrationPhase.BACKFILL.value, "resume_probe")
+        tracker.started(MigrationPhase.BACKFILL.value, "resume_checkpoint_load")
         interrupted = await checkpoints.load(tenant_id, migration_id)
+        tracker.completed_operation(MigrationPhase.BACKFILL.value, "resume_checkpoint_load")
         if interrupted is None or interrupted.completed:
             raise AssertionError("resume probe did not preserve an incomplete checkpoint")
         if interrupted.cursor is None:
@@ -547,11 +727,11 @@ async def _run_branch(
             raise AssertionError("resume probe checkpoint count mismatch")
         if len(interrupted.checksum) != 64:
             raise AssertionError("resume probe checkpoint checksum is invalid")
-        await assert_source_snapshot()
+        await assert_source_snapshot(MigrationPhase.BACKFILL)
         checkpoint_resume = "pass"
     await run_phase(MigrationPhase.BACKFILL)
     control_evidence["after_backfill"] = _checked_control_state(
-        await control.read_state(tenant_id, migration_id),
+        await read_control_state(MigrationPhase.BACKFILL),
         dual_write=False,
         active_profile="source",
         cleaned=False,
@@ -560,7 +740,7 @@ async def _run_branch(
     )
     await run_phase(MigrationPhase.SHADOW_READ)
     control_evidence["after_shadow_read"] = _checked_control_state(
-        await control.read_state(tenant_id, migration_id),
+        await read_control_state(MigrationPhase.SHADOW_READ),
         dual_write=False,
         active_profile="source",
         cleaned=False,
@@ -569,7 +749,7 @@ async def _run_branch(
     )
     await run_phase(MigrationPhase.DUAL_WRITE)
     control_evidence["after_dual_write"] = _checked_control_state(
-        await control.read_state(tenant_id, migration_id),
+        await read_control_state(MigrationPhase.DUAL_WRITE),
         dual_write=True,
         active_profile="source",
         cleaned=False,
@@ -578,7 +758,7 @@ async def _run_branch(
     )
     await run_phase(MigrationPhase.CUTOVER)
     control_evidence["after_cutover"] = _checked_control_state(
-        await control.read_state(tenant_id, migration_id),
+        await read_control_state(MigrationPhase.CUTOVER),
         dual_write=True,
         active_profile="target",
         cleaned=False,
@@ -592,7 +772,7 @@ async def _run_branch(
     if verify["source_count"] != verify["target_count"] or verify["differences"]:
         raise AssertionError("live verification count or differences failed")
     control_evidence["after_verify"] = _checked_control_state(
-        await control.read_state(tenant_id, migration_id),
+        await read_control_state(MigrationPhase.VERIFY),
         dual_write=True,
         active_profile="target",
         cleaned=False,
@@ -602,7 +782,7 @@ async def _run_branch(
     await run_phase(terminal)
     if terminal == MigrationPhase.ROLLBACK:
         control_evidence["after_rollback"] = _checked_control_state(
-            await control.read_state(tenant_id, migration_id),
+            await read_control_state(MigrationPhase.ROLLBACK),
             dual_write=False,
             active_profile="source",
             cleaned=False,
@@ -611,7 +791,7 @@ async def _run_branch(
         )
     else:
         control_evidence["after_cleanup"] = _checked_control_state(
-            await control.read_state(tenant_id, migration_id),
+            await read_control_state(MigrationPhase.CLEANUP),
             dual_write=False,
             active_profile="target",
             cleaned=True,
@@ -721,6 +901,86 @@ def _bounded_positive_int(value: Any, *, name: str, maximum: int) -> int:
     if number < 1 or number > maximum:
         raise ValueError(f"{name} must be between 1 and {maximum}")
     return number
+
+
+def _bounded_timeout(value: Any, *, name: str, maximum: float) -> float:
+    """Validate a finite live-I/O timeout and reject an unbounded setting."""
+
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite positive number") from error
+    if not math.isfinite(timeout):
+        raise ValueError(f"{name} must be a finite positive number")
+    if timeout <= 0 or timeout > maximum:
+        raise ValueError(f"{name} must be between 0 and {maximum:g} seconds")
+    return timeout
+
+
+def _postgres_connection_initializer(
+    command_timeout_seconds: float,
+) -> Callable[[Any], Awaitable[None]]:
+    """Configure fail-closed server-side timeouts on every pooled connection."""
+
+    command_ms = str(max(1, round(command_timeout_seconds * 1000)))
+    lock_ms = str(max(1, round(min(command_timeout_seconds, _DB_LOCK_TIMEOUT_SECONDS) * 1000)))
+
+    async def initialize(connection: Any) -> None:
+        await connection.execute(
+            "SELECT set_config('statement_timeout', $1, false), "
+            "set_config('lock_timeout', $2, false)",
+            f"{command_ms}ms",
+            f"{lock_ms}ms",
+        )
+
+    return initialize
+
+
+async def _close_live_resources(
+    redis: Any | None,
+    pool: asyncpg.Pool | None,
+    *,
+    timeout_seconds: float = DEFAULT_CLOSE_TIMEOUT_SECONDS,
+    terminate_pool: bool = False,
+) -> None:
+    """Close live clients without allowing cleanup to mask the gate result.
+
+    ``asyncpg.Pool.close`` waits for checked-out connections.  That is useful
+    during normal shutdown, but unsafe after cancellation of a hung acceptance
+    operation: the connection may still be in an open transaction.  In that
+    path terminate the pool so PostgreSQL rolls back the transaction and the
+    process can emit a deterministic fail-closed report.
+    """
+
+    close_timeout = _bounded_timeout(
+        timeout_seconds,
+        name="live resource close timeout",
+        maximum=MAX_DB_COMMAND_TIMEOUT_SECONDS,
+    )
+    if redis is not None:
+        try:
+            await asyncio.wait_for(redis.aclose(), timeout=close_timeout)
+        except BaseException as error:
+            _LOGGER.warning("live Redis client close did not complete: %s", type(error).__name__)
+            connection_pool = getattr(redis, "connection_pool", None)
+            disconnect = getattr(connection_pool, "disconnect", None)
+            if callable(disconnect):
+                try:
+                    await asyncio.wait_for(
+                        disconnect(inuse_connections=True), timeout=close_timeout
+                    )
+                except BaseException:
+                    _LOGGER.warning("live Redis connection pool termination failed")
+    if pool is None:
+        return
+    if terminate_pool:
+        pool.terminate()
+        return
+    try:
+        await asyncio.wait_for(pool.close(), timeout=close_timeout)
+    except BaseException as error:
+        _LOGGER.warning("live PostgreSQL pool close did not complete: %s", type(error).__name__)
+        pool.terminate()
 
 
 def _endpoint_fingerprint(value: str) -> str:
@@ -890,7 +1150,6 @@ def _write_report(output: Path, report: dict[str, Any]) -> dict[str, Any]:
             report.setdefault("rejection_reasons", []).extend(binding_reasons)
             report.setdefault("production_rejection_reasons", []).extend(binding_reasons)
 
-
     report = {
         "schema_version": 1,
         **report,
@@ -944,8 +1203,45 @@ def _not_run(output: Path, reasons: list[str]) -> dict[str, Any]:
     )
 
 
+def _live_failure(
+    output: Path,
+    reason: str,
+    *,
+    progress: _LiveProgress | None = None,
+) -> dict[str, Any]:
+    """Build a sanitized fail-closed report for a live acceptance failure."""
+
+    case_deltas = progress.case_deltas() if progress is not None else {}
+    return _write_report(
+        output,
+        {
+            "baseline": "redis-source",
+            "candidate": "postgresql-authoritative",
+            "case_deltas": case_deltas,
+            "gate": "fail",
+            "rejection_reasons": [reason],
+            "production_gate": "not_run",
+            "production_rejection_reasons": [
+                "live acceptance did not complete; production gate remains not_run"
+            ],
+        },
+    )
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     try:
+        timeout_value = getattr(args, "timeout_seconds", None)
+        if timeout_value is None:
+            timeout_value = os.getenv(
+                "TRPC_MIGRATION_FULL_ACCEPTANCE_TIMEOUT_SECONDS",
+                str(DEFAULT_LIVE_TIMEOUT_SECONDS),
+            )
+        db_command_timeout_value = getattr(args, "db_command_timeout_seconds", None)
+        if db_command_timeout_value is None:
+            db_command_timeout_value = os.getenv(
+                "TRPC_MIGRATION_DB_COMMAND_TIMEOUT_SECONDS",
+                str(DEFAULT_DB_COMMAND_TIMEOUT_SECONDS),
+            )
         batch_size = _bounded_positive_int(
             getattr(args, "batch_size", 100),
             name="--batch-size",
@@ -955,6 +1251,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             getattr(args, "db_pool_size", 4),
             name="--db-pool-size",
             maximum=MAX_MIGRATION_DB_POOL_SIZE,
+        )
+        live_timeout_seconds = _bounded_timeout(
+            timeout_value,
+            name="--timeout-seconds",
+            maximum=MAX_LIVE_TIMEOUT_SECONDS,
+        )
+        db_command_timeout_seconds = _bounded_timeout(
+            db_command_timeout_value,
+            name="--db-command-timeout-seconds",
+            maximum=MAX_DB_COMMAND_TIMEOUT_SECONDS,
         )
     except ValueError as error:
         return _not_run(args.output, [str(error)])
@@ -1044,17 +1350,43 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     except ValueError as error:
         return _not_run(args.output, [str(error)])
 
+    progress = _LiveProgress()
     redis: Any | None = None
     pool: asyncpg.Pool | None = None
     guard: PostgresMigrationGuard | None = None
     lease: Any | None = None
+    timed_out = False
+    deadline = asyncio.get_running_loop().time() + live_timeout_seconds
+
+    def remaining_timeout() -> float:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError
+        return remaining
+
     try:
-        redis = redis_async.from_url(source_url, decode_responses=False)
-        pool = await asyncpg.create_pool(
-            target_dsn.replace("postgresql+asyncpg://", "postgresql://"),
-            min_size=1,
-            max_size=db_pool_size,
+        progress.started("bootstrap", "redis_connect")
+        redis = redis_async.from_url(
+            source_url,
+            decode_responses=False,
+            socket_connect_timeout=db_command_timeout_seconds,
+            socket_timeout=db_command_timeout_seconds,
         )
+        progress.completed_operation("bootstrap", "redis_connect")
+        progress.started("bootstrap", "postgres_pool_connect")
+        pool = await asyncio.wait_for(
+            asyncpg.create_pool(
+                target_dsn.replace("postgresql+asyncpg://", "postgresql://"),
+                min_size=1,
+                max_size=db_pool_size,
+                command_timeout=db_command_timeout_seconds,
+                timeout=db_command_timeout_seconds,
+                init=_postgres_connection_initializer(db_command_timeout_seconds),
+                server_settings={"application_name": "trpc-migration-full-acceptance"},
+            ),
+            timeout=remaining_timeout(),
+        )
+        progress.completed_operation("bootstrap", "postgres_pool_connect")
         source_kinds = canonical_migration_kinds(
             item.strip()
             for item in os.getenv("TRPC_MIGRATION_KINDS", "session,memory").split(",")
@@ -1064,7 +1396,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             cast(Any, redis),
             kinds=source_kinds,
         )
-        source_snapshot = await source.snapshot(tenant_id)
+        progress.started("bootstrap", "manifest_source_snapshot")
+        source_snapshot = await asyncio.wait_for(
+            source.snapshot(tenant_id), timeout=remaining_timeout()
+        )
+        progress.completed_operation("bootstrap", "manifest_source_snapshot")
         if source_snapshot.source_count != expected_records:
             raise ValueError("source snapshot count differs from expected migration records")
         manifest = MigrationScopeManifest(
@@ -1090,32 +1426,50 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
 
         async def branch_scope(suffix: str) -> BranchScope:
             nonlocal branch_preflight, lease
+            branch_phase = f"{suffix}-branch"
+            if progress is not None:
+                progress.started(branch_phase, "branch_scope")
             branch_migration_id = f"{migration_id}-{suffix}"
             branch_manifest = manifest.model_copy(update={"migration_id": branch_migration_id})
             if suffix == "cleanup":
+                if progress is not None:
+                    progress.started(branch_phase, "restage_candidate")
                 branch_app_revision = await _restage_acceptance_candidate(
                     pool,
                     tenant_id=tenant_id,
                     app_id=manifest.app_id,
                     source_version=manifest.config_version,
                 )
+                if progress is not None:
+                    progress.completed_operation(branch_phase, "restage_candidate")
                 branch_manifest = branch_manifest.model_copy(
                     update={"app_revision": branch_app_revision}
                 )
             branch_manifests[suffix] = branch_manifest.model_dump(mode="json")
             if suffix == "rollback":
+                if progress is not None:
+                    progress.started(branch_phase, "target_preflight_and_lease")
                 branch_lease, branch_preflight = await guard.acquire_with_target_preflight(
                     branch_manifest,
                     f"full-acceptance:{branch_migration_id}",
                     lease_for=timedelta(minutes=5),
                 )
             else:
+                if progress is not None:
+                    progress.started(branch_phase, "lease_acquire")
                 branch_lease = await guard.acquire(
                     branch_manifest,
                     f"full-acceptance:{branch_migration_id}",
                     lease_for=timedelta(minutes=5),
                 )
+            if progress is not None:
+                progress.completed_operation(
+                    branch_phase,
+                    "target_preflight_and_lease" if suffix == "rollback" else "lease_acquire",
+                )
             lease = branch_lease
+            if progress is not None:
+                progress.started(branch_phase, "control_factory")
             control_result = factory(
                 pool=pool,
                 tenant_id=tenant_id,
@@ -1124,10 +1478,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             control = _require_observable_control(
                 await control_result if inspect.isawaitable(control_result) else control_result
             )
-            target = PostgresMigrationTarget(
-                pool,
-                control=control,
-                manifest=branch_manifest,
+            if progress is not None:
+                progress.completed_operation(branch_phase, "control_factory")
+            target = _PhaseAwareTarget(
+                PostgresMigrationTarget(
+                    pool,
+                    control=control,
+                    manifest=branch_manifest,
+                )
             )
             return target, control, branch_manifest, branch_lease
 
@@ -1136,21 +1494,27 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             await guard.release(branch_lease)
             lease = None
 
-        report = await execute_full_acceptance(
-            source,
-            PostgresMigrationTarget(pool, manifest=manifest),
-            checkpoints,
-            tenant_id=tenant_id,
-            migration_id=migration_id,
-            rollback_control=None,
-            batch_size=batch_size,
-            expected_records=expected_records,
-            require_source_snapshot=True,
-            guard=guard,
-            manifest=manifest,
-            branch_scope_factory=branch_scope,
-            release_branch=release_branch,
+        progress.started("acceptance", "execute_full_acceptance")
+        report = await asyncio.wait_for(
+            execute_full_acceptance(
+                source,
+                PostgresMigrationTarget(pool, manifest=manifest),
+                checkpoints,
+                tenant_id=tenant_id,
+                migration_id=migration_id,
+                rollback_control=None,
+                batch_size=batch_size,
+                expected_records=expected_records,
+                require_source_snapshot=True,
+                guard=guard,
+                manifest=manifest,
+                branch_scope_factory=branch_scope,
+                release_branch=release_branch,
+                progress=progress,
+            ),
+            timeout=remaining_timeout(),
         )
+        progress.completed_operation("acceptance", "execute_full_acceptance")
         report["case_deltas"]["source_endpoint_sha256"] = _endpoint_fingerprint(source_url)
         report["case_deltas"]["target_endpoint_sha256"] = _endpoint_fingerprint(target_dsn)
         if branch_preflight is None:
@@ -1158,34 +1522,49 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         report["case_deltas"]["target_empty_preflight"] = branch_preflight.model_dump(mode="json")
         report["case_deltas"]["branch_manifests"] = branch_manifests
         return _write_report(args.output, report)
-    except Exception as error:
-        return _write_report(
+    except TimeoutError:
+        timed_out = True
+        return _live_failure(
             args.output,
-            {
-                "baseline": "redis-source",
-                "candidate": "postgresql-authoritative",
-                "case_deltas": {},
-                "gate": "fail",
-                "rejection_reasons": [f"live migration acceptance raised {type(error).__name__}"],
-                "production_gate": "not_run",
-                "production_rejection_reasons": [
-                    "live acceptance did not complete; production gate remains not_run"
-                ],
-            },
+            f"live migration acceptance timed out after {live_timeout_seconds:g} seconds",
+            progress=progress,
+        )
+    except asyncpg.exceptions.DeadlockDetectedError:
+        return _live_failure(
+            args.output,
+            "live migration database deadlock detected",
+            progress=progress,
+        )
+    except asyncpg.exceptions.LockNotAvailableError:
+        return _live_failure(
+            args.output,
+            "live migration database lock timeout exceeded",
+            progress=progress,
+        )
+    except asyncpg.exceptions.QueryCanceledError:
+        return _live_failure(
+            args.output,
+            "live migration database statement timeout exceeded",
+            progress=progress,
+        )
+    except Exception as error:
+        return _live_failure(
+            args.output,
+            f"live migration acceptance raised {type(error).__name__}",
+            progress=progress,
         )
     finally:
         if lease is not None and guard is not None:
             _LOGGER.warning("migration acceptance write barrier retained after unsuccessful run")
-        if redis is not None:
-            await redis.aclose()
-        if pool is not None:
-            await pool.close()
+        await _close_live_resources(redis, pool, terminate_pool=timed_out)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--db-pool-size", type=int, default=4)
+    parser.add_argument("--timeout-seconds", type=float, default=None)
+    parser.add_argument("--db-command-timeout-seconds", type=float, default=None)
     parser.add_argument(
         "--output", type=Path, default=Path("runs/multitenant/migration-full-acceptance.json")
     )

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -75,6 +76,9 @@ _TARGET_EMPTY_TABLES = (
     "audit_logs",
     "session_mailboxes",
     "session_mailbox_items",
+    "wecom_connection_state",
+    "im_acceptance_evidence_events",
+    "im_acceptance_runs",
     "migration_checkpoints",
     "migration_scope_manifests",
     "migration_leases",
@@ -285,20 +289,11 @@ class RedisMigrationSource:
         """Return a fresh source snapshot and invalidate the discovery cache."""
 
         keys = await self._tenant_keys(tenant_id, refresh=True)
+        records = await self._read_records(tenant_id, keys)
         checksum = "0" * 64
-        count = 0
-        for kind, resource_id, key in keys:
-            if count >= MAX_MIGRATION_EXPECTED_RECORDS:
-                raise MigrationGuardError("migration source exceeds MAX_MIGRATION_EXPECTED_RECORDS")
-            record = MigrationRecord(
-                kind=kind,
-                resource_id=resource_id,
-                payload=await self._canonical_payload(
-                    kind, tenant_id, resource_id, await self._read_value(key)
-                ),
-            )
+        for record in records:
             checksum = _rolling_checksum(checksum, record.checksum)
-            count += 1
+        count = len(records)
         snapshot_id = hashlib.sha256(f"{count}:{checksum}".encode("ascii")).hexdigest()
         return MigrationSourceSnapshot(
             source_snapshot_id=snapshot_id,
@@ -316,24 +311,137 @@ class RedisMigrationSource:
             raise MigrationGuardError("migration source exceeds MAX_MIGRATION_EXPECTED_RECORDS")
         start = _cursor_position(cursor, keys)
         selected = keys[start : start + limit]
-        records_list: list[MigrationRecord] = []
-        for kind, resource_id, key in selected:
-            records_list.append(
-                MigrationRecord(
-                    kind=kind,
-                    resource_id=resource_id,
-                    payload=await self._canonical_payload(
-                        kind,
-                        tenant_id,
-                        resource_id,
-                        await self._read_value(key),
-                    ),
-                )
-            )
-        records = tuple(records_list)
+        records = await self._read_records(tenant_id, selected)
         next_position = start + len(selected)
         next_cursor = _encode_source_cursor(selected[-1]) if next_position < len(keys) else None
         return records, next_cursor
+
+    async def _read_records(
+        self, tenant_id: str, keys: tuple[tuple[str, str, str], ...]
+    ) -> tuple[MigrationRecord, ...]:
+        values = await self._read_values(keys)
+        records: list[MigrationRecord] = []
+        for (kind, resource_id, _), value in zip(keys, values, strict=True):
+            records.append(
+                MigrationRecord(
+                    kind=kind,
+                    resource_id=resource_id,
+                    payload=await self._canonical_payload(kind, tenant_id, resource_id, value),
+                )
+            )
+        return tuple(records)
+
+    async def _read_values(self, keys: tuple[tuple[str, str, str], ...]) -> tuple[Any, ...]:
+        if not keys:
+            return ()
+        pipelined = await self._read_values_with_pipeline(keys)
+        if pipelined is not None:
+            return pipelined
+        values: list[Any] = []
+        for _, _, key in keys:
+            values.append(await self._read_value(key))
+        return tuple(values)
+
+    async def _read_values_with_pipeline(
+        self, keys: tuple[tuple[str, str, str], ...]
+    ) -> tuple[Any, ...] | None:
+        type_commands = tuple(("type", (key,)) for _, _, key in keys)
+        type_results = await self._execute_pipeline(type_commands)
+        if type_results is None:
+            return None
+        if len(type_results) != len(keys):
+            raise RuntimeError("Redis migration pipeline returned an unexpected TYPE result count")
+
+        key_types = tuple(_text(value) for value in type_results)
+        for _, key_type in zip(keys, key_types, strict=True):
+            if key_type not in {"hash", "string", "none"}:
+                raise ValueError(f"unsupported Redis migration key type: {key_type}")
+
+        value_commands = tuple(
+            ("hget", (key, "payload")) if key_type == "hash" else ("get", (key,))
+            for (_, _, key), key_type in zip(keys, key_types, strict=True)
+        )
+        value_results = await self._execute_pipeline(value_commands)
+        if value_results is None:
+            return None
+        if len(value_results) != len(keys):
+            raise RuntimeError("Redis migration pipeline returned an unexpected value result count")
+
+        values: list[Any] = [None] * len(keys)
+        missing_hashes: list[tuple[int, str]] = []
+        for index, (key_type, value) in enumerate(zip(key_types, value_results, strict=True)):
+            if key_type == "hash" and value is None:
+                missing_hashes.append((index, keys[index][2]))
+            elif value is not None:
+                values[index] = _json_value(value)
+
+        if missing_hashes:
+            fallback_commands = tuple(("hgetall", (key,)) for _, key in missing_hashes)
+            fallback_results = await self._execute_pipeline(fallback_commands)
+            if fallback_results is None:
+                return None
+            if len(fallback_results) != len(missing_hashes):
+                raise RuntimeError(
+                    "Redis migration pipeline returned an unexpected HGETALL result count"
+                )
+            for (index, _), raw_values in zip(missing_hashes, fallback_results, strict=True):
+                values[index] = {
+                    _text(field): _json_value(value) for field, value in raw_values.items()
+                }
+        return tuple(values)
+
+    async def _execute_pipeline(
+        self, commands: tuple[tuple[str, tuple[Any, ...]], ...]
+    ) -> tuple[Any, ...] | None:
+        pipeline_factory = getattr(self._redis, "pipeline", None)
+        if not callable(pipeline_factory):
+            return None
+        try:
+            pipeline = pipeline_factory(transaction=False)
+        except TypeError:
+            try:
+                pipeline = pipeline_factory()
+            except (AttributeError, NotImplementedError, TypeError):
+                return None
+        except (AttributeError, NotImplementedError):
+            return None
+        if inspect.isawaitable(pipeline):
+            pipeline = await pipeline
+        if pipeline is None:
+            return None
+
+        enter = getattr(pipeline, "__aenter__", None)
+        exit_ = getattr(pipeline, "__aexit__", None)
+        if callable(enter) and callable(exit_):
+            async with pipeline as active:
+                return await self._execute_pipeline_commands(active, commands)
+
+        try:
+            return await self._execute_pipeline_commands(pipeline, commands)
+        finally:
+            close = getattr(pipeline, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+
+    async def _execute_pipeline_commands(
+        self, pipeline: Any, commands: tuple[tuple[str, tuple[Any, ...]], ...]
+    ) -> tuple[Any, ...] | None:
+        execute = getattr(pipeline, "execute", None)
+        if not callable(execute):
+            return None
+        for name, args in commands:
+            command = getattr(pipeline, name, None)
+            if not callable(command):
+                return None
+            result = command(*args)
+            if inspect.isawaitable(result):
+                await result
+        results = execute()
+        if inspect.isawaitable(results):
+            results = await results
+        return tuple(results)
 
     async def _tenant_keys(
         self, tenant_id: str, *, refresh: bool = False
@@ -616,6 +724,15 @@ class PostgresMigrationTarget:
         _validate_page_limit(limit, "migration target page size")
         if kind not in {"session", "memory"}:
             raise ValueError(f"unsupported PostgreSQL migration record kind: {kind}")
+        if self._manifest is not None:
+            if tenant_id != self._manifest.tenant_id:
+                raise MigrationManifestConflict(
+                    "target enumeration tenant does not match the migration manifest"
+                )
+            if kind not in self._manifest.kinds:
+                raise MigrationManifestConflict(
+                    f"record kind {kind!r} is outside the migration manifest"
+                )
         if kind == "memory" and cursor is not None:
             try:
                 UUID(cursor)
@@ -626,7 +743,9 @@ class PostgresMigrationTarget:
                 if self._manifest is None:
                     rows = await connection.fetch(
                         """
-                        SELECT session_id FROM sessions
+                        SELECT session_id, app_id, principal_id, state_json,
+                               version, next_sequence
+                          FROM sessions
                          WHERE tenant_id=$1 AND ($2::text IS NULL OR session_id>$2)
                          ORDER BY session_id LIMIT $3
                         """,
@@ -637,7 +756,9 @@ class PostgresMigrationTarget:
                 else:
                     rows = await connection.fetch(
                         """
-                        SELECT session_id FROM sessions
+                        SELECT session_id, app_id, principal_id, state_json,
+                               version, next_sequence
+                          FROM sessions
                          WHERE tenant_id=$1 AND app_id=$2
                            AND ($3::text IS NULL OR session_id>$3)
                          ORDER BY session_id LIMIT $4
@@ -647,10 +768,59 @@ class PostgresMigrationTarget:
                         cursor,
                         limit + 1,
                     )
+                has_more = len(rows) > limit
+                page_rows = rows[:limit]
+                events_by_session: dict[str, list[dict[str, Any]]] = {}
+                if page_rows:
+                    session_ids = [str(row["session_id"]) for row in page_rows]
+                    event_rows = await connection.fetch(
+                        """
+                        SELECT session_id, sequence, event_id, author,
+                               event_timestamp, event_json, state_delta
+                          FROM session_events
+                         WHERE tenant_id=$1 AND session_id=ANY($2::text[])
+                         ORDER BY session_id, sequence
+                        """,
+                        tenant_id,
+                        session_ids,
+                    )
+                    for event_row in event_rows:
+                        session_id = str(event_row["session_id"])
+                        events_by_session.setdefault(session_id, []).append(
+                            {
+                                "sequence": int(event_row["sequence"]),
+                                "event_id": event_row["event_id"],
+                                "author": event_row["author"],
+                                "timestamp": float(event_row["event_timestamp"]),
+                                "event": _json_object(event_row["event_json"]),
+                                "state_delta": _json_object(event_row["state_delta"]),
+                            }
+                        )
+                session_values: list[MigrationRecord] = []
+                for row in page_rows:
+                    session_id = str(row["session_id"])
+                    if self._session_row_is_complete(row):
+                        session_values.append(
+                            self._session_record_from_row(
+                                tenant_id,
+                                row,
+                                events_by_session.get(session_id, []),
+                            )
+                        )
+                    else:
+                        # Lightweight asyncpg doubles may only return the key
+                        # column from the page query.  Keep those doubles
+                        # compatible without affecting real full-row queries.
+                        record = await self._read_session(tenant_id, session_id)
+                        if record is not None:
+                            session_values.append(record)
+                values = tuple(session_values)
             else:
                 rows = await connection.fetch(
                     """
-                    SELECT memory_id,source_record_id FROM memories
+                    SELECT memory_id, source_record_id, principal_id, session_id,
+                           source_sequence, memory_json, projection_status
+                      FROM memories
                      WHERE tenant_id=$1
                        AND ($2::uuid IS NULL OR memory_id>$2::uuid)
                      ORDER BY memory_id LIMIT $3
@@ -659,23 +829,80 @@ class PostgresMigrationTarget:
                     cursor,
                     limit + 1,
                 )
-        has_more = len(rows) > limit
-        page_rows = rows[:limit]
-        values: list[MigrationRecord] = []
-        for row in page_rows:
-            resource_id = str(
-                row["session_id"]
-                if kind == "session"
-                else (row["source_record_id"] or row["memory_id"])
-            )
-            record = await self.read(tenant_id, kind, resource_id)
-            if record is not None:
-                values.append(record)
+                has_more = len(rows) > limit
+                page_rows = rows[:limit]
+                memory_values: list[MigrationRecord] = []
+                for row in page_rows:
+                    if self._memory_row_is_complete(row):
+                        memory_values.append(self._memory_record_from_row(row))
+                    else:
+                        source_record_id = (
+                            row.get("source_record_id") if hasattr(row, "get") else None
+                        )
+                        resource_id = str(source_record_id or row["memory_id"])
+                        record = await self._read_memory(tenant_id, resource_id)
+                        if record is not None:
+                            memory_values.append(record)
+                values = tuple(memory_values)
         if not has_more:
-            return tuple(values), None
+            return values, None
         last = page_rows[-1]
         next_cursor = str(last["session_id"] if kind == "session" else last["memory_id"])
-        return tuple(values), next_cursor
+        return values, next_cursor
+
+    def _session_record_from_row(
+        self,
+        tenant_id: str,
+        row: Any,
+        events: list[dict[str, Any]],
+    ) -> MigrationRecord:
+        session_id = str(row["session_id"])
+        payload = _canonical_session_payload(
+            tenant_id,
+            session_id,
+            {
+                "app_id": row["app_id"],
+                "principal_id": row["principal_id"],
+                "state_json": row["state_json"],
+                "version": row["version"],
+                "next_sequence": row["next_sequence"],
+                "events": events,
+            },
+        )
+        return MigrationRecord(kind="session", resource_id=session_id, payload=payload)
+
+    @staticmethod
+    def _session_row_is_complete(row: Any) -> bool:
+        required = {"app_id", "principal_id", "state_json", "version", "next_sequence"}
+        return required.issubset(row.keys() if hasattr(row, "keys") else ())
+
+    @staticmethod
+    def _memory_record_from_row(row: Any) -> MigrationRecord:
+        source_record_id = row.get("source_record_id") if hasattr(row, "get") else None
+        memory_id = str(row["memory_id"])
+        resource_id = str(source_record_id or memory_id)
+        payload = _canonical_memory_payload(
+            {
+                "principal_id": row["principal_id"],
+                "session_id": row["session_id"],
+                "source_sequence": row["source_sequence"],
+                "memory_json": row["memory_json"],
+                "projection_status": row["projection_status"],
+            }
+        )
+        return MigrationRecord(kind="memory", resource_id=resource_id, payload=payload)
+
+    @staticmethod
+    def _memory_row_is_complete(row: Any) -> bool:
+        required = {
+            "memory_id",
+            "principal_id",
+            "session_id",
+            "source_sequence",
+            "memory_json",
+            "projection_status",
+        }
+        return required.issubset(row.keys() if hasattr(row, "keys") else ())
 
     async def list_records(
         self, tenant_id: str, kind: str, *, limit: int = MIGRATION_TARGET_PAGE_SIZE
@@ -1399,6 +1626,8 @@ class MigrationCoordinator:
         target_list = getattr(self._target, "list_records", None)
         target_page = getattr(self._target, "list_records_page", None)
         target_records: dict[str, set[str]] = {}
+        target_checksums: dict[str, dict[str, str]] = {}
+        target_enumerated = False
         if callable(target_list) or callable(target_page):
             kinds = self._manifest.kinds if self._manifest is not None else ("session", "memory")
             for kind in kinds:
@@ -1411,14 +1640,22 @@ class MigrationCoordinator:
                     )
                 except ValueError:
                     target_records.clear()
+                    target_checksums.clear()
                     target_count = 0
                     break
                 target_records[kind] = {record.resource_id for record in records}
+                target_checksums[kind] = {record.resource_id: record.checksum for record in records}
                 target_count += len(records)
                 _ensure_record_count(target_count, "target verification")
+            else:
+                target_enumerated = True
         source_resource_ids: dict[str, set[str]] = {}
         while True:
             previous_cursor = cursor
+            # Comparison is read-only.  Fence each bounded source page while
+            # the background heartbeat guards the whole phase; target writes
+            # in ``_copy_all`` still assert the lease before every record.
+            await self._assert_lease()
             records, next_cursor = await self._source.fetch(
                 checkpoint.tenant_id, cursor=cursor, limit=self._batch_size
             )
@@ -1429,15 +1666,18 @@ class MigrationCoordinator:
                 source_count += 1
                 source_resource_ids.setdefault(record.kind, set()).add(record.resource_id)
                 checksum = _rolling_checksum(checksum, record.checksum)
-                await self._assert_lease()
-                target = await self._target.read(
-                    checkpoint.tenant_id, record.kind, record.resource_id
-                )
-                if target is not None:
-                    if not target_records:
+                if target_enumerated:
+                    target_checksum = target_checksums.get(record.kind, {}).get(record.resource_id)
+                    if target_checksum != record.checksum:
+                        differences.append(f"{record.kind}/{record.resource_id}")
+                else:
+                    target = await self._target.read(
+                        checkpoint.tenant_id, record.kind, record.resource_id
+                    )
+                    if target is not None:
                         target_count += 1
-                if target is None or target.checksum != record.checksum:
-                    differences.append(f"{record.kind}/{record.resource_id}")
+                    if target is None or target.checksum != record.checksum:
+                        differences.append(f"{record.kind}/{record.resource_id}")
             if next_cursor is None:
                 break
             cursor = next_cursor
@@ -2091,6 +2331,9 @@ class PostgresMigrationGuard:
                 SELECT 'session_mailbox_items'::text,count(*)::bigint
                   FROM public.session_mailbox_items WHERE tenant_id=$1
                 UNION ALL
+                SELECT protected.table_name,protected.row_count
+                  FROM public.migration_protected_target_counts($1) AS protected
+                UNION ALL
                 SELECT 'migration_checkpoints'::text,count(*)::bigint
                   FROM public.migration_checkpoints WHERE tenant_id=$1
                 UNION ALL
@@ -2103,15 +2346,28 @@ class PostgresMigrationGuard:
              ORDER BY table_name
         """
         rows = await connection.fetch(query, tenant_id)
-        counts = {
-            str(_row_value(row, "table_name")): int(_row_value(row, "row_count")) for row in rows
-        }
-        missing = set(_TARGET_EMPTY_TABLES) - set(counts)
-        if missing:
+        count_rows = [
+            (str(_row_value(row, "table_name")), int(_row_value(row, "row_count"))) for row in rows
+        ]
+        table_names = [table_name for table_name, _row_count in count_rows]
+        expected_tables = set(_TARGET_EMPTY_TABLES)
+        observed_tables = set(table_names)
+        missing = expected_tables - observed_tables
+        unexpected = observed_tables - expected_tables
+        duplicates = {table_name for table_name in table_names if table_names.count(table_name) > 1}
+        if missing or unexpected or duplicates:
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(sorted(missing)))
+            if unexpected:
+                details.append("unexpected=" + ",".join(sorted(unexpected)))
+            if duplicates:
+                details.append("duplicates=" + ",".join(sorted(duplicates)))
             raise MigrationGuardError(
-                "target empty preflight did not return all guarded tables: "
-                + ", ".join(sorted(missing))
+                "target empty preflight did not return the exact guarded table set: "
+                + "; ".join(details)
             )
+        counts = dict(count_rows)
         result = TargetEmptyPreflight(
             tenant_id=tenant_id,
             checked_tables=_TARGET_EMPTY_TABLES,

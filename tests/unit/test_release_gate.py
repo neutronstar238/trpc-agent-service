@@ -7,19 +7,21 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+import scripts.im_online_gate as im_online_gate
 import scripts.kubernetes_runtime_gate as kubernetes_runtime_gate
 import scripts.real_runtime_gate as real_runtime_gate
 import scripts.release_gate as release_gate
 import trpc_service.storage.migration as migration_storage
-from scripts.evidence_lineage import canonical_sha256
+from scripts.evidence_lineage import canonical_sha256, runtime_fingerprint
 from scripts.release_gate import (
     FAULT_REQUIRED_MARKERS,
     FINGERPRINT_MAX_BYTES,
     FINGERPRINT_MAX_FILES,
+    FUNCTIONAL_DR_REPORT,
     PRODUCTION_EVIDENCE_PRODUCERS,
     REPORTS,
     _current_candidate_source_fingerprint,
@@ -358,7 +360,7 @@ def _materialize_fault_children(payload: dict[str, object], report_path: Path) -
             "ended_at": generated_at,
             "gate": "pass",
             "production_gate": "not_run",
-            "candidate": {expected_phase: child_phase},
+            "candidate": {"faults" if expected_phase == "fault" else expected_phase: child_phase},
             "case_deltas": {"requested_phase": expected_phase},
         }
         scope = trusted_root / run_id
@@ -372,6 +374,7 @@ def _materialize_fault_children(payload: dict[str, object], report_path: Path) -
         item["child_report_mtime_ns"] = child_path.stat().st_mtime_ns
         item["child_report_started_at"] = generated_at
         item["child_report_ended_at"] = generated_at
+        item["child_phase"] = expected_phase
         item["child_phase_status"] = "pass"
         item["child_production_gate"] = "not_run"
 
@@ -552,7 +555,7 @@ def _valid_online_im_report(trust: dict[str, str] | None = None) -> dict[str, ob
         "value": "a" * 64,
     }
 
-    def observation(case: str) -> dict[str, object]:
+    def observation(case: str, channel: str) -> dict[str, object]:
         result: dict[str, object] = {
             "status": "pass",
             "run_nonce": nonce,
@@ -572,15 +575,29 @@ def _valid_online_im_report(trust: dict[str, str] | None = None) -> dict[str, ob
                     "duplicate_count": 1,
                 },
                 "media": {"bytes": 1024},
-                "reconnect": {
-                    "disconnect_event_id_hash": "7" * 64,
-                    "reconnect_event_id_hash": "8" * 64,
-                    "received_after_reconnect_event_id_hash": "9" * 64,
-                    "lock_takeover_event_id_hash": "0" * 64,
-                    "old_lock_owner_released": True,
-                    "new_lock_owner_acquired": True,
-                    "lock_epoch": 2,
-                },
+                "reconnect": (
+                    {
+                        "failed_endpoint_id_hash": "7" * 64,
+                        "replacement_endpoint_id_hash": "8" * 64,
+                        "endpoint_set_observed": True,
+                        "received_after_failover_event_id_hash": "9" * 64,
+                        "outbound_request_id_hash": "0" * 64,
+                        "acknowledged_request_id_hash": "0" * 64,
+                        "ready_endpoint_count": 4,
+                        "unready_endpoint_count": 0,
+                        "terminating_endpoint_count": 0,
+                    }
+                    if channel == "feishu"
+                    else {
+                        "disconnect_event_id_hash": "7" * 64,
+                        "reconnect_event_id_hash": "8" * 64,
+                        "received_after_reconnect_event_id_hash": "9" * 64,
+                        "lock_takeover_event_id_hash": "0" * 64,
+                        "old_lock_owner_released": True,
+                        "new_lock_owner_acquired": True,
+                        "lock_epoch": 2,
+                    }
+                ),
                 "rate_limit_retry_after": {
                     "provider_error_code": "99991400",
                     "retry_after_seconds": 2.0,
@@ -626,6 +643,13 @@ def _valid_online_im_report(trust: dict[str, str] | None = None) -> dict[str, ob
     channels: dict[str, object] = {}
     for channel, (source, paths, credential_count) in contracts.items():
         response_digest = ("1" if channel == "feishu" else "2") * 64
+        artifact_attestation = {
+            "schema_version": 1,
+            "runner_sha256": "b" * 64,
+            "runner_contract_version": 1,
+            "driver_sha256": ("c" if channel == "feishu" else "d") * 64,
+            "driver_contract_version": 1,
+        }
         trust_values = trust or {
             "probe_url": "https://probe.example.test",
             "key_id": "fixture-key",
@@ -633,16 +657,54 @@ def _valid_online_im_report(trust: dict[str, str] | None = None) -> dict[str, ob
             "config_sha256": "9" * 64,
             "file_sha256": "a" * 64,
         }
-        observations = {case: observation(case) for case in cases}
+        observations = {case: observation(case, channel) for case in cases}
         if channel == "wecom":
             observations["rate_limit_retry_after"]["provider_error_code"] = "45009"
+            for case in ("reconnect", "credential_rotation"):
+                observations[case].update(
+                    {
+                        "outbound_request_id_hash": "4" * 64,
+                        "acknowledged_request_id_hash": "4" * 64,
+                        "provider_code": "0",
+                    }
+                )
+            observations["prolonged_outage"].update(
+                {
+                    "outage_mode": "service_failover",
+                    "failed_instance_id_hash": "1" * 64,
+                    "takeover_instance_id_hash": "2" * 64,
+                    "old_lock_owner_released": True,
+                    "new_lock_owner_acquired": True,
+                    "connection_epoch": 3,
+                    "event_during_outage_id_hash": "3" * 64,
+                    "reply_for_event_id_hash": "3" * 64,
+                    "outbound_request_id_hash": "4" * 64,
+                    "acknowledged_request_id_hash": "4" * 64,
+                    "reply_count": 1,
+                    "ack_count": 1,
+                    "pending_count": 0,
+                    "dlq_count": 0,
+                }
+            )
         channels[channel] = {
             "status": "pass",
+            "runtime_attestation": {
+                "status": "pass",
+                "run_nonce": nonce,
+                "image_digest": "sha256:" + "a" * 64,
+                "release_id": evidence["release_binding"]["release_id"],  # type: ignore[index]
+                "release_nonce_sha256": evidence["release_binding"][  # type: ignore[index]
+                    "nonce_sha256"
+                ],
+                "source_fingerprint": evidence["source_fingerprint"]["value"],  # type: ignore[index]
+            },
+            "artifact_attestation": dict(artifact_attestation),
             "cases": {case: {"status": "pass"} for case in cases},
             "provider_evidence": {
                 "source": source,
                 "independent_paths": paths,
                 "run_nonce": nonce,
+                "artifact_attestation": dict(artifact_attestation),
                 "run_started_at": observed_at,
                 "account_fingerprint": "3" * 64,
                 "credential_attestation": {
@@ -698,6 +760,119 @@ def _valid_online_im_report(trust: dict[str, str] | None = None) -> dict[str, ob
         "case_deltas": {"failed_cases": []},
         "evidence": evidence,
     }
+
+
+def _sanitized_feishu_probe_evidence(*, run_nonce: str, observed_at: str) -> dict[str, object]:
+    common = {"status": "pass", "run_nonce": run_nonce, "observed_at": observed_at}
+    observations: dict[str, dict[str, object]] = {
+        "round_trip": {
+            **common,
+            "provider_event_id": "feishu-round-trip",
+            "callback_event_id": "feishu-callback",
+            "outbound_request_id": "feishu-round-trip-request",
+            "provider_code": 0,
+        },
+        "idempotency": {
+            **common,
+            "provider_event_id": "feishu-idempotency",
+            "duplicate_event_id": "feishu-delivery",
+            "unique_inbound_id": "feishu-inbound",
+            "duplicate_count": 1,
+            "original_event_id": "feishu-delivery",
+            "provider_delivery_count": 2,
+        },
+        "media": {
+            **common,
+            "provider_event_id": "feishu-media",
+            "media_id_hash": "1" * 64,
+            "sha256": "2" * 64,
+            "bytes": 1024,
+        },
+        "reconnect": {
+            **common,
+            "provider_event_id": "feishu-reconnect",
+            "failed_endpoint_id": "feishu-gateway-old",
+            "replacement_endpoint_id": "feishu-gateway-new",
+            "endpoint_set_observed": True,
+            "received_after_failover_event_id": "feishu-after-failover",
+            "outbound_request_id": "feishu-failover-request",
+            "acknowledged_request_id": "feishu-failover-request",
+            "ready_endpoint_count": 4,
+            "unready_endpoint_count": 0,
+            "terminating_endpoint_count": 0,
+        },
+        "rate_limit_retry_after": {
+            **common,
+            "provider_event_id": "feishu-rate-limit",
+            "provider_error_code": 429,
+            "retry_after_seconds": 1.0,
+            "retry_request_id": "feishu-retry-request",
+            "retry_attempts": 2,
+            "retry_elapsed_seconds": 1.0,
+        },
+        "credential_rotation": {
+            **common,
+            "provider_event_id": "feishu-rotation",
+            "old_credential_event_id": "feishu-old-credential",
+            "new_credential_event_id": "feishu-new-credential",
+            "post_rotation_event_id": "feishu-post-rotation",
+            "old_credential_rejected": True,
+        },
+        "prolonged_outage": {
+            **common,
+            "provider_event_id": "feishu-outage",
+            "outage_event_id": "feishu-outage-event",
+            "recovery_event_id": "feishu-recovery-event",
+            "outage_seconds": 60.0,
+        },
+        "ambiguous": {
+            **common,
+            "provider_event_id": "feishu-ambiguous",
+            "ambiguous_event_id": "feishu-ambiguous-event",
+            "manual_review_id": "feishu-manual-review",
+            "drop_response_observed": True,
+            "auto_replay_count": 0,
+        },
+    }
+    fingerprints = {
+        "FEISHU_APP_ID": "3" * 64,
+        "FEISHU_APP_SECRET": "4" * 64,
+        "FEISHU_VERIFICATION_TOKEN": "5" * 64,
+        "FEISHU_ENCRYPT_KEY": "6" * 64,
+    }
+    response = {
+        "credential_attestation": {
+            "status": "pass",
+            "run_nonce": run_nonce,
+            "fingerprints": fingerprints,
+        },
+        "provider_evidence": {
+            "source": "feishu_api_and_webhook",
+            "independent_paths": ["provider_callback", "provider_send_ack"],
+            "run_nonce": run_nonce,
+            "artifact_attestation": {
+                "schema_version": 1,
+                "runner_sha256": "b" * 64,
+                "runner_contract_version": 1,
+                "driver_sha256": "c" * 64,
+                "driver_contract_version": 1,
+            },
+            "account_fingerprint": fingerprints["FEISHU_APP_ID"],
+            "observations": observations,
+        },
+    }
+    current = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    sanitized, errors = im_online_gate._validate_provider_evidence(
+        "feishu",
+        response,
+        run_nonce=run_nonce,
+        credential_fingerprints=fingerprints,
+        run_started_at=current,
+        now=current,
+    )
+    assert errors == []
+    assert sanitized is not None
+    return sanitized
 
 
 def _performance_candidate() -> dict[str, object]:
@@ -838,13 +1013,13 @@ def _performance_candidate() -> dict[str, object]:
         "parameters": {
             "db_pool_size": 32,
             "min_workers": 4,
-            "max_inflight": 32,
+            "max_inflight": 64,
             "timeout_seconds": 300.0,
             "callbacks": 200,
             "callback_rate_per_second": 100.0,
             "burst_turns": 200,
             "target_max_turn_overlap": 200,
-            "max_inflight_accepts": 32,
+            "max_inflight_accepts": 64,
             "db_pool_scope": "load_generator_only",
             "scheduler_version": "v2",
             "redis_stream": "trpc:session-ready:v2",
@@ -852,6 +1027,8 @@ def _performance_candidate() -> dict[str, object]:
         },
         "preflight": {
             "status": "pass",
+            "worker_count": 4,
+            "worker_concurrency": 50,
             "worker_processes": workers,
             "source_fingerprint": source,
             "resources": {
@@ -927,6 +1104,115 @@ def _valid_performance_report() -> dict[str, object]:
         "rejection_reasons": [],
         "production_rejection_reasons": [],
     }
+
+
+def _valid_kubernetes_performance_report() -> dict[str, object]:
+    report = _valid_performance_report()
+    candidate = report["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    source = _current_candidate_source_fingerprint()["value"]
+
+    worker_processes = [
+        {
+            "role": "worker",
+            "pod_name": f"worker-{index}",
+            "pod_uid": f"pod-uid-worker-{index}",
+            "container_name": "worker",
+            "container_id": f"containerd://worker-{index}",
+            "image_id": "sha256:" + "a" * 64,
+            "source_fingerprint": None,
+            "memory_limit_bytes": 2 * 1024**3,
+        }
+        for index in range(4)
+    ]
+    outbox_processes = [
+        {
+            "role": "outbox-dispatcher",
+            "pod_name": "outbox-0",
+            "pod_uid": "pod-uid-outbox-0",
+            "container_name": "outbox-dispatcher",
+            "container_id": "containerd://outbox-0",
+            "image_id": "sha256:" + "a" * 64,
+            "source_fingerprint": source,
+            "memory_limit_bytes": 1 * 1024**3,
+        }
+    ]
+    participating = {"worker": worker_processes, "outbox-dispatcher": outbox_processes}
+    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    role_observations = {
+        "worker": {
+            "identity_count": len(worker_processes),
+            "observed_count": len(worker_processes),
+            "observations": [
+                {
+                    **identity,
+                    "memory_bytes": 128 * 1024**2,
+                    "sampled_memory_bytes": 128 * 1024**2,
+                    "sampling_source": "kubernetes_metrics_api",
+                    "metrics_timestamp": timestamp,
+                    "metrics_window": "15s",
+                }
+                for identity in worker_processes
+            ],
+        },
+        "outbox-dispatcher": {
+            "identity_count": len(outbox_processes),
+            "observed_count": len(outbox_processes),
+            "observations": [
+                {
+                    **outbox_processes[0],
+                    "memory_bytes": 64 * 1024**2,
+                    "sampled_memory_bytes": 64 * 1024**2,
+                    "sampling_source": "kubernetes_metrics_api",
+                    "metrics_timestamp": timestamp,
+                    "metrics_window": "15s",
+                }
+            ],
+        },
+    }
+    memory_observation = {
+        "status": "pass",
+        "sampling_method": "kubernetes_metrics_api",
+        "metrics_api": "metrics.k8s.io/v1beta1",
+        "sample_count": 1,
+        "sampling_interval_seconds": 15.0,
+        "sample_timestamps": [timestamp],
+        "required_roles": ["worker", "outbox-dispatcher"],
+        "role_observations": role_observations,
+        "coverage_complete": True,
+        "observed_identity_count": 5,
+        "sampled_memory_bytes": 576 * 1024**2,
+        "peak_bytes": 576 * 1024**2,
+        "safety_threshold_bytes": 9 * 1024**3,
+        "threshold_source": "pod_resource_limits",
+        "within_safety_threshold": True,
+        "observed_at": timestamp,
+    }
+    preflight["worker_processes"] = worker_processes
+    preflight["participating_processes"] = participating
+    preflight["memory_observation"] = memory_observation
+    preflight["kubernetes"] = {
+        "namespace": "acceptance",
+        "context": "test-context",
+        "metrics_api": "metrics.k8s.io/v1beta1",
+        "namespace_bound": True,
+        "memory_limit_bytes": None,
+    }
+    candidate["memory_observation"] = memory_observation
+    evidence = report["evidence"]
+    assert isinstance(evidence, dict)
+    parameters = candidate["parameters"]
+    assert isinstance(parameters, dict)
+    evidence["runtime_fingerprint"] = _runtime_fingerprint(
+        mode="real_postgresql_redis_multiprocess",
+        workers=cast(list[object], worker_processes),
+        stream="trpc:session-ready:v2",
+        group="trpc-session-ready-v2",
+        parameters=parameters,
+    )
+    return report
 
 
 REAL_RUNTIME_LOAD_STAGE_NAMES = (
@@ -1551,6 +1837,22 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "ready_replicas": 2,
         },
     }
+    external_path = (
+        f"/apis/external.metrics.k8s.io/v1beta1/namespaces/{namespace}/trpc_session_ready_backlog"
+    )
+    for phase in ("before", "during", "after"):
+        observation = hpa_observation[phase]
+        metric_value = observation["metric_value"]
+        observation["external_metric"] = {
+            "api_observed": True,
+            "api_version": "v1beta1",
+            "api_path": external_path,
+            "metric_name": "trpc_session_ready_backlog",
+            "namespace": namespace,
+            "label_namespace": namespace,
+            "item_count": 1,
+            "value": metric_value,
+        }
     post_ready = {name: {"status": "pass"} for name in release_gate.K8S_REQUIRED_DEPLOYMENTS}
     node_eviction = {
         "status": "pass",
@@ -1610,11 +1912,27 @@ def _valid_kubernetes_report() -> dict[str, object]:
             "upgrade": upgrade,
             "changed": {name: True for name in initial},
         },
+        "rollback": {
+            "status": "pass",
+            "deployment": "trpc-worker",
+            "failure_injected": True,
+            "failure_observed": True,
+            "undo_observed": True,
+            "readiness_recovered": True,
+            "restored_image_ids": upgrade["trpc-worker"],
+        },
     }
     checks["initial_image_ids"] = initial
     candidate = {
         "mode": "live_kubernetes_control_plane",
         "enabled": True,
+        "topology": {
+            "scope": "unified_cluster_runtime",
+            "im_deployment": "production_cluster",
+            "production_deployments": list(release_gate.K8S_PRODUCTION_DEPLOYMENTS),
+            "tested_deployments": list(release_gate.K8S_REQUIRED_DEPLOYMENTS),
+            "provider_disabled_deployments": ["trpc-wecom-connector"],
+        },
         "namespace": namespace,
         "run_nonce": nonce,
         "controlled_node": {"fingerprint_sha256": "d" * 64},
@@ -1670,6 +1988,160 @@ def _valid_kubernetes_report() -> dict[str, object]:
         "evidence": evidence,
         "rejection_reasons": [],
         "production_rejection_reasons": [],
+    }
+
+
+def _valid_disaster_recovery_report(directory) -> dict[str, object]:
+    source = _current_candidate_source_fingerprint()
+    release_binding = _current_evidence()["release_binding"]
+    repository = "registry.example/acme/trpc-agent-service"
+    initial_digest = "sha256:" + "a" * 64
+    upgrade_digest = "sha256:" + "b" * 64
+    binding = {
+        "schema_version": 1,
+        "kind": "registry_candidate_binding",
+        "release_binding": release_binding,
+        "source_fingerprint": source,
+        "repository": repository,
+        "image_digest": initial_digest,
+        "images": {
+            "initial": {
+                "digest": initial_digest,
+                "reference": f"{repository}@{initial_digest}",
+            },
+            "upgrade": {
+                "digest": upgrade_digest,
+                "reference": f"{repository}@{upgrade_digest}",
+            },
+        },
+    }
+    lock = {
+        "schema_version": 1,
+        "kind": "release_candidate_lock",
+        "release_binding": release_binding,
+        "source_fingerprint": source,
+        "binding_sha256": release_gate.canonical_sha256(binding),
+        "repository": repository,
+        "image_digest": initial_digest,
+        "images": binding["images"],
+    }
+    binding_path = directory / "registry-image-binding.json"
+    lock_path = directory / "candidate-lock.json"
+    atomic_write_json(binding_path, binding)
+    atomic_write_json(lock_path, lock)
+    components = {
+        name: {
+            "status": "pass",
+            "run_id": f"{name}-run",
+            "rpo_seconds": 30,
+            "rto_seconds": 120,
+        }
+        for name in ("postgres_pitr", "artifact_restore", "key_restore")
+    }
+    return {
+        "schema_version": 1,
+        "gate": "pass",
+        "baseline": {
+            "required_components": ["postgres_pitr", "artifact_restore", "key_restore"],
+            "max_rpo_seconds": 300,
+            "max_rto_seconds": 3_600,
+        },
+        "candidate": {
+            "mode": "isolated_restore_drill",
+            "lineage": {"image_digest": initial_digest},
+            "candidate_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+            "components": components,
+        },
+        "case_deltas": {"failed_components": []},
+        "production_gate": "pass",
+        "evidence": _current_evidence("scripts.disaster_recovery_gate"),
+    }
+
+
+def _valid_functional_disaster_recovery_report(directory) -> dict[str, object]:
+    destructive = _valid_disaster_recovery_report(directory)
+    candidate = cast(dict[str, object], destructive["candidate"])
+    lineage = cast(dict[str, object], candidate["lineage"])
+    image_digest = cast(str, lineage["image_digest"])
+    lock_path = directory / "candidate-lock.json"
+    components = {
+        name: {
+            "status": "pass",
+            "run_id": f"functional-{name}-run",
+            "rpo_seconds": 0,
+            "rto_seconds": 1,
+            "backend": "postgresql" if name == "postgres_pitr" else "minio",
+            "restore_mode": {
+                "postgres_pitr": "logical_snapshot",
+                "artifact_restore": "object_version",
+                "key_restore": "synthetic_key_version",
+            }[name],
+        }
+        for name in ("postgres_pitr", "artifact_restore", "key_restore")
+    }
+    required = ("postgres_pitr", "artifact_restore", "key_restore")
+    runtime_jobs = [
+        {
+            "component": name,
+            "image_digest": image_digest,
+            "job_uid_sha256": str(index) * 64,
+            "pod_uid_sha256": "4" * 64,
+        }
+        for index, name in enumerate(required, start=7)
+    ]
+    runtime_parameters = {
+        "candidate_lock_binding_sha256": json.loads(lock_path.read_text(encoding="utf-8"))[
+            "binding_sha256"
+        ],
+        "components": list(required),
+        "image_digest": image_digest,
+    }
+    evidence = _current_evidence("scripts.functional_disaster_recovery_gate")
+    evidence["runtime_fingerprint"] = runtime_fingerprint(
+        mode="same_cluster_zero_cost_functional",
+        worker_identities=runtime_jobs,
+        stream="3" * 64,
+        group="2" * 64,
+        parameters=runtime_parameters,
+    )
+    return {
+        "schema_version": 1,
+        "baseline": {
+            "required_components": ["postgres_pitr", "artifact_restore", "key_restore"],
+            "max_rto_seconds": 300,
+            "production_requirements_excluded": [
+                "remote redundancy",
+                "WAL PITR",
+                "external KMS",
+            ],
+        },
+        "candidate": {
+            "mode": "same_cluster_zero_cost_functional",
+            "platform": "kubernetes",
+            "lineage": {"image_digest": image_digest},
+            "candidate_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+            "components": components,
+            "runtime_attestation": {
+                "cluster_uid_sha256": "3" * 64,
+                "namespace_uid_sha256": "2" * 64,
+                "jobs": runtime_jobs,
+            },
+            "orchestration": {
+                "failure_stage": None,
+                "failure_code": None,
+                "namespace_sha256": "1" * 64,
+                "namespace_uid_sha256": "2" * 64,
+                "namespace_created": True,
+                "jobs_submitted_together": True,
+                "cleanup_completed": True,
+            },
+        },
+        "case_deltas": {"failed_components": []},
+        "evidence": evidence,
+        "gate": "pass",
+        "production_gate": "not_run",
+        "rejection_reasons": [],
+        "production_rejection_reasons": ["functional evidence is not disaster-redundant"],
     }
 
 
@@ -1813,7 +2285,7 @@ def _valid_migration_report() -> dict[str, object]:
                 "source_fingerprint": evidence["source_fingerprint"]["value"],  # type: ignore[index]
                 "runtime_fingerprint": evidence["runtime_fingerprint"]["value"],  # type: ignore[index]
                 "image_digest": "sha256:" + "a" * 64,
-            }
+            },
         },
         "migration_evidence": {
             "status": "pass",
@@ -1964,8 +2436,7 @@ def test_real_runtime_rejects_global_participating_process_identity_mutations(
     assert status in {"not_run", "fail"}
     assert reasons
     assert any(
-        marker in reasons[0].lower()
-        for marker in ("identity", "duplicated", "pid", "container")
+        marker in reasons[0].lower() for marker in ("identity", "duplicated", "pid", "container")
     )
 
 
@@ -2009,6 +2480,8 @@ def test_kubernetes_pass_requires_complete_live_attestation(tmp_path) -> None:
     ("mutation", "reason_fragment"),
     (
         ("schema", "invalid schema_version"),
+        ("topology_location", "reviewed unified-cluster runtime topology"),
+        ("topology_disabled", "reviewed unified-cluster runtime topology"),
         ("nonce", "run_nonce"),
         ("hpa", "HPA desired replicas"),
         ("hpa_driver_trust", "hpa_driver_trust"),
@@ -2032,6 +2505,10 @@ def test_kubernetes_pass_rejects_incomplete_or_replayed_runtime_evidence(
     value = json.loads(json.dumps(_valid_kubernetes_report()))
     if mutation == "schema":
         value["schema_version"] = 0
+    elif mutation == "topology_location":
+        value["candidate"]["topology"]["im_deployment"] = "external_host"  # type: ignore[index]
+    elif mutation == "topology_disabled":
+        value["candidate"]["topology"]["provider_disabled_deployments"] = []  # type: ignore[index]
     elif mutation == "nonce":
         value["candidate"]["run_nonce"] = "b" * 32  # type: ignore[index]
     elif mutation == "hpa":
@@ -2420,6 +2897,216 @@ def test_performance_pass_accepts_matching_current_candidate_evidence(tmp_path) 
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("db_pool_size", 16),
+        ("max_inflight", 32),
+    ),
+)
+def test_performance_promotion_requires_formal_producer_topology(
+    tmp_path: Path, field: str, value: int
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    parameters = candidate["parameters"]
+    assert isinstance(parameters, dict)
+    parameters[field] = value
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    workers = preflight["worker_processes"]
+    assert isinstance(workers, list)
+    evidence = report_value["evidence"]
+    assert isinstance(evidence, dict)
+    evidence["runtime_fingerprint"] = _runtime_fingerprint(
+        mode="real_postgresql_redis_multiprocess",
+        workers=workers,
+        stream="trpc:session-ready:v2",
+        group="trpc-session-ready-v2",
+        parameters=parameters,
+    )
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "fail"
+    assert field in reasons[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_status"),
+    (
+        ("worker_count", None, "not_run"),
+        ("worker_count", 3, "fail"),
+        ("worker_concurrency", None, "not_run"),
+        ("worker_concurrency", 49, "fail"),
+    ),
+)
+def test_performance_promotion_requires_auditable_worker_topology(
+    tmp_path: Path,
+    field: str,
+    value: int | None,
+    expected_status: str,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    if value is None:
+        preflight.pop(field)
+    else:
+        preflight[field] = value
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == expected_status
+    assert field in reasons[0]
+
+
+def test_performance_promotion_accepts_attested_kubernetes_gateway_service(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    preflight["kubernetes"] = {
+        "namespace": "acceptance",
+        "namespace_bound": True,
+    }
+    sustained = candidate["sustained"]
+    assert isinstance(sustained, dict)
+    sustained["gateway"] = {
+        "host_class": "kubernetes_service",
+        "service_name": "trpc-gateway",
+        "namespace": "acceptance",
+        "scheme": "http",
+        "port": 8080,
+    }
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    assert _status(report, production_field=True) == ("pass", [])
+
+
+def test_performance_promotion_rejects_unbound_kubernetes_gateway_service(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    sustained = candidate["sustained"]
+    assert isinstance(sustained, dict)
+    sustained["gateway"] = {
+        "host_class": "kubernetes_service",
+        "service_name": "trpc-gateway",
+        "namespace": "acceptance",
+        "scheme": "http",
+        "port": 8080,
+    }
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert "candidate.preflight.kubernetes" in reasons[0]
+
+
+def test_performance_pass_accepts_kubernetes_metrics_with_unlabeled_workers(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_kubernetes_performance_report()
+    workers = report_value["candidate"]["preflight"]["worker_processes"]  # type: ignore[index]
+    assert all(worker["source_fingerprint"] is None for worker in workers)
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    assert _status(report, production_field=True) == ("pass", [])
+
+
+def test_performance_non_kubernetes_worker_source_fingerprint_is_required(
+    tmp_path: Path,
+) -> None:
+    report_value = _valid_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    workers = preflight["worker_processes"]
+    assert isinstance(workers, list)
+    for worker in workers:
+        assert isinstance(worker, dict)
+        worker["source_fingerprint"] = None
+    parameters = candidate["parameters"]
+    assert isinstance(parameters, dict)
+    evidence = report_value["evidence"]
+    assert isinstance(evidence, dict)
+    evidence["runtime_fingerprint"] = _runtime_fingerprint(
+        mode="real_postgresql_redis_multiprocess",
+        workers=workers,
+        stream="trpc:session-ready:v2",
+        group="trpc-session-ready-v2",
+        parameters=parameters,
+    )
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert "worker process image/source identity" in reasons[0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_pod_uid", "forged_container_identity", "missing_memory_bytes", "forged_pod_limit"),
+)
+def test_performance_kubernetes_metrics_memory_evidence_fails_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    report_value = _valid_kubernetes_performance_report()
+    candidate = report_value["candidate"]
+    assert isinstance(candidate, dict)
+    preflight = candidate["preflight"]
+    assert isinstance(preflight, dict)
+    participating = preflight["participating_processes"]
+    assert isinstance(participating, dict)
+    memory_observation = candidate["memory_observation"]
+    assert isinstance(memory_observation, dict)
+    observations = memory_observation["role_observations"]
+    assert isinstance(observations, dict)
+    worker_observations = observations["worker"]
+    assert isinstance(worker_observations, dict)
+    worker_observation = worker_observations["observations"][0]
+    assert isinstance(worker_observation, dict)
+    if mutation == "missing_pod_uid":
+        worker_participating = participating["worker"]
+        assert isinstance(worker_participating, list)
+        worker_participating[0].pop("pod_uid")
+    elif mutation == "forged_container_identity":
+        worker_observation["container_id"] = "containerd://forged"
+    elif mutation == "missing_memory_bytes":
+        worker_observation.pop("memory_bytes")
+    else:
+        worker_observation["memory_limit_bytes"] += 1
+
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(report_value), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert reasons
+    assert "memory" in reasons[0].lower() or "pod" in reasons[0].lower()
+
+
+@pytest.mark.parametrize(
     "field",
     ("value", "worker_identity_summary_sha256", "parameters_sha256"),
 )
@@ -2716,6 +3403,56 @@ def test_fault_production_pass_requires_complete_observed_scenarios(tmp_path) ->
     assert "complete inventory" in reasons[0]
 
 
+@pytest.mark.parametrize("scenario_name", ("redis_interrupt", "republish", "dlq"))
+def test_fault_production_reads_real_faults_child_phase(tmp_path, scenario_name: str) -> None:
+    report_path = tmp_path / REPORTS["fault_injection"][0]
+    payload = _valid_fault_report(report_path)
+    scenario = payload["candidate"]["scenarios"][scenario_name]  # type: ignore[index]
+    child_path = Path(scenario["child_report"])  # type: ignore[index]
+    child = json.loads(child_path.read_text(encoding="utf-8"))
+
+    assert scenario["child_phase"] == "fault"  # type: ignore[index]
+    assert child["case_deltas"]["requested_phase"] == "fault"
+    assert "faults" in child["candidate"]
+    assert "fault" not in child["candidate"]
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _status(report_path, production_field=True) == ("pass", [])
+
+
+def test_fault_production_prefers_component_markers_over_aggregate_and_rejects_tamper(
+    tmp_path,
+) -> None:
+    report_path = tmp_path / REPORTS["fault_injection"][0]
+    payload = _valid_fault_report(report_path)
+    scenario = payload["candidate"]["scenarios"]["redis_interrupt"]  # type: ignore[index]
+    assert isinstance(scenario, dict)
+    child_path = Path(scenario["child_report"])
+    child = json.loads(child_path.read_text(encoding="utf-8"))
+    phase = child["candidate"]["faults"]
+    assert isinstance(phase, dict)
+    component = phase["redis"]
+    assert isinstance(component, dict)
+    parent_markers = scenario["stage_markers"]
+    assert isinstance(parent_markers, list)
+    selected_markers = [dict(marker, component="redis") for marker in parent_markers]
+    scenario["stage_markers"] = selected_markers
+    component["stage_markers"] = selected_markers
+    phase["stage_markers"] = [dict(marker, component="postgres") for marker in selected_markers]
+    atomic_write_json(child_path, child)
+    scenario["child_report_sha256"] = canonical_sha256(child)
+    scenario["child_report_mtime_ns"] = child_path.stat().st_mtime_ns
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert _status(report_path, production_field=True) == ("pass", [])
+
+    selected_markers[0]["component"] = "tampered"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    status, reasons = _status(report_path, production_field=True)
+
+    assert status == "not_run"
+    assert "child mismatch" in reasons[0]
+
+
 def test_fault_production_pass_requires_ambiguous_provider_ledger(tmp_path) -> None:
     payload = _valid_fault_report(tmp_path / REPORTS["fault_injection"][0])
     scenario = payload["candidate"]["scenarios"]["ambiguous"]  # type: ignore[index]
@@ -2851,7 +3588,7 @@ def test_fault_release_rejects_missing_or_untrusted_child_path(tmp_path, mutatio
         ("retry_attempts", "retry_attempts bounds"),
         ("retry_elapsed", "did not honor Retry-After"),
         ("short_outage", "outage_seconds bounds"),
-        ("lock_takeover", "lock takeover"),
+        ("reconnect_endpoint_set", "EndpointSlice observation"),
     ],
 )
 def test_online_im_pass_requires_complete_provider_evidence(
@@ -2897,7 +3634,7 @@ def test_online_im_pass_requires_complete_provider_evidence(
         ] = 59.0
     else:
         feishu["provider_evidence"]["observations"]["reconnect"][  # type: ignore[index]
-            "old_lock_owner_released"
+            "endpoint_set_observed"
         ] = False
     report = tmp_path / REPORTS["online_im"][0]
     report.write_text(json.dumps(payload), encoding="utf-8")
@@ -2906,6 +3643,199 @@ def test_online_im_pass_requires_complete_provider_evidence(
 
     assert status == "not_run"
     assert expected_reason in reasons[0]
+
+
+def test_online_im_release_accepts_im_gate_sanitized_feishu_reconnect(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    evidence = payload["evidence"]
+    feishu = payload["candidate"]["channels"]["feishu"]  # type: ignore[index]
+    run_nonce = feishu["provider_evidence"]["run_nonce"]  # type: ignore[index]
+    feishu["provider_evidence"] = _sanitized_feishu_probe_evidence(
+        run_nonce=run_nonce,
+        observed_at=evidence["generated_at"],  # type: ignore[index]
+    )
+    reconnect = feishu["provider_evidence"]["observations"]["reconnect"]  # type: ignore[index]
+    assert "failed_endpoint_id_hash" in reconnect
+    assert "replacement_endpoint_id_hash" in reconnect
+    assert "endpoint_set_observed" in reconnect
+    assert "lock_epoch" not in reconnect
+    assert "old_lock_owner_released" not in reconnect
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "pass"
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    (
+        ("replacement_endpoint_id_hash", "7" * 64, "distinct endpoints"),
+        ("acknowledged_request_id_hash", "1" * 64, "ACK binding"),
+        ("ready_endpoint_count", 0, "ready endpoints"),
+        ("unready_endpoint_count", 1, "unstable endpoints"),
+    ),
+)
+def test_online_im_release_rechecks_feishu_endpoint_failover_invariants(
+    tmp_path, field: str, value: object, expected_reason: str, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    reconnect = payload["candidate"]["channels"]["feishu"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ]["reconnect"]
+    reconnect[field] = value
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert expected_reason in reasons[0]
+
+
+def test_online_im_release_requires_wecom_reconnect_lock_lifecycle(tmp_path, monkeypatch) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    reconnect = payload["candidate"]["channels"]["wecom"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ]["reconnect"]
+    reconnect.pop("lock_epoch")
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert "reconnect fields" in reasons[0]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    (
+        ("runtime_source", "runtime_attestation"),
+        ("runtime_extra", "runtime_attestation"),
+        ("driver_hash", "artifact hashes"),
+        ("provider_artifact", "provider artifact_attestation binding"),
+        ("runner_mismatch", "shared runner artifact"),
+    ),
+)
+def test_online_im_release_rechecks_runtime_and_artifact_attestations(
+    tmp_path, mutation: str, expected_reason: str, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    channels = payload["candidate"]["channels"]  # type: ignore[index]
+    feishu = channels["feishu"]  # type: ignore[index]
+    wecom = channels["wecom"]  # type: ignore[index]
+    if mutation == "runtime_source":
+        feishu["runtime_attestation"]["source_fingerprint"] = "9" * 64  # type: ignore[index]
+    elif mutation == "runtime_extra":
+        feishu["runtime_attestation"]["unexpected"] = True  # type: ignore[index]
+    elif mutation == "driver_hash":
+        feishu["artifact_attestation"]["driver_sha256"] = "0" * 64  # type: ignore[index]
+        feishu["provider_evidence"]["artifact_attestation"][  # type: ignore[index]
+            "driver_sha256"
+        ] = "0" * 64
+    elif mutation == "provider_artifact":
+        feishu["provider_evidence"]["artifact_attestation"][  # type: ignore[index]
+            "driver_sha256"
+        ] = "e" * 64
+    else:
+        wecom["artifact_attestation"]["runner_sha256"] = "e" * 64  # type: ignore[index]
+        wecom["provider_evidence"]["artifact_attestation"][  # type: ignore[index]
+            "runner_sha256"
+        ] = "e" * 64
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert expected_reason in reasons[0]
+
+
+@pytest.mark.parametrize(
+    ("case", "field", "value", "expected_reason"),
+    (
+        ("reconnect", "acknowledged_request_id_hash", "5" * 64, "ACK binding"),
+        ("reconnect", "provider_code", "500", "provider ACK code"),
+        ("credential_rotation", "acknowledged_request_id_hash", "5" * 64, "ACK binding"),
+        ("credential_rotation", "provider_code", "500", "provider ACK code"),
+    ),
+)
+def test_online_im_release_rechecks_wecom_send_ack_binding(
+    tmp_path, case: str, field: str, value: object, expected_reason: str, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    observation = payload["candidate"]["channels"]["wecom"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ][case]
+    observation[field] = value
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert expected_reason in reasons[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        ("outage_mode", "provider_delivery_gap", "outage_mode=service_failover"),
+        ("takeover_instance_id_hash", "1" * 64, "distinct failover instances"),
+        ("old_lock_owner_released", None, "lock handoff evidence"),
+        ("new_lock_owner_acquired", False, "lock handoff evidence"),
+        ("connection_epoch", 1, "connection_epoch"),
+        ("reply_for_event_id_hash", "5" * 64, "reply event binding"),
+        ("acknowledged_request_id_hash", "6" * 64, "send acknowledgement binding"),
+        ("reply_count", 2, "reply_count=1"),
+        ("pending_count", 1, "pending_count=0"),
+    ],
+)
+def test_online_im_release_rechecks_wecom_service_failover_invariants(
+    tmp_path, field: str, value: object, expected_reason: str, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    outage = payload["candidate"]["channels"]["wecom"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ]["prolonged_outage"]
+    outage[field] = value
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "not_run"
+    assert expected_reason in reasons[0]
+
+
+def test_online_im_release_accepts_wecom_hard_failover_without_fake_release(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    payload = _valid_online_im_report(trust)
+    observations = payload["candidate"]["channels"]["wecom"]["provider_evidence"][  # type: ignore[index]
+        "observations"
+    ]
+    observations["reconnect"]["old_lock_owner_released"] = False
+    observations["prolonged_outage"]["old_lock_owner_released"] = False
+    report = tmp_path / REPORTS["online_im"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "pass"
+    assert reasons == []
 
 
 @pytest.mark.parametrize(
@@ -3030,6 +3960,8 @@ def test_each_production_report_accepts_only_its_reserved_producer(tmp_path, mon
                 if filename == REPORTS["online_im"][0]
                 else _valid_kubernetes_report()
                 if filename == REPORTS["deployment"][0]
+                else _valid_disaster_recovery_report(tmp_path)
+                if filename == REPORTS["disaster_recovery"][0]
                 else {
                     "production_gate": "pass",
                     "evidence": _current_evidence(expected_producer),
@@ -3131,6 +4063,19 @@ def test_release_gate_rejects_non_object_json_report(tmp_path) -> None:
     assert reasons == ["invalid report report.json: root must be a JSON object"]
 
 
+def test_production_report_cannot_hide_failed_gate_behind_production_pass(tmp_path) -> None:
+    payload = _valid_performance_report()
+    payload["gate"] = "fail"
+    payload["rejection_reasons"] = ["development contract failed"]
+    report = tmp_path / REPORTS["performance"][0]
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, reasons = _status(report, production_field=True)
+
+    assert status == "fail"
+    assert reasons
+
+
 def _write_complete_report_set(
     directory, *, failed: str | None = None, trust: dict[str, str] | None = None
 ) -> None:
@@ -3153,6 +4098,8 @@ def _write_complete_report_set(
                 if filename == REPORTS["online_im"][0]
                 else _valid_kubernetes_report()
                 if filename == REPORTS["deployment"][0]
+                else _valid_disaster_recovery_report(directory)
+                if filename == REPORTS["disaster_recovery"][0]
                 else {
                     "production_gate": "pass",
                     "evidence": _current_evidence(PRODUCTION_EVIDENCE_PRODUCERS[filename]),
@@ -3172,6 +4119,522 @@ def _write_complete_report_set(
         image_digest="sha256:" + "a" * 64,
     )
     atomic_write_json(directory / "release-manifest.json", manifest)
+
+
+def _functional_dr_manifest_reports() -> dict[str, str]:
+    reports = {
+        name: filename
+        for name, (filename, production) in REPORTS.items()
+        if production and name != "disaster_recovery"
+    }
+    reports["functional_disaster_recovery"] = FUNCTIONAL_DR_REPORT[0]
+    return reports
+
+
+def _functional_dr_manifest_contract() -> dict[str, tuple[str, str]]:
+    return {
+        name: (
+            filename,
+            FUNCTIONAL_DR_REPORT[1]
+            if filename == FUNCTIONAL_DR_REPORT[0]
+            else PRODUCTION_EVIDENCE_PRODUCERS[filename],
+        )
+        for name, filename in _functional_dr_manifest_reports().items()
+    }
+
+
+def _write_functional_dr_waiver_report_set(
+    directory: Path,
+    *,
+    trust: dict[str, str],
+    destructive_status: str = "not_run",
+) -> None:
+    _write_complete_report_set(directory, trust=trust)
+    functional = _valid_functional_disaster_recovery_report(directory)
+    atomic_write_json(directory / FUNCTIONAL_DR_REPORT[0], functional)
+    atomic_write_json(
+        directory / REPORTS["disaster_recovery"][0],
+        {
+            "schema_version": 1,
+            "production_gate": destructive_status,
+            "production_rejection_reasons": ["destructive production DR was not requested"],
+        },
+    )
+    manifest = build_manifest(
+        directory,
+        reports=_functional_dr_manifest_reports(),
+        release_id="test-release-bundle",
+        release_nonce="r" * 32,
+        image_digest="sha256:" + "a" * 64,
+        allow_functional_dr=True,
+        authorized_not_run_gates=("disaster_recovery",),
+    )
+    atomic_write_json(directory / "release-manifest.json", manifest)
+
+
+def test_explicit_functional_dr_waiver_allows_only_destructive_not_run(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--allow-functional-dr",
+            "--require-production",
+        ],
+    )
+
+    assert main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate"]["functional_disaster_recovery"] == "pass"
+    assert result["candidate"]["disaster_recovery"] == "not_run"
+    assert result["candidate"]["online_im"] == "pass"
+    assert result["authorized_not_run_gates"] == ["disaster_recovery"]
+    assert result["case_deltas"]["not_run_gates"] == 0
+    assert result["runtime_production_gate"] == "pass"
+    assert result["gate"] == "pass"
+
+
+def test_explicit_functional_dr_waiver_never_hides_destructive_failure(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(
+        tmp_path,
+        trust=trust,
+        destructive_status="fail",
+    )
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--allow-functional-dr",
+            "--require-production",
+        ],
+    )
+
+    assert main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate"]["disaster_recovery"] == "fail"
+    assert result["authorized_not_run_gates"] == []
+    assert result["runtime_production_gate"] == "fail"
+    assert result["gate"] == "fail"
+
+
+def test_functional_dr_does_not_waive_destructive_not_run_without_explicit_flag(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--require-production",
+        ],
+    )
+
+    assert main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert "functional_disaster_recovery" not in result["candidate"]
+    assert result["candidate"]["disaster_recovery"] == "not_run"
+    assert result["authorized_not_run_gates"] == []
+    assert result["gate"] != "pass"
+
+
+def test_explicit_functional_dr_waiver_treats_destructive_gate_failure_as_failure(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    atomic_write_json(
+        tmp_path / REPORTS["disaster_recovery"][0],
+        {
+            "schema_version": 1,
+            "gate": "fail",
+            "production_gate": "not_run",
+            "production_rejection_reasons": ["destructive production DR failed"],
+        },
+    )
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--allow-functional-dr",
+            "--require-production",
+        ],
+    )
+
+    assert main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate"]["disaster_recovery"] == "fail"
+    assert result["authorized_not_run_gates"] == []
+    assert result["runtime_production_gate"] == "fail"
+
+
+def test_explicit_functional_dr_waiver_does_not_reclassify_invalid_destructive_pass(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    atomic_write_json(
+        tmp_path / REPORTS["disaster_recovery"][0],
+        {"schema_version": 1, "gate": "pass", "production_gate": "pass"},
+    )
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--allow-functional-dr",
+            "--require-production",
+        ],
+    )
+
+    assert main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate"]["disaster_recovery"] == "not_run"
+    assert result["authorized_not_run_gates"] == []
+    assert result["gate"] != "pass"
+
+
+@pytest.mark.parametrize(
+    "mutation", ("missing", "component", "cleanup", "producer", "lineage", "runtime")
+)
+def test_explicit_functional_dr_waiver_requires_valid_current_functional_evidence(
+    tmp_path, monkeypatch, mutation: str
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    path = tmp_path / FUNCTIONAL_DR_REPORT[0]
+    if mutation == "missing":
+        path.unlink()
+    else:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if mutation == "component":
+            report["candidate"]["components"]["postgres_pitr"]["status"] = "fail"
+        elif mutation == "cleanup":
+            report["candidate"]["orchestration"]["cleanup_completed"] = False
+        elif mutation == "producer":
+            report["evidence"]["producer"] = "scripts.disaster_recovery_gate"
+        elif mutation == "runtime":
+            report["candidate"]["runtime_attestation"]["jobs"][0]["job_uid_sha256"] = "0" * 64
+        else:
+            report["candidate"]["lineage"]["image_digest"] = "sha256:" + "b" * 64
+        atomic_write_json(path, report)
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--allow-functional-dr",
+            "--require-production",
+        ],
+    )
+
+    assert main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate"]["functional_disaster_recovery"] != "pass"
+    assert result["authorized_not_run_gates"] == []
+    assert result["gate"] != "pass"
+
+
+def test_explicit_functional_dr_waiver_does_not_exempt_online_im(tmp_path, monkeypatch) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    atomic_write_json(
+        tmp_path / REPORTS["online_im"][0],
+        {
+            "schema_version": 1,
+            "production_gate": "not_run",
+            "production_rejection_reasons": ["online IM was not run"],
+        },
+    )
+    output = tmp_path / "release-gate.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "release_gate.py",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--allow-functional-dr",
+            "--require-production",
+        ],
+    )
+
+    assert main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate"]["online_im"] == "not_run"
+    assert result["authorized_not_run_gates"] == ["disaster_recovery"]
+    assert result["runtime_production_gate"] != "pass"
+    assert result["gate"] != "pass"
+
+
+@pytest.mark.parametrize("policy_mutation", ("missing", "authorized_gates"))
+def test_functional_dr_manifest_policy_is_required_and_tamper_evident(
+    tmp_path, monkeypatch, policy_mutation: str
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    contract = _functional_dr_manifest_contract()
+
+    assert validate_manifest(
+        tmp_path,
+        reports=contract,
+        current_source=_current_candidate_source_fingerprint(),
+        allow_functional_dr=True,
+        authorized_not_run_gates=("disaster_recovery",),
+    ) == ("pass", [])
+
+    manifest_path = tmp_path / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "functional_disaster_recovery" in manifest["reports"]
+    assert "disaster_recovery" not in manifest["reports"]
+    assert manifest["policy"]["authorized_not_run_gates"] == ["disaster_recovery"]
+    if policy_mutation == "missing":
+        manifest.pop("policy")
+    else:
+        manifest["policy"]["authorized_not_run_gates"] = []
+    atomic_write_json(manifest_path, manifest)
+    status, reasons = validate_manifest(
+        tmp_path,
+        reports=contract,
+        current_source=_current_candidate_source_fingerprint(),
+        allow_functional_dr=True,
+        authorized_not_run_gates=("disaster_recovery",),
+    )
+
+    assert status == "fail"
+    assert any("functional DR policy" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "component", "cleanup", "producer", "lineage"))
+def test_functional_dr_manifest_generation_rejects_invalid_functional_evidence(
+    tmp_path, monkeypatch, mutation: str
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    path = tmp_path / FUNCTIONAL_DR_REPORT[0]
+    if mutation == "missing":
+        path.unlink()
+    else:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if mutation == "component":
+            report["candidate"]["components"]["key_restore"]["status"] = "fail"
+        elif mutation == "cleanup":
+            report["candidate"]["orchestration"]["cleanup_completed"] = False
+        elif mutation == "producer":
+            report["evidence"]["producer"] = "scripts.disaster_recovery_gate"
+        else:
+            report["candidate"]["lineage"]["image_digest"] = "sha256:" + "b" * 64
+        atomic_write_json(path, report)
+
+    with pytest.raises(ValueError):
+        build_manifest(
+            tmp_path,
+            reports=_functional_dr_manifest_reports(),
+            release_id="test-release-bundle",
+            release_nonce="r" * 32,
+            image_digest="sha256:" + "a" * 64,
+            allow_functional_dr=True,
+            authorized_not_run_gates=("disaster_recovery",),
+        )
+
+
+def test_functional_dr_manifest_validation_rechecks_semantics_even_if_hash_is_rewritten(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_functional_dr_waiver_report_set(tmp_path, trust=trust)
+    report_path = tmp_path / FUNCTIONAL_DR_REPORT[0]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["candidate"]["components"]["artifact_restore"]["status"] = "fail"
+    atomic_write_json(report_path, report)
+    manifest_path = tmp_path / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["reports"]["functional_disaster_recovery"]["sha256"] = canonical_sha256(report)
+    atomic_write_json(manifest_path, manifest)
+
+    status, reasons = validate_manifest(
+        tmp_path,
+        reports=_functional_dr_manifest_contract(),
+        current_source=_current_candidate_source_fingerprint(),
+        allow_functional_dr=True,
+        authorized_not_run_gates=("disaster_recovery",),
+    )
+
+    assert status == "fail"
+    assert any(
+        "functional disaster recovery component artifact_restore" in reason for reason in reasons
+    )
+
+
+def test_release_manifest_generation_rejects_nonpassing_standard_production_report(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_complete_report_set(tmp_path, trust=trust)
+    report_path = tmp_path / REPORTS["online_im"][0]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["gate"] = "fail"
+    report["rejection_reasons"] = ["online IM failed"]
+    atomic_write_json(report_path, report)
+    production_reports = {
+        name: filename for name, (filename, production) in REPORTS.items() if production
+    }
+
+    with pytest.raises(ValueError, match=r"im-online\.json is not production-valid"):
+        build_manifest(
+            tmp_path,
+            reports=production_reports,
+            release_id="test-release-bundle",
+            release_nonce="r" * 32,
+            image_digest="sha256:" + "a" * 64,
+        )
+
+
+def test_release_manifest_validation_rechecks_standard_production_status(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_complete_report_set(tmp_path, trust=trust)
+    report_path = tmp_path / REPORTS["online_im"][0]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["production_gate"] = "not_run"
+    report["production_rejection_reasons"] = ["online IM was not run"]
+    atomic_write_json(report_path, report)
+    manifest_path = tmp_path / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["reports"]["online_im"]["sha256"] = canonical_sha256(report)
+    atomic_write_json(manifest_path, manifest)
+    contract = {
+        name: (filename, PRODUCTION_EVIDENCE_PRODUCERS[filename])
+        for name, (filename, production) in REPORTS.items()
+        if production
+    }
+
+    status, reasons = validate_manifest(
+        tmp_path,
+        reports=contract,
+        current_source=_current_candidate_source_fingerprint(),
+    )
+
+    assert status == "fail"
+    assert any("production_gate must be pass" in reason for reason in reasons)
+
+
+def test_release_manifest_binding_must_match_candidate_lock(tmp_path, monkeypatch) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_complete_report_set(tmp_path, trust=trust)
+    lock_path = tmp_path / "candidate-lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["release_binding"] = {
+        "release_id": "different-release",
+        "nonce_sha256": "9" * 64,
+    }
+    atomic_write_json(lock_path, lock)
+    contract = {
+        name: (filename, PRODUCTION_EVIDENCE_PRODUCERS[filename])
+        for name, (filename, production) in REPORTS.items()
+        if production
+    }
+    production_reports = {
+        name: filename for name, (filename, production) in REPORTS.items() if production
+    }
+
+    with pytest.raises(ValueError, match="candidate lock does not match registry binding"):
+        build_manifest(
+            tmp_path,
+            reports=production_reports,
+            release_id="test-release-bundle",
+            release_nonce="r" * 32,
+            image_digest="sha256:" + "a" * 64,
+        )
+
+    status, reasons = validate_manifest(
+        tmp_path,
+        reports=contract,
+        current_source=_current_candidate_source_fingerprint(),
+    )
+
+    assert status == "fail"
+    assert any("candidate lock is invalid" in reason for reason in reasons)
+
+
+def test_release_manifest_rejects_registry_binding_changed_after_lock(
+    tmp_path, monkeypatch
+) -> None:
+    trust = _install_release_probe_trust(tmp_path, monkeypatch)
+    _write_complete_report_set(tmp_path, trust=trust)
+    binding_path = tmp_path / "registry-image-binding.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["repository"] = "registry.example/tampered/trpc-agent-service"
+    atomic_write_json(binding_path, binding)
+    contract = {
+        name: (filename, PRODUCTION_EVIDENCE_PRODUCERS[filename])
+        for name, (filename, production) in REPORTS.items()
+        if production
+    }
+    production_reports = {
+        name: filename for name, (filename, production) in REPORTS.items() if production
+    }
+
+    with pytest.raises(ValueError, match="candidate lock does not match registry binding"):
+        build_manifest(
+            tmp_path,
+            reports=production_reports,
+            release_id="test-release-bundle",
+            release_nonce="r" * 32,
+            image_digest="sha256:" + "a" * 64,
+        )
+
+    status, reasons = validate_manifest(
+        tmp_path,
+        reports=contract,
+        current_source=_current_candidate_source_fingerprint(),
+    )
+
+    assert status == "fail"
+    assert any("candidate lock is invalid" in reason for reason in reasons)
 
 
 def test_missing_development_evidence_blocks_overall_gate(tmp_path, monkeypatch) -> None:
@@ -3338,10 +4801,7 @@ def test_release_gate_rejects_runtime_without_database_role_evidence(tmp_path) -
 
     assert _status(report, production_field=True) == (
         "not_run",
-        [
-            "real runtime evidence is missing or invalid "
-            "candidate.database_role_evidence is missing"
-        ],
+        ["real runtime evidence is missing or invalid candidate.database_role_evidence is missing"],
     )
 
 

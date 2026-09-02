@@ -14,7 +14,7 @@ from typing import Any, cast
 
 from trpc_service.channels.base import InboundSink
 from trpc_service.channels.envelopes import InboundEnvelope
-from trpc_service.channels.wecom import WeComConnector
+from trpc_service.channels.wecom import WeComBindingLeaseUnavailable, WeComConnector
 from trpc_service.storage.models import BindingRoute
 from trpc_service.storage.protocols import RuntimeRepository
 from trpc_service.tenant.models import Channel, ChannelBinding
@@ -32,10 +32,13 @@ class WeComConnectionManager:
         sink: InboundSink,
         emergency_sink: EmergencyPreparedSink | None = None,
         reconnect_jitter_ratio: float = 0.2,
+        standby_retry_seconds: float = 0.5,
         random_fn: Callable[[], float] = random.random,
     ) -> None:
         if not 0 <= reconnect_jitter_ratio <= 1:
             raise ValueError("reconnect_jitter_ratio must be between zero and one")
+        if standby_retry_seconds <= 0:
+            raise ValueError("standby retry seconds must be positive")
         self._repository = repository
         self._connector = connector
         self._sink = sink
@@ -49,6 +52,7 @@ class WeComConnectionManager:
         self._routes: dict[str, BindingRoute] = {}
         self._stop_event = asyncio.Event()
         self._reconnect_jitter_ratio = reconnect_jitter_ratio
+        self._standby_retry_seconds = standby_retry_seconds
         self._random = random_fn
 
     async def reconcile_once(self) -> None:
@@ -116,6 +120,17 @@ class WeComConnectionManager:
                     await runner(binding, self._sink)
             except asyncio.CancelledError:
                 raise
+            except WeComBindingLeaseUnavailable:
+                # A held binding lease means this replica is a healthy standby,
+                # not a degraded connector.  Keep takeover polling short and
+                # bounded; exponential backoff here used to leave the binding
+                # without an authenticated WebSocket for up to 30 seconds after
+                # the active replica died.
+                delay = 0.5
+                await _wait_or_stop(
+                    self._stop_event,
+                    self._backoff_delay(self._standby_retry_seconds),
+                )
             except Exception as error:
                 logger.warning(
                     "WeCom connector degraded",

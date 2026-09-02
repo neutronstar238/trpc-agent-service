@@ -5,7 +5,7 @@ import json
 import re
 from typing import Annotated, Any
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -82,6 +82,28 @@ class RollbackRequest(RequestModel):
 
 class ReplayRequest(RequestModel):
     confirm_ambiguous: bool = False
+
+
+class IMAcceptanceEventRequest(RequestModel):
+    channel: Channel
+    run_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$",
+    )
+    run_nonce: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+    provider_event_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class IMAcceptanceRunRequest(RequestModel):
+    channel: Channel
+    run_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$",
+    )
+    run_nonce: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+    expires_in_seconds: int = Field(default=300, ge=30, le=900)
 
 
 def create_admin_router(
@@ -257,6 +279,114 @@ def create_admin_router(
     ) -> list[dict[str, Any]]:
         require_role(actor, Role.AUDITOR, tenant_id=tenant_id)
         return await repository.dead_letters(tenant_id, limit=limit)
+
+    @router.get("/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/wecom")
+    async def wecom_acceptance_snapshot(
+        tenant_id: str,
+        binding_id: str,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ) -> dict[str, Any]:
+        role = Role.AUDITOR if Role.AUDITOR in actor.roles else Role.TENANT_ADMIN
+        require_role(actor, role, tenant_id=tenant_id)
+        result = await repository.wecom_acceptance_snapshot(tenant_id, binding_id, limit=limit)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="resource not found",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.get("/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/evidence")
+    async def im_acceptance_evidence(
+        tenant_id: str,
+        binding_id: str,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+        run_id: Annotated[
+            str,
+            Query(
+                min_length=1,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$",
+            ),
+        ],
+        outbound_id: Annotated[UUID, Query()],
+    ) -> dict[str, Any]:
+        role = Role.AUDITOR if Role.AUDITOR in actor.roles else Role.TENANT_ADMIN
+        require_role(actor, role, tenant_id=tenant_id)
+        result = await repository.im_acceptance_outbound_evidence(
+            tenant_id,
+            binding_id,
+            run_id=run_id,
+            outbound_id=outbound_id,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="resource not found",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.post(
+        "/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/runs",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def register_im_acceptance_run(
+        tenant_id: str,
+        binding_id: str,
+        body: IMAcceptanceRunRequest,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+    ) -> dict[str, Any]:
+        require_role(actor, Role.TENANT_ADMIN, tenant_id=tenant_id)
+        result = await repository.register_im_acceptance_run(
+            tenant_id,
+            binding_id,
+            channel=body.channel,
+            run_id=body.run_id,
+            run_nonce=body.run_nonce,
+            expires_in_seconds=body.expires_in_seconds,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=409,
+                detail="acceptance run is unavailable",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.post("/tenants/{tenant_id}/bindings/{binding_id}/im-acceptance/event-evidence")
+    async def im_acceptance_event_evidence(
+        tenant_id: str,
+        binding_id: str,
+        body: IMAcceptanceEventRequest,
+        response: Response,
+        actor: Annotated[Principal, Depends(principal)],
+    ) -> dict[str, Any]:
+        require_role(actor, Role.TENANT_ADMIN, tenant_id=tenant_id)
+        result = await repository.im_acceptance_event_evidence(
+            tenant_id,
+            binding_id,
+            channel=body.channel,
+            run_id=body.run_id,
+            run_nonce=body.run_nonce,
+            provider_event_hash=body.provider_event_hash,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="resource not found",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return result
 
     @router.post("/tenants/{tenant_id}/outbound/{outbound_id}:replay", status_code=202)
     async def replay_outbound(

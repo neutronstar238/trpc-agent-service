@@ -24,6 +24,13 @@ from scripts.real_performance_gate import (
     DEFAULT_WARMUP_STEPS,
     FINGERPRINT_MAX_FILES,
     IMAGE_SOURCE_FINGERPRINT_LABEL,
+    KUBERNETES_GATEWAY_SERVICE,
+    KUBERNETES_HTTP_WARMUP_REQUESTS,
+    KUBERNETES_METRICS_API,
+    KUBERNETES_OUTBOX_SELECTOR,
+    KUBERNETES_SERVICE_CONFIGMAP,
+    KUBERNETES_WORKER_CONCURRENCY_KEY,
+    KUBERNETES_WORKER_SELECTOR,
     MAX_BURST_TURNS,
     MAX_CALLBACK_RATE,
     MAX_CALLBACKS,
@@ -36,7 +43,17 @@ from scripts.real_performance_gate import (
     _actual_start_rate,
     _batch_state,
     _compose_worker_processes,
+    _gateway_metadata,
     _hard_process_timeout,
+    _kubernetes_configuration,
+    _kubernetes_image_attestation,
+    _kubernetes_image_digest,
+    _kubernetes_metrics_memory_observation,
+    _kubernetes_pod_records,
+    _kubernetes_preflight,
+    _kubernetes_quantity_bytes,
+    _kubernetes_worker_concurrency,
+    _load_kubernetes_preflight_evidence,
     _load_worker_command,
     _load_worker_parent_pid,
     _lookup_authoritative_inbound_batch,
@@ -67,6 +84,7 @@ from scripts.real_performance_gate import (
     _watch_parent_process,
     _worker_image_attestation,
     _write_report,
+    build_kubernetes_preflight_evidence,
     main,
 )
 from trpc_service.config.settings import SchedulerVersion
@@ -97,10 +115,93 @@ def _passed_http_phase() -> dict[str, object]:
         "accepted": 200,
         "errors": 0,
         "ack_p95_ms": 50.0,
+        "warmup_requested": KUBERNETES_HTTP_WARMUP_REQUESTS,
+        "warmup_expected_requests": KUBERNETES_HTTP_WARMUP_REQUESTS,
+        "warmup_accepted": KUBERNETES_HTTP_WARMUP_REQUESTS,
+        "warmup_failed": 0,
+        "p90_latency_ms": 45.0,
+        "p99_latency_ms": 75.0,
+        "over_threshold_count": 0,
+        "latency_histogram": {"0-10": 180, "10-200": 20},
         "actual_submission_start_rate_per_second": 100.0,
         "accepted_external_message_id_count": 200,
         "gateway": {"host_class": "loopback", "scheme": "http", "port": 18080},
         "authoritative_lookup": {"status": "pass"},
+    }
+
+
+def _kubernetes_pod_payload(
+    *,
+    role: str,
+    name: str,
+    image_digest: str,
+    source_fingerprint: str | None = None,
+    memory_limit: str = "1Gi",
+) -> dict[str, object]:
+    labels = {"app.kubernetes.io/component": role}
+    if source_fingerprint is not None:
+        labels[IMAGE_SOURCE_FINGERPRINT_LABEL] = source_fingerprint
+    return {
+        "items": [
+            {
+                "metadata": {"name": name, "uid": f"uid-{name}", "labels": labels},
+                "spec": {
+                    "nodeName": "acceptance-node",
+                    "containers": [
+                        {
+                            "name": role,
+                            "resources": {"limits": {"memory": memory_limit}},
+                        }
+                    ],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [
+                        {
+                            "name": role,
+                            "ready": True,
+                            "state": {"running": {"startedAt": "2026-08-26T00:00:00Z"}},
+                            "containerID": f"containerd://{name}",
+                            "imageID": f"docker-pullable://registry.example/trpc@{image_digest}",
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def _parent_attested_preflight(source: str, image: str) -> dict[str, object]:
+    return {
+        "status": "pass",
+        "worker_count": 4,
+        "worker_concurrency": 50,
+        "source_fingerprint": {"status": "available", "value": source},
+        "worker_image_attestation": {
+            "status": "pass",
+            "worker_count": 4,
+            "image_count": 1,
+            "image_id": image,
+            "source_fingerprint": source,
+            "source_fingerprint_matches": True,
+        },
+        "service_image_attestation": {
+            "worker": {
+                "status": "pass",
+                "image_id": image,
+                "source_fingerprint": source,
+            },
+            "outbox-dispatcher": {
+                "status": "pass",
+                "image_id": image,
+                "source_fingerprint": source,
+            },
+        },
+        "kubernetes": {
+            "namespace": "acceptance",
+            "context": "ack-context",
+            "namespace_bound": True,
+        },
     }
 
 
@@ -146,6 +247,149 @@ def test_performance_gate_allows_explicit_legacy_v1_transport() -> None:
     assert _scheduler_transport(args) == (SchedulerVersion.V1, V1_STREAM, V1_GROUP)
 
 
+def test_kubernetes_configuration_requires_explicit_namespace_and_context() -> None:
+    with pytest.raises(ValueError, match="namespace"):
+        _kubernetes_configuration(SimpleNamespace())
+
+    with pytest.raises(ValueError, match="context"):
+        _kubernetes_configuration(
+            SimpleNamespace(kubernetes_namespace="acceptance", kubernetes_context="")
+        )
+
+
+def test_kubernetes_configuration_validates_candidate_bindings() -> None:
+    source = "a" * 64
+    image = "sha256:" + "b" * 64
+    config = _kubernetes_configuration(
+        SimpleNamespace(
+            kubernetes_namespace="acceptance",
+            kubernetes_context="ack-context",
+            kubernetes_kubeconfig="C:/Users/test/.kube/config",
+            kubernetes_source_fingerprint=source,
+            kubernetes_image_digest=image,
+            kubernetes_memory_limit_bytes=1024,
+        )
+    )
+
+    assert config == {
+        "namespace": "acceptance",
+        "context": "ack-context",
+        "kubeconfig": "C:/Users/test/.kube/config",
+        "expected_image_digest": image,
+        "expected_source_fingerprint": source,
+        "memory_limit_bytes": 1024,
+    }
+
+    with pytest.raises(ValueError, match="image"):
+        _kubernetes_configuration(
+            SimpleNamespace(
+                kubernetes_namespace="acceptance",
+                kubernetes_context="ack-context",
+                kubernetes_image_digest="latest",
+            )
+        )
+
+
+def test_kubernetes_worker_concurrency_reads_the_bound_configmap(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_json(arguments, _configuration):
+        calls.append(list(arguments))
+        return {"data": {KUBERNETES_WORKER_CONCURRENCY_KEY: "50"}}, None
+
+    monkeypatch.setattr("scripts.real_performance_gate._kubernetes_json", fake_json)
+    observed, error = _kubernetes_worker_concurrency(
+        {"namespace": "acceptance", "context": "ack-context"}
+    )
+
+    assert observed == 50
+    assert error is None
+    assert calls == [
+        [
+            "get",
+            f"configmap/{KUBERNETES_SERVICE_CONFIGMAP}",
+            "--namespace",
+            "acceptance",
+            "--output",
+            "json",
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"data": {}},
+        {"data": {KUBERNETES_WORKER_CONCURRENCY_KEY: "49"}},
+        {"data": {KUBERNETES_WORKER_CONCURRENCY_KEY: "50 "}},
+    ),
+)
+def test_kubernetes_worker_concurrency_rejects_missing_or_wrong_configmap_value(
+    monkeypatch, payload
+) -> None:
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._kubernetes_json",
+        lambda _arguments, _configuration: (payload, None),
+    )
+
+    observed, error = _kubernetes_worker_concurrency(
+        {"namespace": "acceptance", "context": "ack-context"}
+    )
+
+    assert error is not None
+    assert "must equal exactly 50" in error
+    assert observed in {None, 49, 50}
+
+
+@pytest.mark.parametrize("worker_count", (3, 5))
+def test_kubernetes_preflight_requires_exactly_four_ready_workers(
+    monkeypatch, worker_count: int
+) -> None:
+    workers = tuple({"role": "worker"} for _ in range(worker_count))
+    outbox = ({"role": "outbox-dispatcher"},)
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._kubernetes_worker_concurrency",
+        lambda _configuration: (50, None),
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._kubernetes_pod_records",
+        lambda _configuration, *, role, selector: (
+            (workers, None) if role == "worker" else (outbox, None)
+        ),
+    )
+    args = SimpleNamespace(
+        kubernetes_namespace="acceptance",
+        kubernetes_context="ack-context",
+        kubernetes_kubeconfig=None,
+        kubernetes_source_fingerprint=None,
+        kubernetes_image_digest=None,
+        kubernetes_memory_limit_bytes=None,
+    )
+
+    result = _kubernetes_preflight(args, min_workers=4)
+
+    assert result["status"] == "not_run"
+    assert result["worker_count"] == worker_count
+    assert result["worker_concurrency"] == 50
+    assert "exactly 4" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("sha256:" + "a" * 64, "sha256:" + "a" * 64),
+        ("docker-pullable://repo/image@sha256:" + "b" * 64, "sha256:" + "b" * 64),
+        ("containerd://sha256:" + "c" * 64, "sha256:" + "c" * 64),
+        ("repo/image:latest", None),
+        ("sha256:bad", None),
+    ],
+)
+def test_kubernetes_image_digest_only_accepts_immutable_cri_ids(
+    value: str, expected: str | None
+) -> None:
+    assert _kubernetes_image_digest(value) == expected
+
+
 @pytest.mark.parametrize(
     "argv",
     (
@@ -176,6 +420,39 @@ def test_load_worker_command_propagates_the_resolved_scheduler_transport(tmp_pat
     assert command[command.index("--scheduler-version") + 1] == "v2"
     assert command[command.index("--redis-stream") + 1] == DEFAULT_STREAM
     assert command[command.index("--redis-group") + 1] == DEFAULT_GROUP
+
+
+def test_load_worker_command_forwards_explicit_kubernetes_configuration(tmp_path) -> None:
+    args = _parser().parse_args(
+        [
+            "--kubernetes",
+            "--kubernetes-namespace",
+            "acceptance",
+            "--kubernetes-context",
+            "ack-context",
+            "--kubernetes-kubeconfig",
+            "C:/Users/test/.kube/config",
+            "--kubernetes-image-digest",
+            "sha256:" + "b" * 64,
+            "--kubernetes-source-fingerprint",
+            "a" * 64,
+            "--kubernetes-memory-limit-bytes",
+            "4096",
+        ]
+    )
+
+    command = _load_worker_command(args, tmp_path / "child.json")
+
+    assert "--kubernetes" in command
+    for option, expected in (
+        ("--kubernetes-namespace", "acceptance"),
+        ("--kubernetes-context", "ack-context"),
+        ("--kubernetes-kubeconfig", "C:/Users/test/.kube/config"),
+        ("--kubernetes-image-digest", "sha256:" + "b" * 64),
+        ("--kubernetes-source-fingerprint", "a" * 64),
+        ("--kubernetes-memory-limit-bytes", "4096"),
+    ):
+        assert command[command.index(option) + 1] == expected
 
 
 def test_default_report_may_collect_git_evidence_but_never_starts_load_worker(
@@ -341,8 +618,7 @@ def test_live_performance_entry_requires_current_release_binding(tmp_path, monke
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["gate"] == "not_run"
     assert any(
-        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason
-        for reason in report["rejection_reasons"]
+        "TRPC_RELEASE_ID and TRPC_RELEASE_NONCE" in reason for reason in report["rejection_reasons"]
     )
 
 
@@ -453,6 +729,83 @@ def test_phase_gate_rejects_http_phase_without_authoritative_lookup() -> None:
     assert _phase_gate(phase, completion, required_p95_ms=200.0)["status"] == "fail"
 
 
+def test_phase_gate_rejects_incomplete_http_warmup() -> None:
+    phase = {
+        "mode": "synthetic_encrypted_feishu_http",
+        "requested": 1,
+        "accepted": 1,
+        "errors": 0,
+        "ack_p95_ms": 10.0,
+        "warmup_requested": 16,
+        "warmup_expected_requests": 16,
+        "warmup_accepted": 15,
+        "warmup_failed": 1,
+        "authoritative_lookup": {"status": "pass"},
+    }
+    completion = {
+        "status": "pass",
+        "state": {
+            "inbound_statuses": {"committed": 1},
+            "turn_statuses": {"committed": 1},
+        },
+    }
+
+    result = _phase_gate(phase, completion, required_p95_ms=200.0)
+
+    assert result["status"] == "fail"
+    assert result["http_warmup_passed"] is False
+
+
+def test_phase_gate_rejects_http_warmup_count_mismatch_even_if_helper_reports_success() -> None:
+    phase = {
+        "mode": "synthetic_encrypted_feishu_http",
+        "requested": 1,
+        "accepted": 1,
+        "errors": 0,
+        "ack_p95_ms": 10.0,
+        "warmup_expected_requests": 16,
+        "warmup_requested": 0,
+        "warmup_accepted": 0,
+        "warmup_failed": 0,
+        "authoritative_lookup": {"status": "pass"},
+    }
+    completion = {
+        "status": "pass",
+        "state": {
+            "inbound_statuses": {"committed": 1},
+            "turn_statuses": {"committed": 1},
+        },
+    }
+
+    result = _phase_gate(phase, completion, required_p95_ms=200.0)
+
+    assert result["status"] == "fail"
+    assert result["http_warmup_passed"] is False
+
+
+def test_phase_gate_keeps_legacy_zero_http_warmup_compatibility() -> None:
+    phase = {
+        "mode": "synthetic_encrypted_feishu_http",
+        "requested": 1,
+        "accepted": 1,
+        "errors": 0,
+        "ack_p95_ms": 10.0,
+        "authoritative_lookup": {"status": "pass"},
+    }
+    completion = {
+        "status": "pass",
+        "state": {
+            "inbound_statuses": {"committed": 1},
+            "turn_statuses": {"committed": 1},
+        },
+    }
+
+    result = _phase_gate(phase, completion, required_p95_ms=200.0)
+
+    assert result["status"] == "pass"
+    assert result["http_warmup_passed"] is True
+
+
 def test_phase_gate_rejects_v2_when_mailbox_is_not_settled() -> None:
     phase = {
         "requested": 1,
@@ -527,6 +880,75 @@ def test_loopback_gateway_metadata_rejects_external_or_credentialed_urls() -> No
     ):
         with pytest.raises(ValueError):
             _loopback_gateway_metadata(value)
+
+
+def test_kubernetes_gateway_metadata_is_bound_to_the_attested_service() -> None:
+    metadata = _gateway_metadata(
+        "http://trpc-gateway.acceptance.svc.cluster.local:8080/base",
+        allow_kubernetes_service=True,
+        kubernetes_namespace="acceptance",
+    )
+
+    assert metadata == {
+        "scheme": "http",
+        "host_class": "kubernetes_service",
+        "service_name": KUBERNETES_GATEWAY_SERVICE,
+        "namespace": "acceptance",
+        "port": 8080,
+        "path_present": True,
+    }
+    with pytest.raises(ValueError, match="attested gateway Service"):
+        _gateway_metadata(
+            "http://untrusted.acceptance.svc.cluster.local:8080",
+            allow_kubernetes_service=True,
+            kubernetes_namespace="acceptance",
+        )
+    with pytest.raises(ValueError, match="attested gateway Service"):
+        _gateway_metadata(
+            "http://trpc-gateway.other.svc.cluster.local:8080",
+            allow_kubernetes_service=True,
+            kubernetes_namespace="acceptance",
+        )
+
+
+def test_kubernetes_load_worker_accepts_only_parent_signed_preflight(tmp_path, monkeypatch) -> None:
+    source = "a" * 64
+    image = "sha256:" + "b" * 64
+    token = "load-worker-token"
+    run_id = "real-performance-run-1"
+    preflight = _parent_attested_preflight(source, image)
+    envelope = build_kubernetes_preflight_evidence(
+        preflight,
+        run_id=run_id,
+        run_token=token,
+        source_fingerprint=source,
+        image_digest=image,
+    )
+    evidence_path = tmp_path / "preflight.json"
+    evidence_path.write_text(json.dumps(envelope), encoding="utf-8")
+    monkeypatch.setenv("TRPC_REAL_PERFORMANCE_WORKER_TOKEN", token)
+    monkeypatch.setenv("TRPC_REAL_RUN_ID", run_id)
+    args = SimpleNamespace(
+        kubernetes=True,
+        kubernetes_preflight_evidence=str(evidence_path),
+        kubernetes_namespace="acceptance",
+        kubernetes_context="ack-context",
+        kubernetes_kubeconfig=None,
+        kubernetes_source_fingerprint=source,
+        kubernetes_image_digest=image,
+        kubernetes_memory_limit_bytes=None,
+    )
+
+    result = _load_kubernetes_preflight_evidence(args)
+
+    assert result["status"] == "pass"
+    assert result["kubernetes"]["preflight_evidence"]["status"] == "parent_attested"  # type: ignore[index]
+    assert result["kubernetes"]["preflight_evidence"]["run_id"] == run_id  # type: ignore[index]
+
+    envelope["signature"] = "0" * 64
+    evidence_path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(ValueError, match="signature"):
+        _load_kubernetes_preflight_evidence(args)
 
 
 def test_session_hmac_key_decoding_matches_service_base64url_contract() -> None:
@@ -616,8 +1038,10 @@ def test_authoritative_inbound_lookup_fails_closed_for_missing_or_duplicate_rows
 def test_feishu_http_batch_uses_mocked_helper_and_authoritative_rows(monkeypatch) -> None:
     seen: dict[str, object] = {}
 
-    async def fake_http(options):
+    async def fake_http(options, *, warmup_requests, latency_threshold_ms):
         seen["options"] = options
+        seen["warmup_requests"] = warmup_requests
+        seen["latency_threshold_ms"] = latency_threshold_ms
         return SimpleNamespace(
             requested=2,
             accepted=2,
@@ -628,6 +1052,13 @@ def test_feishu_http_batch_uses_mocked_helper_and_authoritative_rows(monkeypatch
             p50_latency_ms=3.0,
             p95_latency_ms=5.0,
             max_latency_ms=7.0,
+            warmup_requested=16,
+            warmup_accepted=16,
+            warmup_failed=0,
+            p90_latency_ms=4.0,
+            p99_latency_ms=6.0,
+            over_threshold_count=0,
+            latency_histogram={"0-10": 2},
             offered_rate_per_second=100.0,
             observed_rate_per_second=200.0,
             submission_span_seconds=0.01,
@@ -672,16 +1103,28 @@ def test_feishu_http_batch_uses_mocked_helper_and_authoritative_rows(monkeypatch
             offered_rate=100.0,
             max_inflight=2,
             timeout_seconds=10.0,
+            warmup_requests=16,
         )
     )
 
     assert result["mode"] == "synthetic_encrypted_feishu_http"
     assert result["accepted_inbound_ids"] == ("inbound-1", "inbound-2")
     assert result["authoritative_lookup"]["status"] == "pass"
+    assert result["warmup_requested"] == 16
+    assert result["warmup_expected_requests"] == 16
+    assert result["warmup_accepted"] == 16
+    assert result["warmup_failed"] == 0
+    assert result["http_warmup_passed"] is True
+    assert result["p90_latency_ms"] == 4.0
+    assert result["p99_latency_ms"] == 6.0
+    assert result["over_threshold_count"] == 0
+    assert result["latency_histogram"] == {"0-10": 2}
     options = seen["options"]
     assert options.base_url == "http://127.0.0.1:18080"
     assert options.binding_id == "binding-1"
     assert options.app_id == "account-1"
+    assert seen["warmup_requests"] == 16
+    assert seen["latency_threshold_ms"] == 200.0
 
 
 def test_production_gate_requires_locked_load_target_after_workload_passes() -> None:
@@ -707,6 +1150,30 @@ def test_production_gate_requires_locked_load_target_after_workload_passes() -> 
     }
 
     assert _production_gate_status(target, True, **evidence) == "pass"
+
+
+def test_production_gate_fails_when_sustained_http_warmup_is_incomplete() -> None:
+    args = SimpleNamespace(callbacks=200, callback_rate=100.0, burst_turns=200)
+    phase = _passed_http_phase()
+    phase["warmup_accepted"] = KUBERNETES_HTTP_WARMUP_REQUESTS - 1
+    phase["warmup_failed"] = 1
+    evidence = {
+        "actual_submission_start_rate_per_second": 100.0,
+        "burst_actual_submission_start_rate_per_second": 100.0,
+        "max_turn_overlap_observed": 200,
+        "burst_session_ids": [f"session-{index}" for index in range(200)],
+        "burst_accepted": 200,
+        "accepted_inbound_ids": [f"inbound-{index}" for index in range(400)],
+        "baseline_redis_pending": 0,
+        "final_redis_pending": 0,
+        "worker_image_attestation": _passed_image_attestation(),
+        "sustained_http_phase": phase,
+    }
+
+    assert _production_gate_status(args, True, **evidence) == "fail"
+    assert any(
+        "HTTP warmup" in reason for reason in _production_gate_reasons(args, True, **evidence)
+    )
 
 
 def test_production_gate_rejects_legacy_direct_only_sustained_evidence() -> None:
@@ -836,6 +1303,7 @@ def test_default_run_rate_has_headroom_above_production_minimum() -> None:
     args = _parser().parse_args([])
     assert args.callback_rate == 105.0
     assert args.db_pool_size == 32
+    assert args.max_inflight == 64
     assert args.min_workers == PRODUCTION_MIN_WORKERS == DEFAULT_MIN_WORKERS == 4
     assert args.db_pool_size <= args.max_inflight
 
@@ -1071,6 +1539,124 @@ def test_preflight_reports_resource_snapshot(monkeypatch) -> None:
         max_inflight=DEFAULT_MAX_INFLIGHT,
         burst_turns=200,
     )
+
+
+def test_preflight_kubernetes_uses_pod_and_metrics_evidence_without_local_pid_or_docker(
+    monkeypatch,
+) -> None:
+    source = "a" * 64
+    image = "sha256:" + "b" * 64
+    workers = tuple(
+        {
+            "role": "worker",
+            "pod_name": f"worker-{index}",
+            "pod_uid": f"uid-worker-{index}",
+            "container_name": "worker",
+            "container_id": f"containerd://worker-{index}",
+            "image_id": image,
+            "image_digest": image,
+            "source_fingerprint": source,
+            "node_name": "acceptance-node",
+            "process_count": 1,
+            "memory_limit_bytes": 2 * 1024**3,
+            "ready": True,
+        }
+        for index in range(4)
+    )
+    outbox = (
+        {
+            "role": "outbox-dispatcher",
+            "pod_name": "outbox-0",
+            "pod_uid": "uid-outbox-0",
+            "container_name": "outbox-dispatcher",
+            "container_id": "containerd://outbox-0",
+            "image_id": image,
+            "image_digest": image,
+            "source_fingerprint": source,
+            "node_name": "acceptance-node",
+            "process_count": 1,
+            "memory_limit_bytes": 1024**3,
+            "ready": True,
+        },
+    )
+    metrics = {
+        "items": [
+            {
+                "metadata": {"name": f"worker-{index}"},
+                "timestamp": "2026-08-26T00:00:15Z",
+                "window": "15s",
+                "containers": [{"name": "worker", "usage": {"memory": "128Mi"}}],
+            }
+            for index in range(4)
+        ]
+        + [
+            {
+                "metadata": {"name": "outbox-0"},
+                "timestamp": "2026-08-26T00:00:15Z",
+                "window": "15s",
+                "containers": [{"name": "outbox-dispatcher", "usage": {"memory": "64Mi"}}],
+            }
+        ]
+    }
+
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._resource_snapshot",
+        lambda: {"cpu_count": 8, "available_memory_bytes": 8 * 1024**3},
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._source_fingerprint",
+        lambda: {"algorithm": "sha256", "status": "available", "value": source},
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._kubernetes_pod_records",
+        lambda _configuration, *, role, selector: (
+            (workers, None) if role == "worker" else (outbox, None)
+        ),
+    )
+
+    def fake_kubernetes_json(arguments, _configuration):
+        if arguments[1].startswith("configmap/"):
+            return {"data": {"TRPC_SERVICE_WORKER_CONCURRENCY": "50"}}, None
+        return metrics, None
+
+    monkeypatch.setattr("scripts.real_performance_gate._kubernetes_json", fake_kubernetes_json)
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._worker_processes",
+        lambda: pytest.fail("Kubernetes preflight must not inspect local PIDs"),
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._compose_worker_processes",
+        lambda _project: pytest.fail("Kubernetes preflight must not inspect Docker"),
+    )
+
+    args = SimpleNamespace(
+        kubernetes=True,
+        kubernetes_namespace="acceptance",
+        kubernetes_context="ack-context",
+        kubernetes_kubeconfig="C:/Users/test/.kube/config",
+        kubernetes_source_fingerprint=source,
+        kubernetes_image_digest=image,
+        kubernetes_memory_limit_bytes=None,
+        callbacks=200,
+        burst_turns=200,
+        callback_rate=100.0,
+        min_workers=4,
+        db_pool_size=32,
+        max_inflight=DEFAULT_MAX_INFLIGHT,
+        timeout_seconds=300.0,
+    )
+
+    result = _preflight(args)
+
+    assert result["status"] == "pass"
+    assert len(result["worker_processes"]) == 4
+    assert result["worker_count"] == 4
+    assert result["worker_concurrency"] == 50
+    assert all("pid" not in worker for worker in result["worker_processes"])
+    assert result["worker_image_attestation"]["status"] == "pass"
+    assert result["service_image_attestation"]["outbox-dispatcher"]["status"] == "pass"
+    assert result["memory_observation"]["sampling_method"] == "kubernetes_metrics_api"
+    assert result["memory_observation"]["coverage_complete"] is True
 
 
 def test_preflight_rejects_runtime_connection_budget_before_worker_inspection(monkeypatch) -> None:
@@ -1385,6 +1971,27 @@ def test_load_worker_refuses_to_run_without_parent_watchdog(monkeypatch) -> None
 
     assert report["gate"] == "not_run"
     assert "parent PID" in report["rejection_reasons"][0]
+
+
+def test_kubernetes_load_worker_uses_attested_job_supervision_without_host_pid(monkeypatch) -> None:
+    called = False
+
+    async def fake_run_real_once(_args, preflight):
+        nonlocal called
+        called = True
+        assert preflight["status"] == "pass"
+        return _not_run_report(["job fixture"])
+
+    monkeypatch.setattr("scripts.real_performance_gate._run_real_once", fake_run_real_once)
+    monkeypatch.setenv("TRPC_REAL_PERFORMANCE_WORKER_TOKEN", "job-token")
+    args = _parser().parse_args(
+        ["--load-worker", "--kubernetes-load-worker", "--execute", "--confirm-real-load"]
+    )
+
+    report = asyncio.run(_run_real(args, {"status": "pass"}))
+
+    assert called is True
+    assert report["gate"] == "not_run"
 
 
 def test_parent_watchdog_cancels_worker_when_parent_disappears(monkeypatch) -> None:
@@ -1894,9 +2501,7 @@ def test_worker_image_attestation_rejects_missing_label() -> None:
 
 
 def test_worker_image_attestation_rejects_stale_label() -> None:
-    workers = _attested_workers(
-        image_ids=("sha256:" + "a" * 64,) * 4, labels=("b" * 64,) * 4
-    )
+    workers = _attested_workers(image_ids=("sha256:" + "a" * 64,) * 4, labels=("b" * 64,) * 4)
     result = _worker_image_attestation(
         workers,
         {"algorithm": "sha256", "status": "available", "value": "a" * 64},
@@ -1926,9 +2531,7 @@ def test_worker_image_attestation_rejects_mixed_images() -> None:
 
 
 def test_worker_image_attestation_accepts_four_identical_current_workers() -> None:
-    workers = _attested_workers(
-        image_ids=("sha256:" + "a" * 64,) * 4, labels=("a" * 64,) * 4
-    )
+    workers = _attested_workers(image_ids=("sha256:" + "a" * 64,) * 4, labels=("a" * 64,) * 4)
     result = _worker_image_attestation(
         workers,
         {"algorithm": "sha256", "status": "available", "value": "a" * 64},
@@ -1952,3 +2555,256 @@ def test_worker_image_attestation_rejects_non_digest_image_id() -> None:
 
     assert result["status"] == "not_run"
     assert "image_id" in result["reason"]
+
+
+def test_kubernetes_pod_records_use_only_ready_pod_api_identity(monkeypatch) -> None:
+    source = "a" * 64
+    image = "sha256:" + "b" * 64
+    payload = _kubernetes_pod_payload(
+        role="worker",
+        name="trpc-worker-0",
+        image_digest=image,
+        source_fingerprint=source,
+        memory_limit="2Gi",
+    )
+    calls: list[list[str]] = []
+
+    def fake_json(arguments, _configuration):
+        calls.append(list(arguments))
+        return payload, None
+
+    monkeypatch.setattr("scripts.real_performance_gate._kubernetes_json", fake_json)
+    records, error = _kubernetes_pod_records(
+        {"namespace": "acceptance", "context": "ack-context"},
+        role="worker",
+        selector=KUBERNETES_WORKER_SELECTOR,
+    )
+
+    assert error is None
+    assert records == (
+        {
+            "role": "worker",
+            "pod_name": "trpc-worker-0",
+            "pod_uid": "uid-trpc-worker-0",
+            "container_name": "worker",
+            "container_id": "containerd://trpc-worker-0",
+            "image_id": image,
+            "image_digest": image,
+            "source_fingerprint": source,
+            "node_name": "acceptance-node",
+            "process_count": 1,
+            "memory_limit_bytes": 2 * 1024**3,
+            "ready": True,
+        },
+    )
+    assert calls == [
+        [
+            "get",
+            "pods",
+            "--namespace",
+            "acceptance",
+            "--selector",
+            KUBERNETES_WORKER_SELECTOR,
+            "--output",
+            "json",
+        ]
+    ]
+
+
+def test_kubernetes_pod_records_fail_closed_for_unready_or_tagged_image(monkeypatch) -> None:
+    payload = _kubernetes_pod_payload(
+        role="outbox-dispatcher",
+        name="trpc-outbox-0",
+        image_digest="sha256:" + "b" * 64,
+    )
+    pod = payload["items"][0]
+    assert isinstance(pod, dict)
+    status = pod["status"]
+    assert isinstance(status, dict)
+    statuses = status["containerStatuses"]
+    assert isinstance(statuses, list)
+    assert isinstance(statuses[0], dict)
+    statuses[0]["ready"] = False
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._kubernetes_json", lambda *_args: (payload, None)
+    )
+
+    records, error = _kubernetes_pod_records(
+        {"namespace": "acceptance", "context": "ack-context"},
+        role="outbox-dispatcher",
+        selector=KUBERNETES_OUTBOX_SELECTOR,
+    )
+    assert records == ()
+    assert error is not None and "not ready" in error
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("128Mi", 128 * 1024**2), ("1Gi", 1024**3), ("250M", 250_000_000), ("0", None)],
+)
+def test_kubernetes_quantity_bytes_is_bounded(value: str, expected: int | None) -> None:
+    assert _kubernetes_quantity_bytes(value) == expected
+
+
+def test_kubernetes_image_attestation_binds_expected_digest_and_source() -> None:
+    source = "a" * 64
+    image = "sha256:" + "b" * 64
+    workers = (
+        {"container_id": "container-0", "image_id": image, "source_fingerprint": source},
+        {"container_id": "container-1", "image_id": image, "source_fingerprint": source},
+    )
+
+    result = _kubernetes_image_attestation(
+        workers,
+        expected_source=source,
+        expected_image=image,
+    )
+
+    assert result["status"] == "pass"
+    assert result["independent_process_count"] == 2
+    assert result["image_id"] == image
+    assert result["source_fingerprint"] == source
+    assert result["binding_method"] == "configured_candidate"
+
+    mismatch = _kubernetes_image_attestation(
+        workers,
+        expected_source=source,
+        expected_image="sha256:" + "c" * 64,
+    )
+    assert mismatch["status"] == "not_run"
+    assert "does not match" in mismatch["reason"]
+
+
+def test_kubernetes_image_attestation_can_use_consistent_pod_labels() -> None:
+    source = "a" * 64
+    image = "sha256:" + "b" * 64
+    result = _kubernetes_image_attestation(
+        (
+            {"container_id": "container-0", "image_id": image, "source_fingerprint": source},
+            {"container_id": "container-1", "image_id": image, "source_fingerprint": source},
+        ),
+        expected_source=None,
+        expected_image=None,
+    )
+
+    assert result["status"] == "pass"
+    assert result["binding_method"] == "pod_label"
+
+
+def test_worker_discovery_uses_kubernetes_pods_when_kubernetes_env_is_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("TRPC_PERF_K8S_ENABLED", "true")
+    monkeypatch.setenv("TRPC_PERF_K8S_NAMESPACE", "acceptance")
+    monkeypatch.setenv("TRPC_PERF_K8S_CONTEXT", "ack-context")
+    discovered = (
+        {
+            "role": "worker",
+            "pod_name": "worker-0",
+            "pod_uid": "uid-worker-0",
+            "container_name": "worker",
+            "container_id": "containerd://worker-0",
+            "image_id": "sha256:" + "a" * 64,
+            "process_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._kubernetes_pod_records",
+        lambda _configuration, *, role, selector: (discovered, None),
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate._compose_worker_processes",
+        lambda _project: pytest.fail("Kubernetes discovery must not inspect Docker"),
+    )
+    monkeypatch.setattr(
+        "scripts.real_performance_gate.shutil.which",
+        lambda name: pytest.fail(f"Kubernetes discovery must not inspect local tools: {name}"),
+    )
+
+    from scripts.real_performance_gate import _worker_processes
+
+    assert _worker_processes() == discovered
+
+
+def test_kubernetes_metrics_memory_observation_binds_role_pods() -> None:
+    image = "sha256:" + "b" * 64
+    participating = {
+        "worker": (
+            {
+                "role": "worker",
+                "pod_name": "worker-0",
+                "pod_uid": "uid-worker-0",
+                "container_name": "worker",
+                "container_id": "containerd://worker-0",
+                "image_id": image,
+                "memory_limit_bytes": 2 * 1024**3,
+            },
+        ),
+        "outbox-dispatcher": (
+            {
+                "role": "outbox-dispatcher",
+                "pod_name": "outbox-0",
+                "pod_uid": "uid-outbox-0",
+                "container_name": "outbox-dispatcher",
+                "container_id": "containerd://outbox-0",
+                "image_id": image,
+                "memory_limit_bytes": 1024**3,
+            },
+        ),
+    }
+    metrics = {
+        "items": [
+            {
+                "metadata": {"name": "worker-0"},
+                "timestamp": "2026-08-26T00:00:15Z",
+                "window": "15s",
+                "containers": [{"name": "worker", "usage": {"memory": "128Mi"}}],
+            },
+            {
+                "metadata": {"name": "outbox-0"},
+                "timestamp": "2026-08-26T00:00:15Z",
+                "window": "15s",
+                "containers": [{"name": "outbox-dispatcher", "usage": {"memory": "64Mi"}}],
+            },
+        ]
+    }
+
+    result = _kubernetes_metrics_memory_observation(participating, metrics)
+
+    assert result["status"] == "pass"
+    assert result["sampling_method"] == "kubernetes_metrics_api"
+    assert result["metrics_api"] == KUBERNETES_METRICS_API
+    assert result["coverage_complete"] is True
+    assert result["observed_identity_count"] == 2
+    assert result["peak_bytes"] == 192 * 1024**2
+    assert result["safety_threshold_bytes"] == 3 * 1024**3
+    assert result["sampling_interval_seconds"] == 15.0
+
+
+def test_kubernetes_metrics_memory_observation_missing_container_is_not_run() -> None:
+    participating = {
+        "worker": (
+            {"pod_name": "worker-0", "container_name": "worker", "memory_limit_bytes": 1024},
+        ),
+        "outbox-dispatcher": (
+            {
+                "pod_name": "outbox-0",
+                "container_name": "outbox-dispatcher",
+                "memory_limit_bytes": 1024,
+            },
+        ),
+    }
+
+    result = _kubernetes_metrics_memory_observation(
+        participating,
+        {
+            "items": [
+                {
+                    "metadata": {"name": "worker-0"},
+                    "containers": [{"name": "worker", "usage": {"memory": "1Mi"}}],
+                }
+            ]
+        },
+    )
+
+    assert result["status"] == "not_run"
+    assert result["coverage_complete"] is False
+    assert "coverage" in result["reason"]

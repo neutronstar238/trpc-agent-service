@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location E:\trpc-agent-service
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+Set-Location $projectRoot
 $env:COMPOSE_DISABLE_ENV_FILE = "1"
 
 # This wrapper is intentionally dot-sourced by the release shell.  The caller
@@ -27,9 +28,8 @@ function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$Value)
     $algorithm = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return ([Convert]::ToHexString(
-            $algorithm.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Value))
-        )).ToLowerInvariant()
+        $digest = $algorithm.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Value))
+        return (([BitConverter]::ToString($digest)) -replace "-", "").ToLowerInvariant()
     }
     finally {
         $algorithm.Dispose()
@@ -38,13 +38,15 @@ function Get-Sha256Hex {
 
 function New-SyntheticHexSecret {
     $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    return [Convert]::ToHexString($bytes).ToLowerInvariant()
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+    return (([BitConverter]::ToString($bytes)) -replace "-", "").ToLowerInvariant()
 }
 
 function New-SyntheticBase64UrlSecret {
     $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     return ([Convert]::ToBase64String($bytes)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
@@ -115,14 +117,25 @@ function Get-HealthyWorkerInventory {
     if ($ids.Count -ne 4) {
         throw "$Project must expose exactly four worker containers"
     }
-    $format = '{{.Id}}|{{index .Config.Labels "io.trpc.agent-service.source-fingerprint"}}|{{.Image}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
-    $rows = @($ids | ForEach-Object { docker inspect --format $format $_ })
-    if ($LASTEXITCODE -ne 0 -or $rows.Count -ne 4) {
-        throw "$Project worker inspection failed"
-    }
     $images = @()
-    foreach ($row in $rows) {
-        $parts = $row -split '\|', 5
+    foreach ($id in $ids) {
+        $rawInspection = docker inspect $id
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Project worker inspection failed"
+        }
+        $documents = @((($rawInspection -join [Environment]::NewLine) | ConvertFrom-Json))
+        if ($documents.Count -ne 1) {
+            throw "$Project worker inspection failed"
+        }
+        $document = $documents[0]
+        $health = if ($null -eq $document.State.Health) { "none" } else { [string]$document.State.Health.Status }
+        $parts = @(
+            [string]$document.Id,
+            [string]$document.Config.Labels.'io.trpc.agent-service.source-fingerprint',
+            [string]$document.Image,
+            [string]$document.State.Status,
+            $health
+        )
         if (
             $parts.Count -ne 5 -or
             $parts[0] -notmatch '^[0-9a-f]{64}$' -or
@@ -169,10 +182,20 @@ function Wait-HealthyService {
         if ($LASTEXITCODE -eq 0) {
             $ids = @($rawIds | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             if ($ids.Count -ge 1) {
-                $rows = @($ids | ForEach-Object {
-                    docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $_
+                $unhealthy = @($ids | Where-Object {
+                    $rawInspection = docker inspect $_
+                    if ($LASTEXITCODE -ne 0) {
+                        return $true
+                    }
+                    $documents = @((($rawInspection -join [Environment]::NewLine) | ConvertFrom-Json))
+                    if ($documents.Count -ne 1) {
+                        return $true
+                    }
+                    $document = $documents[0]
+                    $health = if ($null -eq $document.State.Health) { "none" } else { [string]$document.State.Health.Status }
+                    return $document.State.Status -ne "running" -or $health -ne "healthy"
                 })
-                if ($LASTEXITCODE -eq 0 -and @($rows | Where-Object { $_ -ne "running|healthy" }).Count -eq 0) {
+                if ($unhealthy.Count -eq 0) {
                     return $ids
                 }
             }
@@ -183,6 +206,33 @@ function Wait-HealthyService {
         Start-Sleep -Seconds 2
     }
     throw "$Project $Service health did not converge"
+}
+
+function Wait-SuccessfulOneShot {
+    param([object[]]$ComposeArgs, [string]$Project, [string]$Service)
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        $rawIds = docker compose @ComposeArgs ps -q -a $Service
+        if ($LASTEXITCODE -eq 0) {
+            $ids = @($rawIds | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($ids.Count -eq 1) {
+                $rawInspection = docker inspect $ids[0]
+                if ($LASTEXITCODE -eq 0) {
+                    $document = @((($rawInspection -join [Environment]::NewLine) | ConvertFrom-Json))[0]
+                    if ($document.State.Status -eq "exited") {
+                        if ([int]$document.State.ExitCode -eq 0) {
+                            return
+                        }
+                        throw "$Project $Service exited unsuccessfully"
+                    }
+                }
+            }
+        }
+        if ($attempt -eq 89) {
+            throw "$Project $Service did not complete"
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "$Project $Service did not complete"
 }
 
 function Assert-RoleEvidence {
@@ -216,12 +266,26 @@ function Assert-RoleEvidence {
 }
 
 $releaseNonceHash = Get-Sha256Hex -Value ([string]$env:TRPC_RELEASE_NONCE)
-$currentSourceFingerprint = (.venv\Scripts\python.exe -c "from pathlib import Path; from scripts.evidence_lineage import source_fingerprint; print(source_fingerprint(Path.cwd())['value'])").Trim()
-if ($LASTEXITCODE -ne 0 -or $currentSourceFingerprint -ne $candidateFingerprint) {
+& .venv\Scripts\python.exe scripts/candidate_lock.py verify | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "candidate lock verification failed"
+}
+$lockedCandidate = Get-Content -LiteralPath "runs/multitenant/candidate-lock.json" -Raw | ConvertFrom-Json
+$currentSourceFingerprint = [string]$lockedCandidate.source_fingerprint.value
+if ($currentSourceFingerprint -ne $candidateFingerprint) {
     throw "source fingerprint changed after lock"
 }
-$imageEvidence = (docker image inspect --format '{{.Id}}|{{index .Config.Labels "io.trpc.agent-service.source-fingerprint"}}' $candidateImage).Trim()
-if ($LASTEXITCODE -ne 0 -or $imageEvidence -ne "$candidateImageId|$candidateFingerprint") {
+$rawImageInspection = docker image inspect $candidateImage
+if ($LASTEXITCODE -ne 0) {
+    throw "candidate image binding mismatch"
+}
+$imageDocuments = @((($rawImageInspection -join [Environment]::NewLine) | ConvertFrom-Json))
+if ($imageDocuments.Count -ne 1) {
+    throw "candidate image binding mismatch"
+}
+$imageDocument = $imageDocuments[0]
+$imageEvidence = "{0}|{1}" -f $imageDocument.Id, $imageDocument.Config.Labels.'io.trpc.agent-service.source-fingerprint'
+if ($imageEvidence -ne "$candidateImageId|$candidateFingerprint") {
     throw "candidate image binding mismatch"
 }
 if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe' -PathType Leaf)) {
@@ -278,6 +342,7 @@ $env:POSTGRES_PASSWORD = New-SyntheticHexSecret
 $env:RUNTIME_DATABASE_PASSWORD = New-SyntheticHexSecret
 $env:WORKER_DATABASE_PASSWORD = New-SyntheticHexSecret
 $env:MIGRATION_DATABASE_PASSWORD = New-SyntheticHexSecret
+$env:METRICS_DATABASE_PASSWORD = New-SyntheticHexSecret
 $env:REDIS_PASSWORD = New-SyntheticHexSecret
 $env:MINIO_ROOT_PASSWORD = New-SyntheticHexSecret
 $env:SESSION_HMAC_KEY = New-SyntheticBase64UrlSecret
@@ -318,12 +383,16 @@ try {
     }
 
     $stackStarted = $true
-    docker compose @compose up -d --no-build --scale worker=4 --scale outbox-dispatcher=1 postgres redis minio minio-init migrate gateway toxiproxy worker outbox-dispatcher channel-dispatcher post-turn-projector session-recovery
+    # Keep application consumers stopped while the backend suite exercises
+    # PostgreSQL outbox/lease transitions directly.  A live dispatcher or
+    # worker would race those tests even though their Redis streams are unique.
+    docker compose @compose up -d --no-build postgres redis minio minio-init migrate toxiproxy
     if ($LASTEXITCODE -ne 0) {
         throw "runtime Compose startup failed; project retained"
     }
-    $null = Wait-HealthyWorkerInventory -ComposeArgs $compose -Project $project -ExpectedSource $candidateFingerprint -ExpectedImage $candidateImageId
     $null = Wait-HealthyService -ComposeArgs $compose -Project $project -Service "toxiproxy"
+    Wait-SuccessfulOneShot -ComposeArgs $compose -Project $project -Service "migrate"
+    Wait-SuccessfulOneShot -ComposeArgs $compose -Project $project -Service "minio-init"
 
     # Backend contract tests use direct host ports and both database roles.
     $env:TRPC_TEST_POSTGRES_DSN = $directRuntimeDsn
@@ -387,6 +456,12 @@ try {
         throw "backend-compose runtime/image/test attestation failed"
     }
 
+    docker compose @compose up -d --no-build --scale worker=4 --scale outbox-dispatcher=1 gateway worker outbox-dispatcher channel-dispatcher post-turn-projector session-recovery
+    if ($LASTEXITCODE -ne 0) {
+        throw "runtime application startup failed; project retained"
+    }
+    $null = Wait-HealthyWorkerInventory -ComposeArgs $compose -Project $project -ExpectedSource $candidateFingerprint -ExpectedImage $candidateImageId
+
     # Create the owned synthetic tenant/binding required by real-runtime.py.
     $env:TRPC_PERF_DATABASE_DSN = $directRuntimeDsn
     $env:TRPC_PERF_FIXTURE_CONFIRM = "I_UNDERSTAND_PERFORMANCE_FIXTURE"
@@ -440,7 +515,7 @@ try {
 }
 finally {
     if ($runSucceeded -and $stackStarted) {
-        docker compose @compose down --remove-orphans
+        docker compose @compose down --volumes --remove-orphans
         if ($LASTEXITCODE -ne 0) {
             throw "runtime Compose cleanup failed; project retained"
         }

@@ -142,7 +142,15 @@ services:
       TRPC_SERVICE_WORKER_DATABASE_DSN_REF: env://TRPC_SERVICE_WORKER_DATABASE_DSN
       TRPC_SERVICE_WORKER_DATABASE_DSN: postgresql+asyncpg://${TRPC_WORKER_USER:-trpc_worker}@postgres:5432/${POSTGRES_DB:-trpc_service}
       TRPC_SERVICE_WORKER_DATABASE_PASSWORD_REF: file:///run/secrets/worker_database_password
-    secrets: *worker-secrets
+    secrets:
+      - runtime_database_password
+      - worker_database_password
+      - redis_password
+      - minio_root_password
+      - session_hmac_key
+      - emergency_queue_key
+      - development_token
+      - model_api_key
     healthcheck:
       test: ["CMD", "python", "-m", "trpc_service.probe", "--role", "worker"]
       interval: 10s
@@ -184,6 +192,8 @@ services:
       TRPC_SERVICE_WORKER_DATABASE_DSN_REF: env://TRPC_SERVICE_WORKER_DATABASE_DSN
       TRPC_SERVICE_WORKER_DATABASE_DSN: postgresql+asyncpg://${TRPC_WORKER_USER:-trpc_worker}@postgres:5432/${POSTGRES_DB:-trpc_service}
       TRPC_SERVICE_WORKER_DATABASE_PASSWORD_REF: file:///run/secrets/worker_database_password
+      TRPC_SERVICE_ONLINE_TESTS_ENABLED: ${TRPC_SERVICE_ONLINE_TESTS_ENABLED:-false}
+      TRPC_SERVICE_FEISHU_SEND_API_ROOT: ${TRPC_SERVICE_FEISHU_SEND_API_ROOT:-https://open.feishu.cn}
     secrets: *worker-secrets
     healthcheck:
       test: ["CMD", "python", "-m", "trpc_service.probe", "--role", "channel-dispatcher"]
@@ -253,6 +263,38 @@ services:
       retries: 6
       start_period: 20s
 
+  artifact-gc:
+    <<: *app
+    command: ["serve", "--role", "artifact-gc"]
+    environment:
+      <<: *app-environment
+      TRPC_SERVICE_ROLE: artifact-gc
+      TRPC_SERVICE_WORKER_DATABASE_DSN_REF: env://TRPC_SERVICE_WORKER_DATABASE_DSN
+      TRPC_SERVICE_WORKER_DATABASE_DSN: postgresql+asyncpg://${TRPC_WORKER_USER:-trpc_worker}@postgres:5432/${POSTGRES_DB:-trpc_service}
+      TRPC_SERVICE_WORKER_DATABASE_PASSWORD_REF: file:///run/secrets/worker_database_password
+      TRPC_SERVICE_DATABASE_POOL_MIN_SIZE: ${TRPC_SERVICE_ARTIFACT_GC_DATABASE_POOL_MIN_SIZE:-1}
+      TRPC_SERVICE_DATABASE_POOL_MAX_SIZE: ${TRPC_SERVICE_ARTIFACT_GC_DATABASE_POOL_MAX_SIZE:-2}
+      TRPC_SERVICE_ARTIFACT_GC_BATCH_SIZE: ${TRPC_SERVICE_ARTIFACT_GC_BATCH_SIZE:-100}
+      TRPC_SERVICE_ARTIFACT_GC_POLL_SECONDS: ${TRPC_SERVICE_ARTIFACT_GC_POLL_SECONDS:-60}
+      TRPC_SERVICE_ARTIFACT_STAGING_TTL_SECONDS: ${TRPC_SERVICE_ARTIFACT_STAGING_TTL_SECONDS:-86400}
+    secrets:
+      - runtime_database_password
+      - worker_database_password
+      - minio_root_password
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "trpc_service.probe", "--role", "artifact-gc"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+
   postgres:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
@@ -268,6 +310,7 @@ services:
       - migration_database_password
       - runtime_database_password
       - worker_database_password
+      - metrics_database_password
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
@@ -424,9 +467,9 @@ services:
       - ./deploy/toxiproxy.json:/config/toxiproxy.json:ro
     ports:
       - "127.0.0.1:${TOXIPROXY_API_PORT:-8474}:8474"
-      - "127.0.0.1:15432:15432"
-      - "127.0.0.1:16379:16379"
-      - "127.0.0.1:19000:19000"
+      - "127.0.0.1:${TOXIPROXY_POSTGRES_PORT:-15432}:15432"
+      - "127.0.0.1:${TOXIPROXY_REDIS_PORT:-16379}:16379"
+      - "127.0.0.1:${TOXIPROXY_S3_PORT:-19000}:19000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -455,6 +498,8 @@ secrets:
     environment: RUNTIME_DATABASE_PASSWORD
   worker_database_password:
     environment: WORKER_DATABASE_PASSWORD
+  metrics_database_password:
+    environment: METRICS_DATABASE_PASSWORD
   migration_database_password:
     environment: MIGRATION_DATABASE_PASSWORD
   redis_password:
@@ -467,3 +512,5 @@ secrets:
     environment: EMERGENCY_QUEUE_KEY
   development_token:
     environment: DEVELOPMENT_TOKEN
+  model_api_key:
+    environment: MODEL_API_KEY

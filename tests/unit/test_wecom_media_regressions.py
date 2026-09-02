@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,7 +14,7 @@ from trpc_service.channels.wecom import WeComConnector, parse_wecom_frame
 from trpc_service.config.secrets import LocalSecretProvider, SecretRef
 from trpc_service.runtime import TenantRuntime
 from trpc_service.storage.artifacts import InMemoryArtifactStore
-from trpc_service.storage.models import BindingRoute
+from trpc_service.storage.models import BindingRoute, WeComBindingLeaseGrant
 from trpc_service.tenant.models import Channel
 
 MEDIA_URL = "https://private.example.invalid/wecom/video"
@@ -162,10 +163,27 @@ class _GenericMessageClient:
 
 
 class _Lease:
-    async def acquire_binding(self, _binding_id: str, _owner_id: str) -> bool:
+    async def acquire_binding(self, binding: Any, _owner_id: str) -> WeComBindingLeaseGrant:
+        return WeComBindingLeaseGrant(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.binding_id,
+            owner_hash="a" * 64,
+            epoch=1,
+            acquired_at=datetime.now(UTC),
+        )
+
+    async def mark_authenticated(self, _grant: WeComBindingLeaseGrant) -> bool:
         return True
 
-    async def release_binding(self, _binding_id: str, _owner_id: str) -> None:
+    async def record_provider_event(
+        self, _grant: WeComBindingLeaseGrant, _provider_event_id: str
+    ) -> bool:
+        return True
+
+    async def mark_disconnected(self, _grant: WeComBindingLeaseGrant) -> bool:
+        return True
+
+    async def release_binding(self, _grant: WeComBindingLeaseGrant) -> None:
         return None
 
 

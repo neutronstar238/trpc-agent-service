@@ -7,6 +7,7 @@ import asyncpg
 import pytest
 import redis.asyncio as redis_async
 
+from trpc_service import _cli as cli
 from trpc_service import probe
 from trpc_service.probe import _resolve_reference, _url_password
 
@@ -127,6 +128,20 @@ class _RedisConnection:
         self.closed = True
 
 
+class _S3Connection:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.closed = False
+
+    def head_bucket(self, *, Bucket: str) -> None:
+        assert Bucket == "artifacts"
+        if self.fail:
+            raise OSError("object store unavailable")
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _IdentityConnection(_DatabaseConnection):
     def __init__(self, *, schema_usage: bool = True, table_privileges: bool = True) -> None:
         super().__init__()
@@ -172,6 +187,12 @@ def _probe_environment(monkeypatch, *, redis_url: str | None = "redis://cache/0"
     monkeypatch.setenv("TRPC_SERVICE_REDIS_PASSWORD_REF", "literal://redis-secret")
 
 
+def test_lightweight_probe_uses_exact_evidence_table_privileges() -> None:
+    assert probe._WORKER_TABLE_PRIVILEGES["wecom_connection_state"] == ("SELECT,INSERT,UPDATE")
+    assert probe._WORKER_TABLE_PRIVILEGES["im_acceptance_evidence_events"] == ("SELECT,INSERT")
+    assert probe._WORKER_TABLE_PRIVILEGES == cli._WORKER_TABLE_PRIVILEGES
+
+
 @pytest.mark.asyncio
 async def test_lightweight_probe_rejects_missing_dependencies(monkeypatch) -> None:
     monkeypatch.delenv("TRPC_SERVICE_DATABASE_DSN", raising=False)
@@ -194,9 +215,7 @@ async def test_lightweight_probe_database_paths(monkeypatch) -> None:
     assert not await probe.check("channel-dispatcher")
     assert connection.closed
 
-    monkeypatch.setenv(
-        "TRPC_SERVICE_WORKER_DATABASE_DSN_REF", "env://MISSING_WORKER_DATABASE_DSN"
-    )
+    monkeypatch.setenv("TRPC_SERVICE_WORKER_DATABASE_DSN_REF", "env://MISSING_WORKER_DATABASE_DSN")
     assert not await probe.check("gateway")
     monkeypatch.delenv("TRPC_SERVICE_WORKER_DATABASE_DSN_REF")
     monkeypatch.setenv(
@@ -236,6 +255,30 @@ async def test_lightweight_probe_redis_paths(monkeypatch, ping_result: bool) -> 
     assert await probe.check("worker") is ping_result
     assert database.closed
     assert redis.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("s3_failure", [False, True])
+async def test_artifact_gc_probe_requires_database_and_object_store(
+    monkeypatch, s3_failure: bool
+) -> None:
+    _probe_environment(monkeypatch, redis_url=None)
+    monkeypatch.setenv("TRPC_SERVICE_S3_ENDPOINT", "https://s3.example.test")
+    monkeypatch.setenv("TRPC_SERVICE_S3_ACCESS_KEY", "access")
+    monkeypatch.setenv("TRPC_SERVICE_S3_SECRET_KEY_REF", "literal://secret")
+    monkeypatch.setenv("TRPC_SERVICE_S3_BUCKET", "artifacts")
+    database = _IdentityConnection()
+    s3 = _S3Connection(fail=s3_failure)
+
+    async def connect(*_args, **_kwargs):
+        return database
+
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: s3)
+
+    assert await probe.check("artifact-gc") is not s3_failure
+    assert database.closed
+    assert s3.closed
 
 
 @pytest.mark.asyncio

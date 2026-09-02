@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -19,7 +20,7 @@ from trpc_service.config.secrets import LocalSecretProvider, SecretRef
 from trpc_service.runtime import TenantRuntime
 from trpc_service.storage.artifacts import InMemoryArtifactStore
 from trpc_service.storage.memory import InMemoryRuntimeRepository
-from trpc_service.storage.models import BindingRoute
+from trpc_service.storage.models import BindingRoute, WeComBindingLeaseGrant
 from trpc_service.tenant.models import Channel, ChannelBinding
 
 MEDIA_URL = "https://media.example.invalid/download/private-file"
@@ -192,13 +193,34 @@ async def test_wecom_frame_to_worker_download_and_artifact_stays_offline() -> No
 class _TrackingLease:
     acquired: list[tuple[str, str]] = field(default_factory=list)
     released: list[tuple[str, str]] = field(default_factory=list)
+    owners: dict[int, str] = field(default_factory=dict)
 
-    async def acquire_binding(self, binding_id: str, owner_id: str) -> bool:
-        self.acquired.append((binding_id, owner_id))
+    async def acquire_binding(
+        self, binding: ChannelBinding, owner_id: str
+    ) -> WeComBindingLeaseGrant:
+        self.acquired.append((binding.binding_id, owner_id))
+        self.owners[1] = owner_id
+        return WeComBindingLeaseGrant(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.binding_id,
+            owner_hash="a" * 64,
+            epoch=1,
+            acquired_at=datetime.now(UTC),
+        )
+
+    async def mark_authenticated(self, _grant: WeComBindingLeaseGrant) -> bool:
         return True
 
-    async def release_binding(self, binding_id: str, owner_id: str) -> None:
-        self.released.append((binding_id, owner_id))
+    async def record_provider_event(
+        self, _grant: WeComBindingLeaseGrant, _provider_event_id: str
+    ) -> bool:
+        return True
+
+    async def mark_disconnected(self, _grant: WeComBindingLeaseGrant) -> bool:
+        return True
+
+    async def release_binding(self, grant: WeComBindingLeaseGrant) -> None:
+        self.released.append((grant.binding_id, self.owners[grant.epoch]))
 
 
 class _FailingSecrets:

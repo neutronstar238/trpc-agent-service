@@ -14,6 +14,9 @@ Required environment for a live run:
 * ``TRPC_K8S_RUNTIME_UPGRADE_IMAGE`` (a different image for the rollout test)
 * ``TRPC_K8S_RUNTIME_SECRET_MANIFEST`` (a manifest containing the runtime and
   migration Secret objects; it is never copied into the report)
+* ``TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET`` (optional, non-sensitive name of a
+  ``kubernetes.io/dockerconfigjson`` Secret in the supplied Secret manifest;
+  the gate never copies registry credentials into its report)
 * ``TRPC_K8S_RUNTIME_HPA_DRIVER`` (an absolute, repository-bound Python
    trigger that creates and clears a bounded backlog; HPA observations are
    always read by this gate through the Kubernetes API)
@@ -54,12 +57,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import yaml
@@ -69,6 +73,7 @@ import yaml
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.deployment_preflight import build_preflight
 from scripts.evidence_lineage import build_evidence, runtime_fingerprint
 from scripts.report_io import atomic_write_json
 
@@ -77,11 +82,13 @@ OVERLAY_ROOT = ROOT / "deploy" / "kustomize" / "overlays" / "production"
 BASE_ROOT = ROOT / "deploy" / "kustomize" / "base"
 PRODUCER = "scripts.kubernetes_runtime_gate"
 IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-fA-F]{64}")
+_IMAGE_REFERENCE_RE = re.compile(r"^(?P<name>[^@\s]+)@(?P<digest>sha256:[0-9a-fA-F]{64})$")
 # Kubernetes/CRI implementations expose ``imageID`` in more than one
 # equivalent form (for example ``docker-pullable://repo@sha256:...`` or
 # ``containerd://sha256:...``).  The release evidence deliberately retains
 # only the immutable digest, after validating one of these API shapes.
 IMAGE_ID_DIGEST_RE = re.compile(r"(?:^|@|://)(sha256:[0-9a-fA-F]{64})$")
+S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 _KUBERNETES_QUANTITY_RE = re.compile(
     r"^(?P<number>[+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
     r"(?P<suffix>m|Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$"
@@ -106,6 +113,8 @@ RELEASE_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{32,256}")
 MAX_TIMEOUT_SECONDS = 3600.0
 HPA_DRIVER_PHASES = frozenset({"load", "clear"})
 HPA_DRIVER_MAX_BYTES = 1024 * 1024
+_ROLLBACK_PROBE_TIMEOUT_SECONDS = 120.0
+_ROLLBACK_PROBE_DEPLOYMENT = "trpc-worker"
 HPA_DRIVER_SCRIPT = ROOT / "scripts" / "kubernetes_hpa_load_driver.py"
 HPA_DRIVER_OWNER_LABEL = "trpc.io/hpa-gate"
 HPA_DRIVER_OWNER_VALUE = "bounded-job-driver"
@@ -148,9 +157,11 @@ RUNTIME_NAMESPACE_CLUSTER_LABEL = "trpc.io/cluster-fingerprint"
 RUNTIME_NAMESPACE_MAX_CLEANUP = 10
 RUNTIME_NAMESPACE_TTL_SECONDS = 6 * 60 * 60
 
-DEPLOYMENTS: tuple[tuple[str, str], ...] = (
+PRODUCTION_DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-gateway", "gateway"),
     ("trpc-session-recovery", "session-recovery"),
+    ("trpc-artifact-gc", "artifact-gc"),
+    ("trpc-backlog-exporter", "backlog-exporter"),
     ("trpc-admin", "admin"),
     ("trpc-worker", "worker"),
     ("trpc-outbox-dispatcher", "outbox-dispatcher"),
@@ -158,6 +169,14 @@ DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-post-turn-projector", "post-turn-projector"),
     ("trpc-wecom-connector", "wecom-connector"),
 )
+ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
+ACK_RUNTIME_DEPLOYMENTS: tuple[tuple[str, str], ...] = tuple(
+    deployment
+    for deployment in PRODUCTION_DEPLOYMENTS
+    if deployment[0] not in ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS
+)
+ACK_RUNTIME_SCOPE = "unified_cluster_runtime"
+ACK_IM_DEPLOYMENT = "production_cluster"
 _PDB_PROTECTED_DEPLOYMENTS = frozenset(
     {
         "trpc-worker",
@@ -165,22 +184,26 @@ _PDB_PROTECTED_DEPLOYMENTS = frozenset(
         "trpc-outbox-dispatcher",
         "trpc-channel-dispatcher",
         "trpc-post-turn-projector",
-        "trpc-wecom-connector",
     }
 )
 
 _EXPECTED_SCHEDULER_VERSION = "v2"
 _EXPECTED_REDIS_STREAM = "trpc:session-ready:v2"
 _EXPECTED_REDIS_GROUP = "trpc-session-ready-v2"
+_HPA_BACKLOG_METRIC = "trpc_session_ready_backlog"
+_EXTERNAL_METRICS_API_VERSION = "v1beta1"
 _MIN_PRODUCTION_TURN_CAPACITY = 200
 _WORKER_EVICTION_REPLICAS = 4
 _NODE_DRAIN_CONFIRMATION = "I_UNDERSTAND_ISOLATED_NODE_DRAIN"
 _NODE_LABEL_KEY = "trpc-runtime-gate"
+_DNS_1123_LABEL = r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+_DNS_1123_SUBDOMAIN_RE = re.compile(rf"{_DNS_1123_LABEL}(?:\.{_DNS_1123_LABEL})*")
 
 _REQUIRED_RUNTIME_CHECKS = (
     "kube_context",
     "kustomize_render",
     "production_manifest_contract",
+    "image_pull_secret_contract",
     "namespace_create",
     "server_side_dry_run",
     "manifest_contract",
@@ -300,6 +323,107 @@ def _kubectl(
     )
 
 
+def _valid_image_pull_secret_name(value: str) -> bool:
+    """Return whether *value* is a bounded Kubernetes DNS subdomain name."""
+
+    return len(value) <= 253 and _DNS_1123_SUBDOMAIN_RE.fullmatch(value) is not None
+
+
+def _image_pull_secret_metadata_contract(
+    secret_manifest: str,
+    image_pull_secret: str,
+    *,
+    namespace: str,
+    context: str | None,
+    timeout_seconds: float,
+) -> CommandResult:
+    """Inspect only Secret metadata needed by the private-registry contract.
+
+    ``kubectl`` receives the external Secret manifest but the output template
+    emits only kind/name/namespace/type.  Secret ``data`` and ``stringData``
+    never enter this process or the runtime report.
+    """
+
+    name = image_pull_secret.strip()
+    if not name:
+        return CommandResult(
+            status="pass",
+            evidence={"configured": False},
+        )
+    if not _valid_image_pull_secret_name(name):
+        return CommandResult(
+            status="fail",
+            reason="image pull Secret name is not a valid Kubernetes DNS subdomain",
+            evidence={"configured": True},
+        )
+    metadata_template = (
+        'go-template={{.kind}}{{"\\t"}}{{.metadata.name}}{{"\\t"}}'
+        '{{if .metadata.namespace}}{{.metadata.namespace}}{{end}}{{"\\t"}}'
+        '{{.type}}{{"\\n"}}'
+    )
+    inspection = _kubectl(
+        [
+            "create",
+            "--dry-run=client",
+            "--namespace",
+            namespace,
+            "-f",
+            secret_manifest,
+            "-o",
+            metadata_template,
+        ],
+        context=context,
+        timeout_seconds=min(timeout_seconds, 30),
+    )
+    if inspection.status != "pass":
+        return CommandResult(
+            status=inspection.status,
+            exit_code=inspection.exit_code,
+            reason="Secret manifest metadata inspection failed",
+            stderr="present" if inspection.stderr else "",
+            evidence={"configured": True, "secret_name": name},
+        )
+    records: list[tuple[str, str, str, str]] = []
+    for line in inspection.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4:
+            return CommandResult(
+                status="fail",
+                reason="Secret manifest metadata output is invalid",
+                evidence={"configured": True, "secret_name": name},
+            )
+        records.append(cast(tuple[str, str, str, str], tuple(fields)))
+    matches = [record for record in records if record[0] == "Secret" and record[1] == name]
+    if len(matches) != 1:
+        return CommandResult(
+            status="fail",
+            reason="Secret manifest must contain exactly one configured image pull Secret",
+            evidence={"configured": True, "secret_name": name},
+        )
+    _kind, _name, declared_namespace, resource_type = matches[0]
+    if declared_namespace not in {"", namespace}:
+        return CommandResult(
+            status="fail",
+            reason="image pull Secret targets a different namespace",
+            evidence={"configured": True, "secret_name": name},
+        )
+    if resource_type != "kubernetes.io/dockerconfigjson":
+        return CommandResult(
+            status="fail",
+            reason="image pull Secret must use type kubernetes.io/dockerconfigjson",
+            evidence={"configured": True, "secret_name": name},
+        )
+    return CommandResult(
+        status="pass",
+        evidence={
+            "configured": True,
+            "secret_name": name,
+            "secret_type": resource_type,
+            "namespace_bound": declared_namespace == namespace,
+        },
+    )
+
+
 def _evict_pod(
     pod_name: str,
     *,
@@ -361,21 +485,53 @@ def _image_transform(image: str) -> dict[str, str]:
     return {"newName": image[:colon], "newTag": image[colon + 1 :]}
 
 
+def _registry_digest_reference(image: str) -> tuple[str, str] | None:
+    """Return a registry-qualified immutable image reference.
+
+    Kubernetes accepts an unqualified image name and resolves it through a
+    default registry. That is not sufficient for production evidence: the
+    exact registry and content digest must be visible in the rendered
+    Deployment. A registry host is identified by the same syntax used by
+    OCI/Docker references (a dot, a port, or the literal ``localhost`` in
+    the first path component).
+    """
+
+    match = _IMAGE_REFERENCE_RE.fullmatch(image.strip())
+    if match is None:
+        return None
+    name = match.group("name")
+    if name != name.lower() or "://" in name or "/" not in name:
+        return None
+    first_component, repository_path = name.split("/", 1)
+    if not repository_path or ":" in repository_path:
+        return None
+    host = first_component
+    has_port = ":" in first_component
+    if has_port:
+        host, port = first_component.rsplit(":", 1)
+        if not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
+            return None
+    if not (host == "localhost" or "." in host or has_port):
+        return None
+    return name, match.group("digest").lower()
+
+
 def _production_image_contract(image: str, upgrade_image: str) -> tuple[bool, tuple[str, ...]]:
-    """Require two distinct immutable, non-example production image refs."""
+    """Require two distinct registry-qualified immutable production refs."""
 
     reasons: list[str] = []
     values = (image.strip(), upgrade_image.strip())
     digests: list[str] = []
     for label, value in zip(("initial", "upgrade"), values, strict=True):
-        if "@sha256:" not in value:
-            reasons.append(f"{label} runtime image must use a sha256 digest")
+        parsed = _registry_digest_reference(value)
+        if parsed is None:
+            reasons.append(
+                f"{label} runtime image must use a registry-qualified "
+                "name@sha256:<64-hex-digest> reference"
+            )
             continue
-        name, digest = value.split("@", 1)
-        if not name or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
-            reasons.append(f"{label} runtime image digest is malformed")
-        else:
-            digests.append(digest.lower())
+        name, digest = parsed
+        digests.append(digest)
         if any(token in name.lower() for token in ("example", "replace", "latest")):
             reasons.append(f"{label} runtime image uses a placeholder registry/reference")
     if values[0] == values[1] or (len(digests) == 2 and digests[0] == digests[1]):
@@ -409,10 +565,20 @@ def _hpa_status_contract(
     if not isinstance(metrics, list) or not metrics:
         reasons.append("worker HPA has no current metric samples")
     configured = spec.get("metrics")
-    if not isinstance(configured, list) or not any(
-        isinstance(item, Mapping) and item.get("type") == "External" for item in configured
-    ):
-        reasons.append("worker HPA has no backlog external metric")
+    configured_names = (
+        {
+            item.get("external", {}).get("metric", {}).get("name")
+            for item in configured
+            if isinstance(item, Mapping)
+            and item.get("type") == "External"
+            and isinstance(item.get("external"), Mapping)
+            and isinstance(item["external"].get("metric"), Mapping)
+        }
+        if isinstance(configured, list)
+        else set()
+    )
+    if _HPA_BACKLOG_METRIC not in configured_names:
+        reasons.append("worker HPA does not configure the exact backlog external metric")
     for key in ("currentReplicas", "desiredReplicas"):
         value = status.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -618,10 +784,7 @@ def _prepare_worker_eviction_capacity(
         return (
             CommandResult(
                 status="fail",
-                reason=(
-                    "local-kind PDB eviction capacity is insufficient: "
-                    + ", ".join(failed)
-                ),
+                reason=("local-kind PDB eviction capacity is insufficient: " + ", ".join(failed)),
             ),
             details,
         )
@@ -638,10 +801,10 @@ def _finite_nonnegative_number(value: object) -> float | None:
         if match is None:
             return None
         try:
-            number = Decimal(match.group("number")) * _KUBERNETES_QUANTITY_FACTORS.get(
+            parsed_number = Decimal(match.group("number")) * _KUBERNETES_QUANTITY_FACTORS.get(
                 match.group("suffix") or "", Decimal(1)
             )
-            number = float(number)
+            number = float(parsed_number)
         except (InvalidOperation, OverflowError, ValueError):
             return None
     else:
@@ -670,20 +833,134 @@ def _hpa_metric_value(hpa: Mapping[str, Any]) -> float | None:
         metric_spec = external.get("metric")
         if not isinstance(metric_spec, Mapping):
             continue
-        if metric_spec.get("name") != "trpc_session_ready_backlog":
+        if metric_spec.get("name") != _HPA_BACKLOG_METRIC:
             continue
         current = external.get("current")
         if not isinstance(current, Mapping):
             return None
         # External metrics can expose either value or averageValue.  The
-        # service HPA uses value; accepting averageValue keeps the observer
-        # compatible with API-server adapters without trusting driver output.
+        # service HPA uses AverageValue, so this status value is the
+        # controller's per-replica view and is not directly comparable with
+        # the namespace total returned by the external metrics API.
         for key in ("value", "averageValue"):
             parsed = _finite_nonnegative_number(current.get(key))
             if parsed is not None:
                 return parsed
         return None
     return None
+
+
+def _external_metric_from_api(
+    payload: Mapping[str, Any] | None, *, namespace: str
+) -> tuple[float | None, dict[str, Any], tuple[str, ...]]:
+    """Parse one namespace-scoped ExternalMetricValueList fail-closed."""
+
+    evidence: dict[str, Any] = {
+        "api_observed": False,
+        "api_version": _EXTERNAL_METRICS_API_VERSION,
+        "metric_name": _HPA_BACKLOG_METRIC,
+        "namespace": namespace,
+    }
+    if not isinstance(payload, Mapping):
+        return None, evidence, ("external metrics API response is unavailable",)
+    expected_api_version = f"external.metrics.k8s.io/{_EXTERNAL_METRICS_API_VERSION}"
+    if payload.get("apiVersion") != expected_api_version:
+        return (
+            None,
+            {**evidence, "api_version": payload.get("apiVersion")},
+            ("external metrics API response version is invalid",),
+        )
+    if payload.get("kind") != "ExternalMetricValueList":
+        return (
+            None,
+            {**evidence, "api_version": expected_api_version},
+            ("external metrics API response kind is invalid",),
+        )
+    items = payload.get("items")
+    if not isinstance(items, list) or len(items) != 1:
+        return (
+            None,
+            {**evidence, "item_count": len(items) if isinstance(items, list) else None},
+            ("external metrics API must return exactly one backlog value",),
+        )
+    item = items[0]
+    if not isinstance(item, Mapping):
+        return None, {**evidence, "item_count": 1}, ("external metrics API value is invalid",)
+    if item.get("metricName") != _HPA_BACKLOG_METRIC:
+        return (
+            None,
+            {**evidence, "item_count": 1},
+            ("external metrics API returned an unexpected metric name",),
+        )
+    labels = item.get("metricLabels")
+    if not isinstance(labels, Mapping) or labels.get("namespace") != namespace:
+        return (
+            None,
+            {
+                **evidence,
+                "item_count": 1,
+                "label_namespace": labels.get("namespace") if isinstance(labels, Mapping) else None,
+            },
+            ("external metrics API value is not namespace-bound",),
+        )
+    value = _finite_nonnegative_number(item.get("value"))
+    if value is None:
+        return (
+            None,
+            {**evidence, "item_count": 1, "label_namespace": namespace},
+            ("external metrics API value is not finite and nonnegative",),
+        )
+    return (
+        value,
+        {
+            **evidence,
+            "api_observed": True,
+            "item_count": 1,
+            "label_namespace": namespace,
+            "value": value,
+        },
+        (),
+    )
+
+
+def _observe_external_metric(
+    *, namespace: str, context: str | None, timeout_seconds: float
+) -> tuple[CommandResult, float | None]:
+    """Read the external metrics API directly, never a driver-supplied file."""
+
+    path = (
+        f"/apis/external.metrics.k8s.io/{_EXTERNAL_METRICS_API_VERSION}/namespaces/"
+        f"{namespace}/{_HPA_BACKLOG_METRIC}"
+    )
+    result, payload = _json_command(
+        ["get", "--raw", path],
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    base_evidence = {"api_path": path}
+    if result.status != "pass":
+        return (
+            CommandResult(
+                status=result.status,
+                exit_code=result.exit_code,
+                reason="external metrics API read failed",
+                stderr=result.stderr,
+                evidence=base_evidence,
+            ),
+            None,
+        )
+    value, evidence, reasons = _external_metric_from_api(payload, namespace=namespace)
+    evidence = {**base_evidence, **evidence}
+    if reasons:
+        return (
+            CommandResult(
+                status="fail",
+                reason="; ".join(reasons),
+                evidence=evidence,
+            ),
+            None,
+        )
+    return CommandResult(status="pass", evidence=evidence), value
 
 
 def _hpa_observation_from_api(
@@ -734,7 +1011,7 @@ def _hpa_observation_from_api(
 def _observe_hpa_state(
     *, namespace: str, context: str | None, timeout_seconds: float
 ) -> tuple[CommandResult, dict[str, Any] | None]:
-    """Read one HPA phase from the live API server, never from a driver file."""
+    """Read one HPA phase and its direct external metric from the API server."""
 
     timeout_seconds = _validate_timeout_seconds(timeout_seconds)
     hpa_result, hpa = _json_command(
@@ -754,6 +1031,29 @@ def _observe_hpa_state(
     observation, reasons = _hpa_observation_from_api(hpa, deployment)
     if observation is None:
         return CommandResult(status="fail", reason="; ".join(reasons)), None
+    external_result, external_value = _observe_external_metric(
+        namespace=namespace,
+        context=context,
+        timeout_seconds=timeout_seconds,
+    )
+    if external_result.status != "pass" or external_value is None:
+        return (
+            CommandResult(
+                status=external_result.status,
+                reason=external_result.reason or "external metrics API observation failed",
+                stderr=external_result.stderr,
+                evidence=external_result.evidence,
+            ),
+            None,
+        )
+    # The HPA status reports ``averageValue`` for an AverageValue target,
+    # while the namespace-scoped external metrics API reports the aggregate
+    # backlog.  Preserve the controller's view for diagnostics, but use the
+    # direct API aggregate as the load-transition signal.  Requiring equality
+    # here would discard every healthy scaled observation once replicas > 1.
+    observation["hpa_metric_value"] = observation["metric_value"]
+    observation["metric_value"] = external_value
+    observation["external_metric"] = external_result.evidence or {}
     return CommandResult(status="pass"), observation
 
 
@@ -787,9 +1087,7 @@ def _hpa_phase_transition_contract(
         candidate_ready = number(candidate.get("ready_replicas"), "during.ready_replicas")
 
         replicas_increased = any(
-            baseline is not None
-            and observed is not None
-            and observed > baseline
+            baseline is not None and observed is not None and observed > baseline
             for baseline, observed in (
                 (before_desired, candidate_desired),
                 (before_current, candidate_current),
@@ -820,9 +1118,7 @@ def _hpa_phase_transition_contract(
             # pre-load bound while still requiring the Deployment readiness
             # check below.
             if max(candidate_current, candidate_ready) < before_desired:
-                reasons.append(
-                    "HPA current replicas did not reach the pre-load desired bound"
-                )
+                reasons.append("HPA current replicas did not reach the pre-load desired bound")
         if candidate_ready is not None and candidate_desired is not None:
             if candidate_ready < candidate_desired:
                 reasons.append("HPA scaled replicas did not become ready")
@@ -1048,6 +1344,36 @@ def _hpa_load_observation_contract(
         else:
             observations[phase] = value
 
+    expected_namespace = namespace or evidence.get("namespace")
+    for phase, observation in observations.items():
+        external = observation.get("external_metric")
+        if not isinstance(external, Mapping):
+            reasons.append(f"HPA {phase} observation lacks direct external metric API evidence")
+            continue
+        if external.get("api_observed") is not True:
+            reasons.append(f"HPA {phase} external metric API was not observed")
+        if external.get("metric_name") != _HPA_BACKLOG_METRIC:
+            reasons.append(f"HPA {phase} external metric name is not bound")
+        if expected_namespace is not None:
+            if external.get("namespace") != expected_namespace:
+                reasons.append(f"HPA {phase} external metric namespace is not bound")
+            if external.get("label_namespace") != expected_namespace:
+                reasons.append(f"HPA {phase} external metric label namespace is not bound")
+            expected_path = (
+                f"/apis/external.metrics.k8s.io/{_EXTERNAL_METRICS_API_VERSION}/namespaces/"
+                f"{expected_namespace}/{_HPA_BACKLOG_METRIC}"
+            )
+            if external.get("api_path") != expected_path:
+                reasons.append(f"HPA {phase} external metric API path is not namespace-bound")
+        if external.get("item_count") != 1:
+            reasons.append(f"HPA {phase} external metric API item count is invalid")
+        direct_value = _finite_nonnegative_number(external.get("value"))
+        observed_value = _finite_nonnegative_number(observation.get("metric_value"))
+        if direct_value is None:
+            reasons.append(f"HPA {phase} external metric value is not finite and nonnegative")
+        elif observed_value is not None and direct_value != observed_value:
+            reasons.append(f"HPA {phase} external metric value does not match observed metric")
+
     def number(phase: str, key: str) -> float | None:
         value = observations.get(phase, {}).get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1071,18 +1397,20 @@ def _hpa_load_observation_contract(
     after_current = number("after", "current_replicas")
     after_ready = number("after", "ready_replicas")
     replicas_increased = any(
-        baseline is not None
-        and observed is not None
-        and observed > baseline
+        baseline is not None and observed is not None and observed > baseline
         for baseline, observed in (
             (before_desired, during_desired),
             (before_current, during_current),
             (before_ready, during_ready),
         )
     )
-    if before_metric is not None and during_metric is not None and (
-        during_metric < before_metric
-        or (during_metric == before_metric and (during_metric <= 0 or not replicas_increased))
+    if (
+        before_metric is not None
+        and during_metric is not None
+        and (
+            during_metric < before_metric
+            or (during_metric == before_metric and (during_metric <= 0 or not replicas_increased))
+        )
     ):
         reasons.append("controlled backlog did not increase the observed HPA metric")
     if not replicas_increased:
@@ -1106,11 +1434,7 @@ def _hpa_load_observation_contract(
         after_current is not None
         and during_current is not None
         and after_current > during_current
-        and (
-            after_desired is None
-            or before_desired is None
-            or after_desired > before_desired
-        )
+        and (after_desired is None or before_desired is None or after_desired > before_desired)
     ):
         reasons.append("HPA current replicas increased after controlled load removal")
     if after_ready is not None and after_desired is not None and after_ready < after_desired:
@@ -1150,6 +1474,24 @@ def _hpa_load_report_payload(evidence: Mapping[str, Any] | None) -> dict[str, An
             for key in ("metric_value", "desired_replicas", "current_replicas", "ready_replicas")
             if isinstance(observation, Mapping) and key in observation
         }
+        if isinstance(observation, Mapping) and isinstance(
+            observation.get("external_metric"), Mapping
+        ):
+            external = observation["external_metric"]
+            result[phase]["external_metric"] = {
+                key: external.get(key)
+                for key in (
+                    "api_observed",
+                    "api_version",
+                    "api_path",
+                    "metric_name",
+                    "namespace",
+                    "label_namespace",
+                    "item_count",
+                    "value",
+                )
+                if key in external
+            }
     return result
 
 
@@ -1163,6 +1505,7 @@ def _write_overlay(
     run_nonce: str | None = None,
     cluster_fingerprint: str | None = None,
     expires_at: str | None = None,
+    image_pull_secret: str | None = None,
 ) -> Path:
     image_transform = _image_transform(image)
 
@@ -1180,17 +1523,13 @@ def _write_overlay(
     if local_kind:
         replica_patch = directory / "kind-capacity-patch.yaml"
         replica_documents: list[dict[str, Any]] = []
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             replica_documents.append(
                 {
                     "apiVersion": "apps/v1",
                     "kind": "Deployment",
                     "metadata": {"name": deployment},
-                    "spec": {
-                        "replicas": 2
-                        if deployment in _PDB_PROTECTED_DEPLOYMENTS
-                        else 1
-                    },
+                    "spec": {"replicas": 2 if deployment in _PDB_PROTECTED_DEPLOYMENTS else 1},
                 }
             )
         replica_documents.extend(
@@ -1215,6 +1554,23 @@ def _write_overlay(
     else:
         replica_patch = OVERLAY_ROOT / "replicas-patch.yaml"
     relative_replica_patch = resource_path(replica_patch)
+    provider_disabled_patch = directory / "provider-disabled-patch.yaml"
+    provider_disabled_patch.write_text(
+        yaml.safe_dump_all(
+            [
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": deployment},
+                    "spec": {"replicas": 0},
+                }
+                for deployment in ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS
+            ],
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    relative_provider_disabled_patch = resource_path(provider_disabled_patch)
     relative_config_patch = resource_path(OVERLAY_ROOT / "production-config-patch.yaml")
     namespace_labels = {
         RUNTIME_NAMESPACE_OWNER_LABEL: RUNTIME_NAMESPACE_OWNER_VALUE,
@@ -1250,6 +1606,7 @@ def _write_overlay(
         *image_lines,
         "patches:",
         f"  - path: {relative_replica_patch}",
+        f"  - path: {relative_provider_disabled_patch}",
         f"  - path: {relative_config_patch}",
     ]
     if node_label is not None:
@@ -1268,6 +1625,31 @@ def _write_overlay(
                 "    path: controlled-node-patch.yaml",
             ]
         )
+    if image_pull_secret:
+        if not _valid_image_pull_secret_name(image_pull_secret):
+            raise ValueError("image pull Secret name is invalid")
+        image_pull_secret_patch = directory / "image-pull-secret-patch.yaml"
+        image_pull_secret_patch.write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "op": "add",
+                        "path": "/spec/template/spec/imagePullSecrets",
+                        "value": [{"name": image_pull_secret}],
+                    }
+                ],
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        for kind in ("Deployment", "Job"):
+            lines.extend(
+                [
+                    "  - target:",
+                    f"      kind: {kind}",
+                    "    path: image-pull-secret-patch.yaml",
+                ]
+            )
     lines.append("")
     content = "\n".join(lines)
     path = directory / "kustomization.yaml"
@@ -1326,6 +1708,58 @@ def _split_migration_manifests(rendered: str) -> tuple[str, str]:
     )
 
 
+def _runtime_object_store_override(
+    rendered: str, *, endpoint: str, bucket: str
+) -> tuple[str, dict[str, Any]]:
+    """Apply one credential-free acceptance endpoint to the rendered ConfigMap."""
+
+    normalized_endpoint = endpoint.strip().rstrip("/")
+    normalized_bucket = bucket.strip()
+    try:
+        parsed = urlsplit(normalized_endpoint)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("runtime object-store endpoint is invalid") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise ValueError("runtime object-store endpoint must be a credential-free HTTP(S) origin")
+    if S3_BUCKET_RE.fullmatch(normalized_bucket) is None:
+        raise ValueError("runtime object-store bucket is invalid")
+    try:
+        documents = [document for document in yaml.safe_load_all(rendered) if document is not None]
+    except yaml.YAMLError as error:
+        raise ValueError("rendered manifest is not valid YAML") from error
+    configs = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "ConfigMap"
+        and isinstance(document.get("metadata"), dict)
+        and document["metadata"].get("name") == "trpc-service-config"
+    ]
+    if len(configs) != 1 or not isinstance(configs[0].get("data"), dict):
+        raise ValueError("rendered manifest must contain one trpc-service-config ConfigMap")
+    configs[0]["data"]["TRPC_SERVICE_S3_ENDPOINT"] = normalized_endpoint
+    configs[0]["data"]["TRPC_SERVICE_S3_BUCKET"] = normalized_bucket
+    return (
+        yaml.safe_dump_all(documents, sort_keys=False),
+        {
+            "status": "pass",
+            "endpoint_sha256": hashlib.sha256(normalized_endpoint.encode()).hexdigest(),
+            "bucket_sha256": hashlib.sha256(normalized_bucket.encode()).hexdigest(),
+            "credentials_recorded": False,
+        },
+    )
+
+
 def _rendered_manifest_contract(
     rendered: str, *, local_kind: bool = False
 ) -> tuple[bool, tuple[str, ...]]:
@@ -1379,11 +1813,19 @@ def _rendered_manifest_contract(
             reasons.append(f"{name} HPA replica bounds are invalid")
         if not isinstance(metrics, list) or not metrics:
             reasons.append(f"{name} HPA has no resource metrics")
-        if name == "trpc-worker" and not any(
-            isinstance(metric, Mapping) and metric.get("type") == "External"
-            for metric in metrics or ()
-        ):
-            reasons.append("trpc-worker HPA has no backlog external metric")
+        if name == "trpc-worker":
+            external_names = {
+                metric.get("external", {}).get("metric", {}).get("name")
+                for metric in metrics or ()
+                if isinstance(metric, Mapping)
+                and metric.get("type") == "External"
+                and isinstance(metric.get("external"), Mapping)
+                and isinstance(metric["external"].get("metric"), Mapping)
+            }
+            if _HPA_BACKLOG_METRIC not in external_names:
+                reasons.append(
+                    "trpc-worker HPA does not configure the exact backlog external metric"
+                )
 
     for kind, name in (
         ("PodDisruptionBudget", "trpc-worker"),
@@ -1417,7 +1859,7 @@ def _rendered_manifest_contract(
     ):
         reasons.append("schema migration Job has no active deadline")
 
-    for deployment_name, _container_name in DEPLOYMENTS:
+    for deployment_name, _container_name in PRODUCTION_DEPLOYMENTS:
         deployment = resources.get(("Deployment", deployment_name))
         if not isinstance(deployment, Mapping):
             reasons.append(f"required deployment {deployment_name} is missing")
@@ -1458,7 +1900,7 @@ def _rendered_manifest_contract(
             prestop = lifecycle.get("preStop") if isinstance(lifecycle, Mapping) else None
             if not isinstance(prestop, Mapping):
                 reasons.append(f"{deployment_name}/{container_name} has no preStop hook")
-            else:
+            elif deployment_name != "trpc-backlog-exporter":
                 command = (
                     prestop.get("exec", {}).get("command", [])
                     if isinstance(prestop.get("exec"), Mapping)
@@ -1469,7 +1911,76 @@ def _rendered_manifest_contract(
                     reasons.append(
                         f"{deployment_name}/{container_name} preStop does not call its exact drain"
                     )
-            if deployment_name not in {"trpc-gateway", "trpc-admin"}:
+            if deployment_name == "trpc-backlog-exporter":
+                if container.get("command") != [
+                    "python",
+                    "scripts/session_ready_backlog_exporter.py",
+                ]:
+                    reasons.append(
+                        "trpc-backlog-exporter does not run the fixed backlog exporter command"
+                    )
+                env = container.get("env")
+                env_by_name = (
+                    {
+                        item.get("name"): item
+                        for item in env
+                        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+                    }
+                    if isinstance(env, list)
+                    else {}
+                )
+                dsn_ref = env_by_name.get("TRPC_SERVICE_METRICS_DATABASE_DSN")
+                dsn_source = dsn_ref.get("valueFrom") if isinstance(dsn_ref, Mapping) else None
+                dsn_secret = (
+                    dsn_source.get("secretKeyRef") if isinstance(dsn_source, Mapping) else None
+                )
+                if (
+                    not isinstance(dsn_secret, Mapping)
+                    or dsn_secret.get("name") != "trpc-metrics-secrets"
+                    or dsn_secret.get("key") != "TRPC_SERVICE_METRICS_DATABASE_DSN"
+                ):
+                    reasons.append(
+                        "trpc-backlog-exporter metrics DSN is not sourced from trpc-metrics-secrets"
+                    )
+                namespace_ref = env_by_name.get("TRPC_BACKLOG_NAMESPACE")
+                namespace_source = (
+                    namespace_ref.get("valueFrom") if isinstance(namespace_ref, Mapping) else None
+                )
+                field_ref = (
+                    namespace_source.get("fieldRef")
+                    if isinstance(namespace_source, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(field_ref, Mapping)
+                    or field_ref.get("fieldPath") != "metadata.namespace"
+                ):
+                    reasons.append(
+                        "trpc-backlog-exporter namespace is not sourced from metadata.namespace"
+                    )
+                ports = container.get("ports")
+                if not isinstance(ports, list) or not any(
+                    isinstance(port, Mapping)
+                    and port.get("name") == "metrics"
+                    and port.get("containerPort") == 9100
+                    for port in ports
+                ):
+                    reasons.append("trpc-backlog-exporter does not expose metrics port 9100")
+                for probe_name, expected_path in (
+                    ("readinessProbe", "/health/ready"),
+                    ("livenessProbe", "/health/live"),
+                ):
+                    probe = container.get(probe_name)
+                    http_get = probe.get("httpGet") if isinstance(probe, Mapping) else None
+                    if (
+                        not isinstance(http_get, Mapping)
+                        or http_get.get("path") != expected_path
+                        or http_get.get("port") != "metrics"
+                    ):
+                        reasons.append(
+                            f"trpc-backlog-exporter has no exact {probe_name} HTTP probe"
+                        )
+            elif deployment_name not in {"trpc-gateway", "trpc-admin"}:
                 readiness = container.get("readinessProbe")
                 liveness = container.get("livenessProbe")
                 for probe_name, probe in (("readiness", readiness), ("liveness", liveness)):
@@ -1585,8 +2096,12 @@ def _production_render_contract(
         containers = pod_spec.get("containers", []) if isinstance(pod_spec, Mapping) else []
         for container in containers if isinstance(containers, list) else ():
             image = container.get("image") if isinstance(container, Mapping) else None
-            if not allow_local_images and (not isinstance(image, str) or "@sha256:" not in image):
-                reasons.append("production Deployment image is not digest-pinned")
+            if not allow_local_images:
+                if not isinstance(image, str) or _registry_digest_reference(image) is None:
+                    reasons.append(
+                        "production Deployment image is not a registry-qualified "
+                        "name@sha256:<64-hex-digest> reference"
+                    )
     if allow_local_images:
         reasons = [reason for reason in reasons if "placeholder" not in reason]
     return not reasons, tuple(dict.fromkeys(reasons))
@@ -1744,6 +2259,11 @@ def _report(
                 "manual_scale_is_not_evidence": True,
                 "required_phases": ["before", "during", "after"],
             },
+            "rollback_policy": {
+                "deployment": _ROLLBACK_PROBE_DEPLOYMENT,
+                "failure_image_is_registry_local_and_unavailable": True,
+                "requires_failed_rollout_undo_and_ready_recovery": True,
+            },
             "static_manifest_checks_do_not_upgrade_runtime_gate": True,
         },
         "candidate": candidate,
@@ -1886,6 +2406,25 @@ def _runtime_attestation_contract(
     """
 
     reasons: list[str] = []
+    topology = candidate.get("topology")
+    expected_runtime_deployments = [name for name, _container in ACK_RUNTIME_DEPLOYMENTS]
+    if not isinstance(topology, Mapping):
+        reasons.append("unified-cluster runtime topology is missing")
+    else:
+        if topology.get("scope") != ACK_RUNTIME_SCOPE:
+            reasons.append("runtime topology scope is not unified_cluster_runtime")
+        if topology.get("im_deployment") != ACK_IM_DEPLOYMENT:
+            reasons.append("runtime topology does not bind IM to the production cluster")
+        if topology.get("production_deployments") != [
+            name for name, _container in PRODUCTION_DEPLOYMENTS
+        ]:
+            reasons.append("runtime topology production deployment set is invalid")
+        if topology.get("tested_deployments") != expected_runtime_deployments:
+            reasons.append("runtime topology tested deployment set is invalid")
+        if topology.get("provider_disabled_deployments") != list(
+            ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS
+        ):
+            reasons.append("runtime topology provider-disabled deployment set is invalid")
     checks = candidate.get("checks")
     if not isinstance(checks, Mapping):
         return False, ("runtime checks are unavailable",)
@@ -1965,7 +2504,7 @@ def _runtime_attestation_contract(
     if require_node_eviction and node_eviction_status != "pass":
         reasons.append("runtime_attestation node eviction status is not pass")
     image_ids = attestation.get("image_ids")
-    expected_deployments = {name for name, _container in DEPLOYMENTS}
+    expected_deployments = {name for name, _container in ACK_RUNTIME_DEPLOYMENTS}
     validated_image_ids: dict[str, dict[str, str]] = {}
     if (
         not isinstance(image_ids, Mapping)
@@ -2010,6 +2549,33 @@ def _runtime_attestation_contract(
         )
         if not image_ok:
             reasons.extend(image_reasons)
+    rolling = checks.get("rolling_upgrade")
+    rollback = rolling.get("rollback") if isinstance(rolling, Mapping) else None
+    if not isinstance(rollback, Mapping) or rollback.get("status") != "pass":
+        reasons.append("rolling upgrade failure rollback was not observed")
+    else:
+        if rollback.get("deployment") != _ROLLBACK_PROBE_DEPLOYMENT:
+            reasons.append("rolling upgrade rollback probe deployment is invalid")
+        for field in (
+            "failure_injected",
+            "failure_observed",
+            "undo_observed",
+            "readiness_recovered",
+        ):
+            if rollback.get(field) is not True:
+                reasons.append(f"rolling upgrade rollback {field} was not observed")
+        restored = rollback.get("restored_image_ids")
+        expected_upgrade = None
+        if isinstance(rolling, Mapping):
+            rolling_images = rolling.get("image_ids")
+            if isinstance(rolling_images, Mapping):
+                upgrade = rolling_images.get("upgrade")
+                if isinstance(upgrade, Mapping):
+                    expected_upgrade = upgrade.get(_ROLLBACK_PROBE_DEPLOYMENT)
+        if not isinstance(restored, list) or restored != expected_upgrade:
+            reasons.append(
+                "rolling upgrade rollback did not restore the known-good worker image IDs"
+            )
     return not reasons, tuple(dict.fromkeys(reasons))
 
 
@@ -2312,11 +2878,12 @@ def _run_hpa_driver(
             "TRPC_K8S_HPA_DRIVER_JOB_IMAGE": os.getenv(
                 "TRPC_K8S_RUNTIME_HPA_JOB_IMAGE", os.getenv("TRPC_K8S_RUNTIME_IMAGE", "")
             ),
-            "TRPC_K8S_HPA_DRIVER_JOB_COMMAND": os.getenv(
-                "TRPC_K8S_RUNTIME_HPA_JOB_COMMAND", ""
-            ),
+            "TRPC_K8S_HPA_DRIVER_JOB_COMMAND": os.getenv("TRPC_K8S_RUNTIME_HPA_JOB_COMMAND", ""),
         }
     )
+    image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
+    if image_pull_secret:
+        environment["TRPC_K8S_HPA_DRIVER_IMAGE_PULL_SECRET"] = image_pull_secret
     if effective_driver_context:
         environment["TRPC_K8S_HPA_CONTEXT"] = effective_driver_context
     before_job: dict[str, Any] | None = None
@@ -2557,15 +3124,28 @@ def _driver_identity_and_scope(
             },
             separators=(",", ":"),
         )
-        result, payload = _driver_json(
-            ["create", "--raw", "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "-f", "-"],
-            kubeconfig_path=kubeconfig_path,
-            context=driver_context,
-            timeout_seconds=timeout_seconds,
-            input_text=body,
-        )
-        status_value = payload.get("status") if isinstance(payload, Mapping) else None
-        if result.status != "pass" or not isinstance(status_value, Mapping):
+        status_value: Mapping[str, Any] | None = None
+        for attempt in range(3):
+            result, payload = _driver_json(
+                [
+                    "create",
+                    "--raw",
+                    "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                    "-f",
+                    "-",
+                ],
+                kubeconfig_path=kubeconfig_path,
+                context=driver_context,
+                timeout_seconds=timeout_seconds,
+                input_text=body,
+            )
+            candidate_status = payload.get("status") if isinstance(payload, Mapping) else None
+            if result.status == "pass" and isinstance(candidate_status, Mapping):
+                status_value = candidate_status
+                break
+            if attempt < 2:
+                time.sleep(0.25)
+        if status_value is None:
             return None, None, False, "SelfSubjectRulesReview could not be observed"
         if status_value.get("incomplete") is True:
             return None, None, False, "SelfSubjectRulesReview is incomplete"
@@ -2602,8 +3182,10 @@ def _driver_identity_and_scope(
                 return None, None, False, "SelfSubjectRulesReview has an invalid non-resource rule"
             urls = rule.get("nonResourceURLs")
             verbs = rule.get("verbs")
-            if not isinstance(urls, list) or not urls or not all(
-                isinstance(url, str) and url for url in urls
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or not all(isinstance(url, str) and url for url in urls)
             ):
                 return None, None, False, "SelfSubjectRulesReview has an invalid non-resource rule"
             if not isinstance(verbs, list) or not verbs or any(verb != "get" for verb in verbs):
@@ -2708,9 +3290,7 @@ def _driver_identity_and_scope(
                 "role_name": _HPA_DRIVER_ROLE_NAME,
             }:
                 reasons.append("HPA driver RoleBinding is outside the declared target Role")
-        if clusterrolebinding_result.status == "pass" and isinstance(
-            clusterrolebindings, Mapping
-        ):
+        if clusterrolebinding_result.status == "pass" and isinstance(clusterrolebindings, Mapping):
             matching_clusterrolebindings = []
             for item in clusterrolebindings.get("items", []):
                 if not isinstance(item, Mapping):
@@ -2724,9 +3304,7 @@ def _driver_identity_and_scope(
                     for value in subjects
                 ):
                     matching_clusterrolebindings.append(item)
-            binding_audit["matching_clusterrolebinding_count"] = len(
-                matching_clusterrolebindings
-            )
+            binding_audit["matching_clusterrolebinding_count"] = len(matching_clusterrolebindings)
             if matching_clusterrolebindings:
                 reasons.append("HPA driver subject has a ClusterRoleBinding")
         if (
@@ -2868,6 +3446,93 @@ def _parse_controlled_node_label(value: str) -> tuple[str, str] | None:
     return key, label_value
 
 
+def _pdb_selector_matches_pod(
+    selector: object,
+    labels: object,
+) -> bool:
+    """Match the conservative PDB selector subset used for safe node drains."""
+
+    if not isinstance(selector, Mapping) or not isinstance(labels, Mapping):
+        return False
+    match_labels = selector.get("matchLabels")
+    if not isinstance(match_labels, Mapping) or not match_labels:
+        return False
+    match_expressions = selector.get("matchExpressions")
+    if match_expressions not in (None, []):
+        return False
+    return all(labels.get(key) == value for key, value in match_labels.items())
+
+
+def _pdb_protected_system_pod(
+    pod: Mapping[str, Any],
+    pdb_items: Sequence[object],
+) -> bool:
+    """Accept one ready kube-system replica only when one fresh PDB permits eviction."""
+
+    metadata_value = pod.get("metadata")
+    metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+    namespace = metadata.get("namespace")
+    labels = metadata.get("labels")
+    owners_value = metadata.get("ownerReferences")
+    owners = owners_value if isinstance(owners_value, list) else []
+    controlled_replica = any(
+        isinstance(owner, Mapping)
+        and owner.get("controller") is True
+        and owner.get("kind") in {"ReplicaSet", "StatefulSet"}
+        for owner in owners
+    )
+    status_value = pod.get("status")
+    status = status_value if isinstance(status_value, Mapping) else {}
+    conditions = status.get("conditions") if isinstance(status, Mapping) else []
+    ready = any(
+        isinstance(condition, Mapping)
+        and condition.get("type") == "Ready"
+        and condition.get("status") == "True"
+        for condition in conditions or ()
+    )
+    if namespace != "kube-system" or not controlled_replica or not ready:
+        return False
+
+    matching: list[Mapping[str, Any]] = []
+    for pdb in pdb_items:
+        if not isinstance(pdb, Mapping):
+            continue
+        pdb_metadata_value = pdb.get("metadata")
+        pdb_metadata = pdb_metadata_value if isinstance(pdb_metadata_value, Mapping) else {}
+        if pdb_metadata.get("namespace") != namespace:
+            continue
+        spec_value = pdb.get("spec")
+        spec = spec_value if isinstance(spec_value, Mapping) else {}
+        if _pdb_selector_matches_pod(spec.get("selector"), labels):
+            matching.append(pdb)
+    if len(matching) != 1:
+        return False
+
+    pdb = matching[0]
+    pdb_metadata_value = pdb.get("metadata")
+    pdb_metadata = pdb_metadata_value if isinstance(pdb_metadata_value, Mapping) else {}
+    pdb_status_value = pdb.get("status")
+    pdb_status = pdb_status_value if isinstance(pdb_status_value, Mapping) else {}
+    generation = pdb_metadata.get("generation")
+    observed_generation = pdb_status.get("observedGeneration")
+    fresh = (
+        isinstance(generation, int)
+        and isinstance(observed_generation, int)
+        and generation == observed_generation
+    )
+    disruptions_allowed = pdb_status.get("disruptionsAllowed")
+    current_healthy = pdb_status.get("currentHealthy")
+    desired_healthy = pdb_status.get("desiredHealthy")
+    return (
+        fresh
+        and isinstance(disruptions_allowed, int)
+        and disruptions_allowed >= 1
+        and isinstance(current_healthy, int)
+        and isinstance(desired_healthy, int)
+        and current_healthy > desired_healthy
+    )
+
+
 def _node_drain_preflight(
     node_name: str,
     *,
@@ -2877,17 +3542,30 @@ def _node_drain_preflight(
     context: str | None,
     timeout_seconds: float,
     require_schedulable: bool = True,
+    require_cordoned: bool = False,
     require_gate_workload: bool = False,
+    node_read_attempt_limit: int = 1,
 ) -> tuple[CommandResult, dict[str, Any]]:
-    """Prove the explicitly named node is dedicated before any drain call."""
+    """Prove the named node contains only gate or safely disruptable system pods."""
 
-    node_result, node = _json_command(
-        ["get", "node", node_name, "-o", "json"],
-        context=context,
-        timeout_seconds=timeout_seconds,
-    )
+    node_result = CommandResult(status="not_run", reason="node was not observed")
+    node: dict[str, Any] | None = None
+    node_read_attempts = 0
+    for node_read_attempts in range(1, node_read_attempt_limit + 1):
+        node_result, node = _json_command(
+            ["get", "node", node_name, "-o", "json"],
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        if node_result.status == "pass" and node is not None:
+            break
+        if node_read_attempts < node_read_attempt_limit:
+            time.sleep(0.25)
     if node_result.status != "pass" or node is None:
-        return node_result, {"node": _result_payload(node_result)}
+        return node_result, {
+            "node": _result_payload(node_result),
+            "node_read_attempts": node_read_attempts,
+        }
     metadata_value = node.get("metadata")
     metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
     labels = metadata.get("labels") if isinstance(metadata, Mapping) else {}
@@ -2918,6 +3596,7 @@ def _node_drain_preflight(
     )
     items = pods.get("items") if isinstance(pods, Mapping) else None
     blockers: list[dict[str, str]] = []
+    system_candidates: list[Mapping[str, Any]] = []
     gate_namespace_pods = 0
     if isinstance(items, list):
         for item in items:
@@ -2939,9 +3618,44 @@ def _node_drain_preflight(
             mirror_pod = "kubernetes.io/config.mirror" in annotations
             if daemon_owned or mirror_pod:
                 continue
+            if item_namespace == "kube-system":
+                system_candidates.append(item)
+                continue
             blockers.append(
                 {
                     "namespace": item_namespace,
+                    "owner_kind": ",".join(
+                        str(owner.get("kind"))
+                        for owner in owners
+                        if isinstance(owner, Mapping) and owner.get("kind")
+                    )
+                    or "unknown",
+                }
+            )
+    pdb_result = CommandResult(status="not_run", reason="no system pod required PDB review")
+    protected_system_pods = 0
+    if system_candidates:
+        pdb_result, pdbs = _json_command(
+            ["get", "pdb", "--all-namespaces", "-o", "json"],
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        pdb_items = pdbs.get("items") if isinstance(pdbs, Mapping) else None
+        for item in system_candidates:
+            if (
+                pdb_result.status == "pass"
+                and isinstance(pdb_items, list)
+                and _pdb_protected_system_pod(item, pdb_items)
+            ):
+                protected_system_pods += 1
+                continue
+            metadata_value = item.get("metadata")
+            item_metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+            owners_value = item_metadata.get("ownerReferences")
+            owners = owners_value if isinstance(owners_value, list) else []
+            blockers.append(
+                {
+                    "namespace": "kube-system",
                     "owner_kind": ",".join(
                         str(owner.get("kind"))
                         for owner in owners
@@ -2957,6 +3671,8 @@ def _node_drain_preflight(
         reasons.append("controlled node is not Ready")
     if require_schedulable and not schedulable:
         reasons.append("controlled node is already cordoned")
+    if require_cordoned and schedulable:
+        reasons.append("controlled node was not observed cordoned")
     if pods_result.status != "pass":
         reasons.append("controlled node pod inventory could not be observed")
     if blockers:
@@ -2965,12 +3681,15 @@ def _node_drain_preflight(
         reasons.append("controlled node has no workload from the isolated gate namespace")
     details = {
         "node": _result_payload(node_result),
+        "node_read_attempts": node_read_attempts,
         "node_label_verified": label_ok,
         "node_ready": ready,
         "node_schedulable": schedulable,
         "pod_inventory": _result_payload(pods_result),
+        "pdb_inventory": _result_payload(pdb_result),
         "blocking_pod_count": len(blockers),
         "blocking_owner_kinds": sorted({item["owner_kind"] for item in blockers}),
+        "pdb_protected_system_pod_count": protected_system_pods,
         "gate_namespace_pod_count": gate_namespace_pods,
     }
     return (
@@ -3031,7 +3750,9 @@ def _controlled_node_drain(
             context=context,
             timeout_seconds=timeout_seconds,
             require_schedulable=False,
+            require_cordoned=True,
             require_gate_workload=True,
+            node_read_attempt_limit=3,
         )
         details["post_cordon_preflight"] = post_cordon_details
         if post_cordon_preflight.status != "pass":
@@ -3285,10 +4006,30 @@ def _missing_prerequisites(
             missing.append("TRPC_RELEASE_NONCE is required for a production runtime acceptance")
     image = required["TRPC_K8S_RUNTIME_IMAGE"] or ""
     upgrade_image = required["TRPC_K8S_RUNTIME_UPGRADE_IMAGE"] or ""
+    image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
+    if image_pull_secret and not _valid_image_pull_secret_name(image_pull_secret):
+        missing.append("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET is invalid")
     if not allow_local_images:
         valid_images, image_reasons = _production_image_contract(image, upgrade_image)
         if not valid_images:
             missing.extend(image_reasons)
+    object_store_endpoint = os.getenv("TRPC_K8S_RUNTIME_S3_ENDPOINT", "").strip()
+    object_store_bucket = os.getenv("TRPC_K8S_RUNTIME_S3_BUCKET", "").strip()
+    if bool(object_store_endpoint) != bool(object_store_bucket):
+        missing.append("TRPC_K8S_RUNTIME_S3_ENDPOINT and TRPC_K8S_RUNTIME_S3_BUCKET must be paired")
+    elif object_store_endpoint:
+        try:
+            config_map = (
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n"
+                "  name: trpc-service-config\ndata: {}\n"
+            )
+            _runtime_object_store_override(
+                config_map,
+                endpoint=object_store_endpoint,
+                bucket=object_store_bucket,
+            )
+        except ValueError as error:
+            missing.append(str(error))
     return missing
 
 
@@ -3333,13 +4074,35 @@ def _first_worker_pod(
     items = payload.get("items")
     if not isinstance(items, list) or not items:
         return CommandResult(status="fail", reason="no worker pod was found"), None
-    first = items[0]
-    if not isinstance(first, dict):
-        return CommandResult(status="fail", reason="worker pod JSON was invalid"), None
-    metadata = first.get("metadata")
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
-        return CommandResult(status="fail", reason="worker pod has no name"), None
-    return result, metadata["name"]
+    ready_names: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        metadata = item.get("metadata")
+        status = item.get("status")
+        if not isinstance(metadata, Mapping) or not isinstance(status, Mapping):
+            continue
+        name = metadata.get("name")
+        conditions = status.get("conditions")
+        ready = isinstance(conditions, list) and any(
+            isinstance(condition, Mapping)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in conditions
+        )
+        if (
+            isinstance(name, str)
+            and name
+            and metadata.get("deletionTimestamp") is None
+            and status.get("phase") == "Running"
+            and ready
+        ):
+            ready_names.append(name)
+    if not ready_names:
+        return CommandResult(
+            status="fail", reason="no ready non-terminating worker pod was found"
+        ), None
+    return result, min(ready_names)
 
 
 def _deployment_ready(
@@ -3374,7 +4137,7 @@ def _rollout_all(
     timeout_seconds: float,
 ) -> dict[str, CommandResult]:
     checks: dict[str, CommandResult] = {}
-    for deployment, _container in DEPLOYMENTS:
+    for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
         checks[deployment] = _rollout_deployment(
             deployment,
             namespace=namespace,
@@ -3416,7 +4179,7 @@ def _rolling_upgrade_serial(
 
     image_updates: dict[str, CommandResult] = {}
     rollouts: dict[str, CommandResult] = {}
-    for deployment, container in DEPLOYMENTS:
+    for deployment, container in ACK_RUNTIME_DEPLOYMENTS:
         image_updates[deployment] = _kubectl(
             [
                 "set",
@@ -3507,7 +4270,14 @@ def _deployment_image_ids(
                     (),
                 )
             image_id = container.get("imageID")
-            digest = IMAGE_ID_DIGEST_RE.search(image_id) if isinstance(image_id, str) else None
+            if not isinstance(image_id, str):
+                return (
+                    CommandResult(
+                        status="fail", reason=f"{deployment} container image ID is invalid"
+                    ),
+                    (),
+                )
+            digest = IMAGE_ID_DIGEST_RE.search(image_id)
             if digest is None or digest.end() != len(image_id):
                 return (
                     CommandResult(
@@ -3554,6 +4324,152 @@ def _wait_for_deployment_image_ids(
     return CommandResult(status="fail", reason=last_reason), (), poll_count
 
 
+def _rollback_probe_image(image: str) -> str:
+    """Derive an intentionally unavailable image in the same registry.
+
+    The failure probe is used only inside the disposable acceptance namespace.
+    Keeping the registry host and changing the repository path avoids testing
+    a second registry while the all-zero digest makes accidental reuse of a
+    real release image infeasible.
+    """
+
+    parsed = _registry_digest_reference(image)
+    repository = parsed[0] if parsed is not None else image.split("@", 1)[0].strip()
+    slash = repository.rfind("/")
+    colon = repository.rfind(":")
+    if colon > slash:
+        repository = repository[:colon]
+    return f"{repository}/__trpc_runtime_gate_failure__@sha256:{'0' * 64}"
+
+
+def _failure_rollback(
+    deployment: str,
+    container: str,
+    known_good_image: str,
+    known_good_image_ids: tuple[str, ...],
+    *,
+    namespace: str,
+    context: str | None,
+    timeout_seconds: float,
+) -> tuple[CommandResult, dict[str, Any]]:
+    """Prove a failed rollout is recoverable in the isolated namespace.
+
+    The gate first points one representative worker Deployment at a
+    deliberately unavailable immutable image and requires rollout status to
+    fail. It then invokes the controller's own ``rollout undo`` and requires
+    both readiness and the previously observed image digest to return. The
+    probe is bounded so a broken registry cannot turn the acceptance into an
+    unbounded wait.
+    """
+
+    probe_image = _rollback_probe_image(known_good_image)
+    probe_timeout = min(timeout_seconds, _ROLLBACK_PROBE_TIMEOUT_SECONDS)
+    details: dict[str, Any] = {
+        "deployment": deployment,
+        "failure_injected": False,
+        "failure_observed": False,
+        "undo_observed": False,
+        "readiness_recovered": False,
+        "restored_image_ids": [],
+    }
+    set_failed = _kubectl(
+        [
+            "set",
+            "image",
+            f"deployment/{deployment}",
+            f"{container}={probe_image}",
+            "--namespace",
+            namespace,
+        ],
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["failure_injection"] = _result_payload(set_failed)
+    details["failure_injected"] = set_failed.status == "pass"
+    if set_failed.status != "pass":
+        return (
+            CommandResult(
+                status="fail",
+                reason=set_failed.reason or "rollback failure image could not be applied",
+            ),
+            details,
+        )
+
+    failed_rollout = _rollout_deployment(
+        deployment,
+        namespace=namespace,
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["failed_rollout"] = _result_payload(failed_rollout)
+    details["failure_observed"] = failed_rollout.status != "pass"
+    if not details["failure_observed"]:
+        return (
+            CommandResult(
+                status="fail",
+                reason="injected failure rollout unexpectedly became ready",
+            ),
+            details,
+        )
+
+    undo = _kubectl(
+        [
+            "rollout",
+            "undo",
+            f"deployment/{deployment}",
+            "--namespace",
+            namespace,
+        ],
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["undo"] = _result_payload(undo)
+    details["undo_observed"] = undo.status == "pass"
+    if undo.status != "pass":
+        return (
+            CommandResult(status="fail", reason=undo.reason or "rollout undo failed"),
+            details,
+        )
+
+    recovered_rollout = _rollout_deployment(
+        deployment,
+        namespace=namespace,
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["rollback_rollout"] = _result_payload(recovered_rollout)
+    if recovered_rollout.status != "pass":
+        return (
+            CommandResult(
+                status="fail",
+                reason=recovered_rollout.reason or "rollback rollout did not become ready",
+            ),
+            details,
+        )
+
+    image_result, restored_image_ids, image_poll_count = _wait_for_deployment_image_ids(
+        deployment,
+        namespace=namespace,
+        context=context,
+        timeout_seconds=probe_timeout,
+    )
+    details["rollback_image_poll_count"] = image_poll_count
+    details["restored_image_ids"] = list(restored_image_ids)
+    details["readiness_recovered"] = image_result.status == "pass" and restored_image_ids == tuple(
+        sorted(set(known_good_image_ids))
+    )
+    details["restored_image_read"] = _result_payload(image_result)
+    if not details["readiness_recovered"]:
+        return (
+            CommandResult(
+                status="fail",
+                reason="rollback readiness did not restore the known-good immutable image",
+            ),
+            details,
+        )
+    return CommandResult(status="pass"), details
+
+
 def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> dict[str, Any]:
     """Derive a one-shot schema-head Job from the rendered migration Job.
 
@@ -3567,7 +4483,8 @@ def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> d
         raise ValueError("schema head-check namespace is required")
     try:
         documents = [
-            document for document in yaml.safe_load_all(migration_manifest)
+            document
+            for document in yaml.safe_load_all(migration_manifest)
             if isinstance(document, Mapping)
         ]
     except yaml.YAMLError as error:
@@ -3593,6 +4510,7 @@ def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> d
     source_container = containers[0]
     if not isinstance(source_container, Mapping) or not source_container.get("image"):
         raise ValueError("migration Job container image is missing")
+    assert isinstance(source_container, Mapping)
     if not isinstance(migration_spec, Mapping) or not isinstance(template, Mapping):
         raise ValueError("migration Job pod template is missing")
     if not isinstance(pod_spec, Mapping):
@@ -3606,12 +4524,12 @@ def _schema_head_check_manifest(migration_manifest: str, *, namespace: str) -> d
     head_container["args"] = ["migrate", "--check"]
     head_pod_spec["containers"] = [head_container]
     source_template_metadata = template.get("metadata")
-    template_labels = (
-        dict(source_template_metadata.get("labels"))
+    source_labels = (
+        source_template_metadata.get("labels")
         if isinstance(source_template_metadata, Mapping)
-        and isinstance(source_template_metadata.get("labels"), Mapping)
-        else {}
+        else None
     )
+    template_labels = dict(source_labels) if isinstance(source_labels, Mapping) else {}
     template_labels.update(
         {
             "app.kubernetes.io/name": SCHEMA_HEAD_CHECK_JOB_NAME,
@@ -3840,9 +4758,7 @@ def _migration_head_check(
     pod_name = selected_metadata.get("name") if isinstance(selected_metadata, Mapping) else None
     pod_uid = selected_metadata.get("uid") if isinstance(selected_metadata, Mapping) else None
     container_statuses = (
-        selected_status.get("containerStatuses")
-        if isinstance(selected_status, Mapping)
-        else None
+        selected_status.get("containerStatuses") if isinstance(selected_status, Mapping) else None
     )
     if not isinstance(pod_name, str) or not pod_name:
         return CommandResult(
@@ -3898,6 +4814,13 @@ def _run_live_once(
     candidate: dict[str, Any] = {
         "mode": "live_kubernetes_control_plane",
         "enabled": True,
+        "topology": {
+            "scope": ACK_RUNTIME_SCOPE,
+            "im_deployment": ACK_IM_DEPLOYMENT,
+            "production_deployments": [name for name, _container in PRODUCTION_DEPLOYMENTS],
+            "tested_deployments": [name for name, _container in ACK_RUNTIME_DEPLOYMENTS],
+            "provider_disabled_deployments": list(ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS),
+        },
         "checks": {},
     }
     reasons: list[str] = []
@@ -3925,6 +4848,7 @@ def _run_live_once(
     candidate["namespace"] = namespace
     candidate["run_nonce"] = run_nonce
     secret_manifest = os.environ["TRPC_K8S_RUNTIME_SECRET_MANIFEST"]
+    image_pull_secret = os.getenv("TRPC_K8S_RUNTIME_IMAGE_PULL_SECRET", "").strip()
     image = os.environ["TRPC_K8S_RUNTIME_IMAGE"]
     upgrade_image = os.environ["TRPC_K8S_RUNTIME_UPGRADE_IMAGE"]
     hpa_driver_path = os.environ["TRPC_K8S_RUNTIME_HPA_DRIVER"]
@@ -3972,15 +4896,6 @@ def _run_live_once(
             reasons.append("current Kubernetes context is unavailable")
             return 1 if require_runtime else 0
         cluster_identity = _cluster_identity(cluster_stdout, context)
-        expired_cleanup, expired_cleanup_details = _cleanup_expired_gate_namespaces(
-            context=context,
-            cluster_fingerprint=cluster_identity["fingerprint_sha256"],
-            timeout_seconds=min(timeout_seconds, 30),
-        )
-        candidate["expired_namespace_recovery"] = expired_cleanup_details
-        if expired_cleanup.status != "pass":
-            reasons.append(expired_cleanup.reason or "expired namespace recovery failed")
-            return 1 if require_runtime else 0
         if node_label is None:
             checks["node_eviction"] = {
                 "status": "not_run",
@@ -3997,11 +4912,35 @@ def _run_live_once(
             timeout_seconds=timeout_seconds,
         )
         checks["node_eviction"] = {
-            "status": node_preflight.status,
+            "status": "not_run" if node_preflight.status == "pass" else node_preflight.status,
             "preflight": node_preflight_details,
         }
         if node_preflight.status != "pass":
             reasons.append(node_preflight.reason or "controlled node preflight failed")
+            return 1 if require_runtime else 0
+
+        pull_secret_contract = _image_pull_secret_metadata_contract(
+            secret_manifest,
+            image_pull_secret,
+            namespace=namespace,
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        checks["image_pull_secret_contract"] = _result_payload(pull_secret_contract)
+        if pull_secret_contract.status != "pass":
+            reasons.append(
+                pull_secret_contract.reason or "image pull Secret metadata contract failed"
+            )
+            return 1 if require_runtime else 0
+
+        expired_cleanup, expired_cleanup_details = _cleanup_expired_gate_namespaces(
+            context=context,
+            cluster_fingerprint=cluster_identity["fingerprint_sha256"],
+            timeout_seconds=min(timeout_seconds, 30),
+        )
+        candidate["expired_namespace_recovery"] = expired_cleanup_details
+        if expired_cleanup.status != "pass":
+            reasons.append(expired_cleanup.reason or "expired namespace recovery failed")
             return 1 if require_runtime else 0
 
         for verb, resource in (("create", "namespaces"),):
@@ -4028,6 +4967,7 @@ def _run_live_once(
             run_nonce=run_nonce,
             cluster_fingerprint=cluster_identity["fingerprint_sha256"],
             expires_at=str(int(time.time()) + RUNTIME_NAMESPACE_TTL_SECONDS),
+            image_pull_secret=image_pull_secret,
         )
         rendered_manifest = Path(temporary_directory.name) / "runtime-rendered.yaml"
         render = _kubectl(
@@ -4043,10 +4983,30 @@ def _run_live_once(
         if render.status != "pass":
             reasons.append("Kustomize render failed")
             return 1 if require_runtime else 0
-        rendered_manifest.write_text(render.stdout, encoding="utf-8")
+        rendered = render.stdout
+        object_store_endpoint = os.getenv("TRPC_K8S_RUNTIME_S3_ENDPOINT", "").strip()
+        object_store_bucket = os.getenv("TRPC_K8S_RUNTIME_S3_BUCKET", "").strip()
+        if object_store_endpoint and object_store_bucket:
+            try:
+                rendered, object_store_evidence = _runtime_object_store_override(
+                    rendered,
+                    endpoint=object_store_endpoint,
+                    bucket=object_store_bucket,
+                )
+            except ValueError as error:
+                checks["runtime_object_store_override"] = {
+                    "status": "fail",
+                    "reason": str(error),
+                }
+                reasons.append(str(error))
+                return 1 if require_runtime else 0
+            checks["runtime_object_store_override"] = object_store_evidence
+        else:
+            checks["runtime_object_store_override"] = {"status": "not_requested"}
+        rendered_manifest.write_text(rendered, encoding="utf-8")
 
         manifest_ok, manifest_reasons = _rendered_manifest_contract(
-            render.stdout, local_kind=allow_local_images
+            rendered, local_kind=allow_local_images
         )
         checks["manifest_contract"] = {
             "status": "pass" if manifest_ok else "fail",
@@ -4056,7 +5016,7 @@ def _run_live_once(
             reasons.extend(manifest_reasons)
             return 1 if require_runtime else 0
         production_manifest_ok, production_manifest_reasons = _production_render_contract(
-            render.stdout, allow_local_images=allow_local_images
+            rendered, allow_local_images=allow_local_images
         )
         checks["production_manifest_contract"] = {
             "status": "pass" if production_manifest_ok else "fail",
@@ -4152,7 +5112,7 @@ def _run_live_once(
             reasons.append("Secret manifest could not be applied")
             return 1 if require_runtime else 0
 
-        migration_manifest, runtime_manifest = _split_migration_manifests(render.stdout)
+        migration_manifest, runtime_manifest = _split_migration_manifests(rendered)
         migration_apply = _kubectl(
             [
                 "apply",
@@ -4223,7 +5183,7 @@ def _run_live_once(
             else "fail",
             "deployments": {name: _result_payload(item) for name, item in rollout_checks.items()},
         }
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             ready = _deployment_ready(
                 deployment,
                 namespace=namespace,
@@ -4468,7 +5428,7 @@ def _run_live_once(
 
         initial_image_ids: dict[str, tuple[str, ...]] = {}
         initial_image_polls: dict[str, int] = {}
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             image_result, image_ids, poll_count = _wait_for_deployment_image_ids(
                 deployment,
                 namespace=namespace,
@@ -4494,7 +5454,7 @@ def _run_live_once(
             context=context,
             timeout_seconds=timeout_seconds,
         )
-        upgrade_complete = len(rollouts) == len(DEPLOYMENTS)
+        upgrade_complete = len(rollouts) == len(ACK_RUNTIME_DEPLOYMENTS)
         checks["rolling_upgrade"] = {
             "status": "pass"
             if upgrade_complete
@@ -4512,7 +5472,7 @@ def _run_live_once(
         upgraded_image_ids: dict[str, tuple[str, ...]] = {}
         image_changes: dict[str, bool] = {}
         upgraded_image_polls: dict[str, int] = {}
-        for deployment, _container in DEPLOYMENTS:
+        for deployment, _container in ACK_RUNTIME_DEPLOYMENTS:
             image_result, image_ids, poll_count = _wait_for_deployment_image_ids(
                 deployment,
                 namespace=namespace,
@@ -4533,6 +5493,27 @@ def _run_live_once(
             checks["rolling_upgrade"]["status"] = "fail"
             reasons.append(
                 "rolling upgrade did not converge every deployment to one new immutable image ID"
+            )
+            return 1 if require_runtime else 0
+
+        rollback_result, rollback_details = _failure_rollback(
+            _ROLLBACK_PROBE_DEPLOYMENT,
+            dict(ACK_RUNTIME_DEPLOYMENTS)[_ROLLBACK_PROBE_DEPLOYMENT],
+            upgrade_image,
+            upgraded_image_ids[_ROLLBACK_PROBE_DEPLOYMENT],
+            namespace=namespace,
+            context=context,
+            timeout_seconds=timeout_seconds,
+        )
+        checks["rolling_upgrade"]["rollback"] = {
+            "status": rollback_result.status,
+            **rollback_details,
+        }
+        if rollback_result.status != "pass":
+            checks["rolling_upgrade"]["status"] = "fail"
+            reasons.append(
+                rollback_result.reason
+                or "failed rollout did not recover through controller rollback"
             )
             return 1 if require_runtime else 0
 
@@ -4769,23 +5750,69 @@ def _run_live(
     return initial_code
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "strict unified runtime configuration; when supplied, its release, "
+            "image, Kubernetes, HPA, Secret-reference, node, and timeout values "
+            "are validated before any cluster mutation"
+        ),
+    )
+    parser.add_argument(
+        "--preflight-output",
+        type=Path,
+        default=Path("runs/multitenant/deployment-preflight.json"),
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("runs/multitenant/kubernetes-runtime.json")
     )
-    parser.add_argument("--context", default=os.getenv("TRPC_K8S_RUNTIME_CONTEXT"))
+    parser.add_argument("--context")
     parser.add_argument(
         "--timeout-seconds",
         type=float,
-        default=os.getenv("TRPC_K8S_RUNTIME_TIMEOUT_SECONDS", "600"),
+        default=None,
     )
     parser.add_argument(
         "--require-runtime",
         action="store_true",
         help="return non-zero when the live gate is not run because prerequisites are missing",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.config is not None:
+        if args.context is not None or args.timeout_seconds is not None:
+            parser.error("--config cannot be combined with --context or --timeout-seconds")
+        preflight, projected = build_preflight(args.config, environment=os.environ)
+        atomic_write_json(args.preflight_output, preflight)
+        if preflight["gate"] != "pass" or projected is None:
+            candidate = {
+                "mode": "configuration_preflight",
+                "enabled": False,
+                "checks": {
+                    "configuration_preflight": {
+                        "status": "fail",
+                        "report": str(args.preflight_output),
+                    }
+                },
+            }
+            result = _report(
+                args.output,
+                gate="not_run",
+                candidate=candidate,
+                rejection_reasons=list(preflight["rejection_reasons"]),
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1
+        os.environ.update(projected)
+        args.context = projected["TRPC_K8S_RUNTIME_CONTEXT"]
+        args.timeout_seconds = float(projected["TRPC_K8S_RUNTIME_TIMEOUT_SECONDS"])
+    else:
+        if args.context is None:
+            args.context = os.getenv("TRPC_K8S_RUNTIME_CONTEXT")
+        if args.timeout_seconds is None:
+            args.timeout_seconds = float(os.getenv("TRPC_K8S_RUNTIME_TIMEOUT_SECONDS", "600"))
     try:
         timeout_seconds = _validate_timeout_seconds(args.timeout_seconds)
     except ValueError as exc:
