@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -47,6 +48,12 @@ def _config_value(
     paths: dict[str, Path] = {}
     channels: dict[str, Any] = {}
     executable = Path(getattr(sys, "_base_executable", sys.executable))
+    if os.name == "posix":
+        executable = _write_secure(
+            tmp_path / "python-runner",
+            "#!/bin/sh\nexec " + shlex.quote(str(executable)) + ' "$@"\n',
+        )
+        executable.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
     for channel in broker.CHANNELS:
         profile = _write_secure(
