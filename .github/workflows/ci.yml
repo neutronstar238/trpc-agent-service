@@ -53,6 +53,7 @@ jobs:
       - run: >-
           uv run --python ${{ matrix.python }} python scripts/check_coverage.py
           runs/multitenant/coverage.json
+          --branch-minimum 88.0
           --output runs/multitenant/coverage-gate.json
       - run: uv run --python ${{ matrix.python }} trpc-service doctor --output runs/multitenant/sdk-upgrade.json
       - uses: actions/upload-artifact@v4
