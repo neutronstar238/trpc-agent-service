@@ -169,14 +169,14 @@ PRODUCTION_DEPLOYMENTS: tuple[tuple[str, str], ...] = (
     ("trpc-post-turn-projector", "post-turn-projector"),
     ("trpc-wecom-connector", "wecom-connector"),
 )
-ACK_RUNTIME_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
+ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
 ACK_RUNTIME_DEPLOYMENTS: tuple[tuple[str, str], ...] = tuple(
     deployment
     for deployment in PRODUCTION_DEPLOYMENTS
-    if deployment[0] not in ACK_RUNTIME_DISABLED_DEPLOYMENTS
+    if deployment[0] not in ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS
 )
-ACK_RUNTIME_SCOPE = "ack_non_im"
-ACK_EXTERNAL_IM_HOST = "yqzl"
+ACK_RUNTIME_SCOPE = "unified_cluster_runtime"
+ACK_IM_DEPLOYMENT = "production_cluster"
 _PDB_PROTECTED_DEPLOYMENTS = frozenset(
     {
         "trpc-worker",
@@ -1554,8 +1554,8 @@ def _write_overlay(
     else:
         replica_patch = OVERLAY_ROOT / "replicas-patch.yaml"
     relative_replica_patch = resource_path(replica_patch)
-    external_im_patch = directory / "ack-external-im-patch.yaml"
-    external_im_patch.write_text(
+    provider_disabled_patch = directory / "provider-disabled-patch.yaml"
+    provider_disabled_patch.write_text(
         yaml.safe_dump_all(
             [
                 {
@@ -1564,13 +1564,13 @@ def _write_overlay(
                     "metadata": {"name": deployment},
                     "spec": {"replicas": 0},
                 }
-                for deployment in ACK_RUNTIME_DISABLED_DEPLOYMENTS
+                for deployment in ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS
             ],
             sort_keys=False,
         ),
         encoding="utf-8",
     )
-    relative_external_im_patch = resource_path(external_im_patch)
+    relative_provider_disabled_patch = resource_path(provider_disabled_patch)
     relative_config_patch = resource_path(OVERLAY_ROOT / "production-config-patch.yaml")
     namespace_labels = {
         RUNTIME_NAMESPACE_OWNER_LABEL: RUNTIME_NAMESPACE_OWNER_VALUE,
@@ -1606,7 +1606,7 @@ def _write_overlay(
         *image_lines,
         "patches:",
         f"  - path: {relative_replica_patch}",
-        f"  - path: {relative_external_im_patch}",
+        f"  - path: {relative_provider_disabled_patch}",
         f"  - path: {relative_config_patch}",
     ]
     if node_label is not None:
@@ -2409,16 +2409,22 @@ def _runtime_attestation_contract(
     topology = candidate.get("topology")
     expected_runtime_deployments = [name for name, _container in ACK_RUNTIME_DEPLOYMENTS]
     if not isinstance(topology, Mapping):
-        reasons.append("ACK non-IM runtime topology is missing")
+        reasons.append("unified-cluster runtime topology is missing")
     else:
         if topology.get("scope") != ACK_RUNTIME_SCOPE:
-            reasons.append("runtime topology scope is not ack_non_im")
-        if topology.get("external_im_host") != ACK_EXTERNAL_IM_HOST:
-            reasons.append("runtime topology does not bind IM to yqzl")
-        if topology.get("deployments") != expected_runtime_deployments:
-            reasons.append("runtime topology deployment set is invalid")
-        if topology.get("disabled_deployments") != list(ACK_RUNTIME_DISABLED_DEPLOYMENTS):
-            reasons.append("runtime topology disabled deployment set is invalid")
+            reasons.append("runtime topology scope is not unified_cluster_runtime")
+        if topology.get("im_deployment") != ACK_IM_DEPLOYMENT:
+            reasons.append("runtime topology does not bind IM to the production cluster")
+        if topology.get("production_deployments") != [
+            name for name, _container in PRODUCTION_DEPLOYMENTS
+        ]:
+            reasons.append("runtime topology production deployment set is invalid")
+        if topology.get("tested_deployments") != expected_runtime_deployments:
+            reasons.append("runtime topology tested deployment set is invalid")
+        if topology.get("provider_disabled_deployments") != list(
+            ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS
+        ):
+            reasons.append("runtime topology provider-disabled deployment set is invalid")
     checks = candidate.get("checks")
     if not isinstance(checks, Mapping):
         return False, ("runtime checks are unavailable",)
@@ -4810,9 +4816,10 @@ def _run_live_once(
         "enabled": True,
         "topology": {
             "scope": ACK_RUNTIME_SCOPE,
-            "external_im_host": ACK_EXTERNAL_IM_HOST,
-            "deployments": [name for name, _container in ACK_RUNTIME_DEPLOYMENTS],
-            "disabled_deployments": list(ACK_RUNTIME_DISABLED_DEPLOYMENTS),
+            "im_deployment": ACK_IM_DEPLOYMENT,
+            "production_deployments": [name for name, _container in PRODUCTION_DEPLOYMENTS],
+            "tested_deployments": [name for name, _container in ACK_RUNTIME_DEPLOYMENTS],
+            "provider_disabled_deployments": list(ACK_RUNTIME_PROVIDER_DISABLED_DEPLOYMENTS),
         },
         "checks": {},
     }

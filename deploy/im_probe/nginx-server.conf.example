@@ -5,10 +5,10 @@
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    server_name probe.tx.nstarzx.cn;
+    server_name probe.agent.example.com;
 
-    ssl_certificate     /etc/letsencrypt/live/probe.tx.nstarzx.cn/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/probe.tx.nstarzx.cn/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/probe.agent.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/probe.agent.example.com/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     client_max_body_size 1m;
 
@@ -45,7 +45,7 @@ server {
     }
 
     # Online acceptance only. The Channel Dispatcher is pointed at
-    # https://probe.tx.nstarzx.cn/feishu-openapi for the bounded run, so nginx
+    # https://probe.agent.example.com/feishu-openapi for the bounded run, so nginx
     # removes that prefix before the loopback witness forwards the allowlisted
     # /open-apis/auth and /open-apis/im paths to open.feishu.cn. Keep the
     # cluster egress allowlist separate from the release-gate allowlist.

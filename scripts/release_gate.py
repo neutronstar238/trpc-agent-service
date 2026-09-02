@@ -571,9 +571,10 @@ K8S_REQUIRED_DEPLOYMENTS = (
     "trpc-channel-dispatcher",
     "trpc-post-turn-projector",
 )
-K8S_RUNTIME_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
-K8S_RUNTIME_SCOPE = "ack_non_im"
-K8S_EXTERNAL_IM_HOST = "yqzl"
+K8S_PRODUCTION_DEPLOYMENTS = (*K8S_REQUIRED_DEPLOYMENTS, "trpc-wecom-connector")
+K8S_PROVIDER_DISABLED_DEPLOYMENTS = ("trpc-wecom-connector",)
+K8S_RUNTIME_SCOPE = "unified_cluster_runtime"
+K8S_IM_DEPLOYMENT = "production_cluster"
 K8S_IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 K8S_RUN_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 K8S_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -3373,11 +3374,14 @@ def _validate_kubernetes_semantics(
         return _k8s_missing("candidate.topology")
     if (
         topology.get("scope") != K8S_RUNTIME_SCOPE
-        or topology.get("external_im_host") != K8S_EXTERNAL_IM_HOST
-        or topology.get("deployments") != list(K8S_REQUIRED_DEPLOYMENTS)
-        or topology.get("disabled_deployments") != list(K8S_RUNTIME_DISABLED_DEPLOYMENTS)
+        or topology.get("im_deployment") != K8S_IM_DEPLOYMENT
+        or topology.get("production_deployments") != list(K8S_PRODUCTION_DEPLOYMENTS)
+        or topology.get("tested_deployments") != list(K8S_REQUIRED_DEPLOYMENTS)
+        or topology.get("provider_disabled_deployments") != list(K8S_PROVIDER_DISABLED_DEPLOYMENTS)
     ):
-        return _k8s_failed("ACK runtime topology is not the reviewed yqzl-external IM topology")
+        return _k8s_failed(
+            "ACK runtime topology is not the reviewed unified-cluster runtime topology"
+        )
     namespace = candidate.get("namespace")
     nonce = candidate.get("run_nonce")
     if (

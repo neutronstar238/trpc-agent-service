@@ -58,9 +58,6 @@ FINGERPRINT_IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
 FINGERPRINT_IGNORED_FILES = frozenset(
     {
         "deploy/runtime-gate.yaml",
-        "deploy/yqzl/admin.env",
-        "deploy/yqzl/gateway.env",
-        "deploy/yqzl/runtime.env",
     }
 )
 EVIDENCE_SCHEMA_VERSION = 1

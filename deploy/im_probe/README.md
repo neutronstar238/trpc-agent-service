@@ -28,20 +28,14 @@ broker 的 action executable 是部署/租户特定的受审控制器：它负�
 或文件被替换但未同步更新受审摘要时，broker `--check` 以及每次 action 调用都会 fail closed；
 用静态 JSON、录制结果或 driver 自报字段替代 action 会使真实在线门禁失去独立性。
 
-## 与 yqzl 现有部署的关系
+## 凭据安装边界
 
-现有凭据来源仍可位于下列 yqzl 路径：
-
-- `/www/wwwroot/tx.nstarzx.cn/secrets/feishu_app_secret`
-- `/www/wwwroot/tx.nstarzx.cn/secrets/feishu_verification_token`
-- `/www/wwwroot/tx.nstarzx.cn/secrets/feishu_encrypt_key`
-- `/www/wwwroot/tx.nstarzx.cn/secrets/wecom_bot_secret`
-
-但探针不会直接读取这些旧路径。部署时应以 root 将凭据原子复制为
+正式应用凭据由 Kubernetes Secret/外部 Secret 管理器提供给 production cluster；独立验收探针不挂载
+应用 Pod 的 Secret。部署探针时，应由受控 Secret 管理器以 root 将同一测试账号的凭据原子安装为
 `/etc/trpc-im-probe/secrets` 下的同名**普通文件**；目录及其任一父目录、文件本身都不能是
 symlink。目录使用 `root:trpcagent 0750`，每个凭据文件和签名私钥使用
-`root:trpcagent 0640`，写入临时文件并完成 owner/mode 校验后再原子 rename。不要把旧目录
-symlink 到新目录，也不要让 `trpcagent` 对目录或文件拥有写权限；否则 host 预检和探针会
+`root:trpcagent 0640`，写入临时文件并完成 owner/mode 校验后再原子 rename。不要把其他 Secret 目录
+symlink 到探针目录，也不要让 `trpcagent` 对目录或文件拥有写权限；否则 host 预检和探针会
 fail closed。`im-probe.env` 与 `feishu-observer.env` 只填写新路径，不复制 secret 值。
 
 账号 ID 通过 `TRPC_IM_PROBE_FEISHU_APP_ID` 和
@@ -59,11 +53,12 @@ fail closed。`im-probe.env` 与 `feishu-observer.env` 只填写新路径，不�
    `/usr/local/libexec/trpc-im-provider-runner`），由独立验收代码所有者审查。
    仓库中的 `provider_runner.py`、`feishu_provider_driver.py` 和 `wecom_provider_driver.py` 是可安装的
    fail-closed 编排器；复制到上述路径后设为 `root:root 0755`，且路径任一层都不能是 symlink。
-   在 yqzl 的最终安装路径对 runner 和两个 driver 分别执行 `sha256sum`，把结果写入
+   在独立探针主机的最终安装路径对 runner 和两个 driver 分别执行 `sha256sum`，把结果写入
    `TRPC_IM_PROBE_RUNNER_SHA256`、`TRPC_IM_PROBE_FEISHU_DRIVER_SHA256` 和
    `TRPC_IM_PROBE_WECOM_DRIVER_SHA256`。探针和 runner 会在每次执行前重新 open/fstat/hash；文件被替换
-   或 owner/mode/父目录链不再受 root 控制时必须保持 `not_ready`/`not_run`。IM probe 只部署在拥有真实
-   回调域名的 yqzl 独立主机，ACK 集群不部署或运行这些外部 provider action。
+   或 owner/mode/父目录链不再受 root 控制时必须保持 `not_ready`/`not_run`。IM probe 部署在与被测
+   production cluster 隔离的验收主机；Gateway、Channel Dispatcher 和 Feishu/WeCom Connector 仍全部
+   位于 production cluster，集群内不运行持有供应商管理权限的 provider action。
 2. 把 `feishu-control-profile.example.json`、`wecom-control-profile.example.json`、
    `feishu-control-action.example.json`、`wecom-control-action.example.json` 和
    `control-broker.example.json` 渲染到 `/etc/trpc-im-probe`。两个 action 模板中的 `<...>` 都是必须替换的
@@ -203,7 +198,7 @@ $env:TRPC_IM_PROBE_IDENTITY_SHA256 = "<fixed-64-hex>"
 release context 必须是 root-owned、不可 group/other-writable 的非 symlink 普通文件，且只包含
 `schema_version=1`、`release_id`、`nonce_sha256`、`source_fingerprint` 和不可变 `image_digest`。
 probe 启动时会对当前部署目录执行与候选锁相同的 source fingerprint；仅复制新 context 到旧代码目录
-会 fail closed，不能把旧 yqzl 服务伪装成新候选。
+会 fail closed，不能把旧探针服务伪装成新候选。
 
 先用同一个 host-only 配置文件运行完整预检；它不会访问网络、执行 driver 或生成
 生产 IM 通过证据：
@@ -228,12 +223,12 @@ release binding、URL allowlist、Ed25519 公私钥和两条 driver 全部一致
 8-case。破坏性生产灾备默认必须真实通过；唯一例外是发布者显式使用 `--allow-functional-dr`，并由当前
 候选的功能灾备 `pass` 授权其诚实保持 `not_run`。该选项不能豁免 `online_im=not_run` 或任何失败门禁。
 
-yqzl 承载真实 IM 回调域名对应的被测 Gateway、Channel Dispatcher、Feishu/WeCom Connector，以及
-与应用进程隔离的 probe/control broker/runner/driver；yqzl 只做 IM 功能与在线门禁，禁止在该主机做
-性能压测。ACK 不承载真实 IM 回调，而承载同一候选的 Kubernetes、迁移、故障、HPA 和性能验收。
-两侧证据只有在 yqzl 部署的 release context、实际测得 source fingerprint 和不可变 image digest 与
-candidate lock 完全一致时才能合并。可以在候选冻结前先做 yqzl 双向收发 smoke，但最终签名 8-case
-必须在候选锁和镜像 digest 冻结后重跑，再与 ACK 的非 IM 报告共同生成 release manifest。
+production cluster 承载真实 IM 回调域名对应的 Gateway、Channel Dispatcher、Feishu/WeCom Connector，
+以及 Kubernetes、迁移、故障、HPA 和性能验收。probe/control broker/runner/driver 位于独立验收主机，
+只生成外部供应商证据，禁止承担性能压测或应用流量。两侧证据只有在 release context、实际测得 source
+fingerprint 和不可变 image digest 与 candidate lock 完全一致时才能合并。可以在候选冻结前先做双向
+收发 smoke，但最终签名 8-case 必须在候选锁和镜像 digest 冻结后重跑，再与同一集群的运行报告共同
+生成 release manifest。
 
 真正生产验收仍必须由下面这一条（同一候选、同一 release binding）命令发起：
 

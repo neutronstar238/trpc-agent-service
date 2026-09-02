@@ -21,9 +21,9 @@ Worker 接收媒体时必须配置 S3-compatible Artifact 后端，否则不会�
 `staged` 的元数据与对象，并分页检查 S3 staging 前缀，回收上传成功但元数据事务未提交的孤儿对象。
 默认每轮最多 100 项、每 60 秒轮询；对象删除成功后才把元数据 CAS 为 `deleted`，供应商故障会保留
 记录供下轮幂等重试。Compose/Kubernetes 均以单副本启动，也可依靠行锁安全扩容。
-`yqzl` 基线用固定版本 MinIO 容器，仅监听 `127.0.0.1:9000`，数据位于
-`/www/wwwroot/tx.nstarzx.cn/data/minio`，凭证位于只读 `secrets/`；容器设置 512 MiB 内存、1 CPU
-和 256 PID 上限。小规模图片/PDF 验收时 Worker 常驻约几十 MiB，峰值额外内存主要由当前下载项、
+Production overlay 使用 digest-pinned MinIO StatefulSet、独立 application identity 和 retained PVC；
+凭据来自 `trpc-infrastructure-secrets`，应用不能使用 MinIO root 身份。小规模图片/PDF 验收时 Worker
+常驻约几十 MiB，峰值额外内存主要由当前下载项、
 PDF 解析和模型 SDK 决定；每个 Worker 当前顺序消费消息，默认单项 20 MiB 硬上限可避免并发倍增。
 更高吞吐应通过增加无状态 Worker 副本扩展，而不是放宽单文件限制。
 
@@ -98,32 +98,14 @@ lineage 或正确 producer 时都不能授权，`online_im` 和其他门禁也�
 和应急队列处理见 [调度器切换运行手册](scheduler-cutover.md)。禁止以 `DEL`、`XTRIM`、
 `XGROUP DESTROY` 或直接改状态字段的方式伪造排空。
 
-## yqzl 服务器发布顺序
+## Kubernetes 正式发布顺序
 
-在 `/www/wwwroot/tx.nstarzx.cn` 上，发布必须按以下顺序执行：
+正式发布只使用 `deploy/kustomize/overlays/production`。先创建六类 Secret 和镜像拉取凭据，再应用
+基础设施并等待 PostgreSQL、Redis、MinIO、Prometheus ready；随后重建并等待 schema migration 与
+MinIO bootstrap Job，最后启动 Gateway、Admin、Worker、两个 Dispatcher、Projector、Recovery、GC、
+Exporter 和 WeCom Connector。裸 `kubectl` 与 Argo CD 的精确顺序、等待命令和回滚步骤见根目录
+README。不得以单机 systemd、面板数据库或临时域名替代正式集群模板。
 
-1. 更新代码并重建 `.venv`，确认 `trpc-service doctor` 与锁文件一致。
-2. 由 root 执行 `deploy/yqzl/provision.sh`；生产配置使用
-   `deploy/yqzl/runtime.env.example` 复制后的 host-specific 文件，不能使用
-   `TRPC_SERVICE_ENVIRONMENT=development` 或 development token。
-   同时保留 `TRPC_SERVICE_RUNTIME_STATE_DIR=/tmp/trpc-agent-service`，将
-   `TRPC_SERVICE_TENANT_SECRET_ROOT` 指向站点 `secrets/` 目录，并只在确有
-   `env://` 租户 Secret 时把对应的 `TRPC_TENANT_*` 名称加入
-   `TRPC_SERVICE_TENANT_SECRET_ENV_NAMES`；空列表是 fail-closed 默认值。
-   `TRPC_SERVICE_MODEL_ENDPOINT_HOSTS` 必须列出实际批准的 HTTPS 主机，
-   `TRPC_SERVICE_FEISHU_ALLOW_STALE_BINDING_CACHE=false` 不得被生产配置覆盖。
-   应急队列使用 `TRPC_SERVICE_EMERGENCY_QUEUE_KEY_VERSION` 标识当前密钥；
-   轮换期间才填写 `TRPC_SERVICE_EMERGENCY_QUEUE_PREVIOUS_KEY_REFS`，且每个
-   引用的旧密钥必须同时存在并在轮换完成后移除。
-3. 使用独立 `trpc_migration` 账号执行 `trpc-service migrate --revision head`，确认
-   `alembic_version` 为 checkout head；运行角色使用非 owner 的 `trpc_runtime`。
-4. 启动 Redis/MinIO，再启动 `gateway`、`admin`、`session-recovery`、`artifact-gc`、`worker`、两个
-   dispatcher、projector 和 `wecom-connector` 全部 systemd role。
-5. 设置 `TRPC_VERIFY_TENANT_ID` 与 `TRPC_VERIFY_BINDING_ID` 后执行
-   `deploy/yqzl/verify_runtime.sh`。该脚本会检查 binding/secret 引用、WeCom connector、
-   PostgreSQL/Redis/MinIO 连接、服务重启和日志泄漏；未提供 ID 会 fail-closed，不再使用
-   仓库内硬编码租户。
-
-Worker 的 systemd drop-in 将内存上限提升到 2 GiB；其他角色保留 768 MiB 上限。变更
-runtime.env 或 secret 后应先执行 verify，再按 role 滚动重启，不能通过重启次数正常来掩盖
-配置错误。
+变更 ConfigMap 或 Secret 后按角色滚动，并重新验证 EndpointSlice、HPA、binding/SecretRef、
+PostgreSQL/Redis/MinIO 连通性和日志脱敏。企业微信两个 Connector 副本必须跨节点，且同一 binding
+只能有一个 advisory-lock owner；飞书回调必须经正式 Ingress HTTPS 验签。

@@ -6,7 +6,6 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION = ROOT / "deploy" / "kustomize" / "overlays" / "production"
-YQZL = ROOT / "deploy" / "yqzl"
 
 
 def test_production_wecom_replicas_require_distinct_nodes() -> None:
@@ -29,26 +28,3 @@ def test_production_wecom_replicas_require_distinct_nodes() -> None:
         "requiredDuringSchedulingIgnoredDuringExecution"
     ]
     assert any(rule["topologyKey"] == "kubernetes.io/hostname" for rule in required)
-
-
-def test_yqzl_wecom_standby_has_fixed_role_and_isolated_runtime_state() -> None:
-    service = (YQZL / "trpc-agent-wecom-standby.service").read_text("utf-8")
-    assert "ExecStart=" in service
-    assert "serve --role wecom-connector" in service
-    assert "TRPC_SERVICE_RUNTIME_STATE_DIR=/run/trpc-agent-wecom-standby" in service
-    assert "RuntimeDirectory=trpc-agent-wecom-standby" in service
-    assert "NoNewPrivileges=true" in service
-    assert "ProtectSystem=strict" in service
-
-    provision = (YQZL / "provision.sh").read_text("utf-8")
-    assert "trpc-agent-wecom-standby.service" in provision
-    assert "trpc-agent-wecom-primary.conf" in provision
-
-
-def test_yqzl_wecom_units_load_the_release_source_tree() -> None:
-    standby = (YQZL / "trpc-agent-wecom-standby.service").read_text("utf-8")
-    primary = (YQZL / "trpc-agent-wecom-primary.conf").read_text("utf-8")
-    expected = "Environment=PYTHONPATH=/www/wwwroot/tx.nstarzx.cn/app"
-
-    assert expected in standby
-    assert expected in primary

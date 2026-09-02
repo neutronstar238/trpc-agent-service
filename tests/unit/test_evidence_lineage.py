@@ -114,19 +114,12 @@ def test_source_fingerprint_changes_for_real_python_content(tmp_path) -> None:
     assert after["total_bytes"] == before["total_bytes"]
 
 
-def test_source_fingerprint_ignores_local_runtime_config_but_tracks_source(
+def test_source_fingerprint_ignores_runtime_gate_config_but_tracks_source(
     tmp_path,
 ) -> None:
     deploy = tmp_path / "deploy"
     deploy.mkdir()
-    yqzl = deploy / "yqzl"
-    yqzl.mkdir()
-    runtime_configs = (
-        deploy / "runtime-gate.yaml",
-        yqzl / "admin.env",
-        yqzl / "gateway.env",
-        yqzl / "runtime.env",
-    )
+    runtime_configs = (deploy / "runtime-gate.yaml",)
     for runtime_config in runtime_configs:
         runtime_config.write_text("release_id: first\n", encoding="utf-8")
     source = tmp_path / "source.py"

@@ -826,7 +826,7 @@ binding 的 `capabilities` 是配置声明/要求，当前不会单独执行发�
 - digest-pinned PostgreSQL、Redis、MinIO、Prometheus、Adapter、load Job 镜像。
 - `trpc_session_ready_backlog` 外部指标与 HPA driver 身份。
 
-性能 Job 必须在专用 `trpc-role=load-driver` 节点，不在 yqzl、开发机端口转发或业务 Pod 中执行。性能、
+性能 Job 必须在专用 `trpc-role=load-driver` 节点，不在独立 IM 探针主机、开发机端口转发或业务 Pod 中执行。性能、
 Kubernetes runtime、迁移和故障注入必须串行使用同一候选，不能并发改 namespace、HPA、节点 drain 或
 固定报告文件。详见[测试与发布门禁](docs/testing.md)。
 

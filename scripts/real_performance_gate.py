@@ -5,7 +5,7 @@
 The script deliberately targets the durable acceptance boundary instead of a
 provider account.  It offers a sustained callback rate and then a burst of
 independent sessions, while the already-running dispatcher and workers drain
-the PostgreSQL outbox/Redis stream.  It is suitable for the yqzl systemd
+the PostgreSQL outbox/Redis stream.  It is suitable for a single-host systemd
 deployment and does not start, stop, scale, or kill any service.
 
 ``--kubernetes`` (or ``TRPC_PERF_K8S_ENABLED=true``) switches the preflight

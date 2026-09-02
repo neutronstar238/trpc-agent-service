@@ -356,11 +356,11 @@ def test_generated_overlay_is_namespace_scoped(tmp_path) -> None:
     assert "newTag: test" in rendered
     assert "namespace.yaml" in rendered
     assert "replicas-patch.yaml" in rendered
-    assert "ack-external-im-patch.yaml" in rendered
-    external_im = list(
-        yaml.safe_load_all((tmp_path / "ack-external-im-patch.yaml").read_text(encoding="utf-8"))
+    assert "provider-disabled-patch.yaml" in rendered
+    provider_disabled = list(
+        yaml.safe_load_all((tmp_path / "provider-disabled-patch.yaml").read_text(encoding="utf-8"))
     )
-    assert external_im == [
+    assert provider_disabled == [
         {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -918,10 +918,15 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
         "namespace": "isolated",
         "run_nonce": "a" * 32,
         "topology": {
-            "scope": "ack_non_im",
-            "external_im_host": "yqzl",
-            "deployments": [name for name, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS],
-            "disabled_deployments": ["trpc-wecom-connector"],
+            "scope": "unified_cluster_runtime",
+            "im_deployment": "production_cluster",
+            "production_deployments": [
+                name for name, _container in runtime_gate.PRODUCTION_DEPLOYMENTS
+            ],
+            "tested_deployments": [
+                name for name, _container in runtime_gate.ACK_RUNTIME_DEPLOYMENTS
+            ],
+            "provider_disabled_deployments": ["trpc-wecom-connector"],
         },
         "checks": checks,
         "runtime_attestation": {
@@ -950,11 +955,11 @@ def test_runtime_attestation_contract_requires_all_actions() -> None:
     assert valid
     assert reasons == ()
 
-    candidate_with_in_cluster_im = deepcopy(candidate)
-    candidate_with_in_cluster_im["topology"]["disabled_deployments"] = []
-    valid, reasons = _runtime_attestation_contract(candidate_with_in_cluster_im)
+    candidate_without_provider_isolation = deepcopy(candidate)
+    candidate_without_provider_isolation["topology"]["provider_disabled_deployments"] = []
+    valid, reasons = _runtime_attestation_contract(candidate_without_provider_isolation)
     assert not valid
-    assert any("disabled deployment set" in reason for reason in reasons)
+    assert any("provider-disabled deployment set" in reason for reason in reasons)
 
     candidate_without_rollback = deepcopy(candidate)
     candidate_without_rollback["checks"]["rolling_upgrade"].pop("rollback")

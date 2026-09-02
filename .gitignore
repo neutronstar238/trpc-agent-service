@@ -58,10 +58,9 @@ pyrightconfig.json
 # Kind gate work directories are generated beside the repository root.
 /trpc-k8s-gate-*/
 
-# yqzl runtime.env is host-specific service configuration.  Keep only the
-# reviewed, secret-free example in version control.
-/deploy/yqzl/runtime.env
+# Operator-local runtime inputs are generated from reviewed examples.
 /deploy/runtime-gate.yaml
+/deploy/im-probe-trust.json
 
 # Local cluster credentials and code-understanding caches are workstation-only.
 /.kube/

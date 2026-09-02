@@ -3,7 +3,7 @@
 
 The public HTTPS terminator is intentionally kept outside this process (the
 deployment template uses nginx).  This process owns the Ed25519 signing key,
-reads the existing yqzl secret files, and invokes an operator-supplied
+reads root-controlled probe secret files, and invokes an operator-supplied
 provider runner.  It never manufactures provider observations: a missing or
 invalid runner result is returned as a signed ``not_run`` response.
 
@@ -37,7 +37,7 @@ from typing import Any, cast
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-# Direct invocation from the yqzl checkout remains supported.
+# Direct invocation from a reviewed probe installation remains supported.
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 

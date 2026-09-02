@@ -13,8 +13,8 @@ import pytest
 from deploy.im_probe import wecom_control_action as action
 from deploy.im_probe import wecom_provider_driver as driver
 
-TENANT = "tenant-yqzl"
-BINDING = "wecom-yqzl"
+TENANT = "tenant-probe"
+BINDING = "wecom-probe"
 ACCOUNT_HASH = "a" * 64
 PROFILE_HASH = "b" * 64
 IMAGE = "sha256:" + "c" * 64
@@ -353,8 +353,8 @@ def test_all_cases_require_matching_control_admin_and_provider_evidence(
     assert calls[0] == (
         "POST",
         (
-            "https://admin.example.test/v1/tenants/tenant-yqzl/bindings/"
-            "wecom-yqzl/im-acceptance/runs"
+            "https://admin.example.test/v1/tenants/tenant-probe/bindings/"
+            "wecom-probe/im-acceptance/runs"
         ),
         {
             "channel": "wecom_ai_bot",
@@ -372,8 +372,8 @@ def test_all_cases_require_matching_control_admin_and_provider_evidence(
     assert calls[3] == (
         "POST",
         (
-            "https://admin.example.test/v1/tenants/tenant-yqzl/bindings/"
-            "wecom-yqzl/im-acceptance/event-evidence"
+            "https://admin.example.test/v1/tenants/tenant-probe/bindings/"
+            "wecom-probe/im-acceptance/event-evidence"
         ),
         {
             "channel": "wecom_ai_bot",
