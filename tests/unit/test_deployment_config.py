@@ -23,7 +23,7 @@ from trpc_service.tenant.models import TenantConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 NONCE = "n" * 32
-PULL_REGISTRY = "elt91uy73y2gh25fs7.xuanyuan.run"
+PULL_REGISTRY = "mirror.example.com"
 SUPPORT_POSTGRES_IMAGE = f"{PULL_REGISTRY}/library/postgres@sha256:" + "3" * 64
 SUPPORT_REDIS_IMAGE = f"{PULL_REGISTRY}/library/redis@sha256:" + "4" * 64
 SUPPORT_MINIO_IMAGE = f"{PULL_REGISTRY}/minio/minio@sha256:" + "5" * 64

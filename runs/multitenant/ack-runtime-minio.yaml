@@ -1,3 +1,5 @@
+# Template only: render with scripts/render_runtime_support.py before applying.
+# The renderer replaces every placeholder node, image, and pull-Secret value.
 apiVersion: v1
 kind: Service
 metadata:
@@ -42,9 +44,9 @@ spec:
     spec:
       automountServiceAccountToken: false
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -54,7 +56,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: prepare-data
-          image: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:f6efb212cad3b62f78ca02339f16d8bc28d5bb2fbe792dfc21225c6037d2af8b
+          image: registry.invalid/template/minio@sha256:0000000000000000000000000000000000000000000000000000000000000000
           command: ["/bin/sh", "-ec", "chmod 0700 /data && chown 1000:1000 /data"]
           securityContext:
             runAsNonRoot: false
@@ -75,7 +77,7 @@ spec:
               mountPath: /data
       containers:
         - name: minio
-          image: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:f6efb212cad3b62f78ca02339f16d8bc28d5bb2fbe792dfc21225c6037d2af8b
+          image: registry.invalid/template/minio@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           args: ["server", "/data", "--console-address", ":9001"]
           env:
@@ -161,9 +163,9 @@ spec:
       restartPolicy: Never
       automountServiceAccountToken: false
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -172,7 +174,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: bootstrap
-          image: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780
+          image: registry.invalid/template/minio-client@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-ec"]
           args:

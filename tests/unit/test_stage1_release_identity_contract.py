@@ -64,6 +64,16 @@ def test_stage1_failure_summary_tolerates_missing_optional_metrics() -> None:
     assert 'throw "formal ACK Performance gate failed; no automatic rerun was attempted"' in stage1
 
 
+def test_formal_entry_forwards_operator_supplied_ack_identity_to_stage1() -> None:
+    formal_entry = FORMAL_ENTRY.read_text(encoding="utf-8")
+    invocation = formal_entry.split('"[1/8] Performance + external-metric HPA"', 1)[1].split(
+        "if ($LASTEXITCODE -ne 0)", 1
+    )[0]
+
+    assert "-KubeconfigPath $kubeconfig" in invocation
+    assert "-KubeContext $context" in invocation
+
+
 def test_stage1_applies_schema_before_starting_runtime_pods() -> None:
     stage1 = STAGE1.read_text(encoding="utf-8")
 

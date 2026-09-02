@@ -12,7 +12,7 @@ from deploy.im_probe import feishu_control_action as action
 
 RUN_NONCE = "feishu-action-nonce-123456"
 IMAGE_DIGEST = "sha256:" + "a" * 64
-TENANT_ID = "nstarzx-feishu"
+TENANT_ID = "tenant-feishu"
 BINDING_ID = "feishu-binding"
 
 
@@ -381,7 +381,7 @@ def test_action_calls_only_configured_https_hook_and_returns_opaque_evidence(
     assert len(calls) == 3
     registration_hook, registration_token, registration_payload = calls[0]
     assert registration_hook.url == (
-        "https://ack-admin.internal/v1/tenants/nstarzx-feishu/bindings/feishu-binding/"
+        "https://ack-admin.internal/v1/tenants/tenant-feishu/bindings/feishu-binding/"
         "im-acceptance/runs"
     )
     assert registration_token == "private-evidence-token-123456"
@@ -397,7 +397,7 @@ def test_action_calls_only_configured_https_hook_and_returns_opaque_evidence(
     assert json.loads(payload) == _request()
     evidence_hook, evidence_token, evidence_payload = calls[2]
     assert evidence_hook.url == (
-        "https://ack-admin.internal/v1/tenants/nstarzx-feishu/bindings/feishu-binding/"
+        "https://ack-admin.internal/v1/tenants/tenant-feishu/bindings/feishu-binding/"
         "im-acceptance/event-evidence"
     )
     assert evidence_token == "private-evidence-token-123456"

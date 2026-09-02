@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location E:\trpc-agent-service
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+Set-Location $projectRoot
 $env:COMPOSE_DISABLE_ENV_FILE = "1"
 
 if (-not $env:TRPC_RELEASE_ID -or -not $env:TRPC_RELEASE_NONCE) {

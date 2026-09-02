@@ -15,6 +15,8 @@ def test_candidate_entry_uses_one_tracked_session_orchestrator() -> None:
     assert "scripts.release_context" not in entry
     assert "candidate_lock.py verify" in entry
     assert "TRPC_RELEASE_NONCE" in entry
+    assert "TRPC_CANDIDATE_REPOSITORY" in entry
+    assert "zixuan760" not in entry
 
 
 def test_hpa_kubeconfig_is_rebuilt_from_current_ack_cluster() -> None:
@@ -29,3 +31,12 @@ def test_hpa_kubeconfig_is_rebuilt_from_current_ack_cluster() -> None:
     assert "--embed-certs=true" in refresh
     assert "config set-context $hpaDriverContext" in refresh
     assert "auth whoami" in refresh
+
+
+def test_formal_entry_requires_operator_supplied_ack_identity() -> None:
+    entry = FORMAL_ENTRY.read_text(encoding="utf-8")
+
+    assert "TRPC_ACK_KUBECONFIG" in entry
+    assert "TRPC_ACK_CONTEXT" in entry
+    assert "C:/Users/" not in entry
+    assert "kubernetes-admin-" not in entry

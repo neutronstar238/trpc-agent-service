@@ -520,8 +520,7 @@ def test_render_performance_overlay_binds_config_image_and_namespace(
         object_store_endpoint="http://minio.trpc-runtime-support.svc.cluster.local:9000",
         object_store_bucket="trpc-artifacts",
         resolved_image_references=lambda: {
-            "initial": "elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:"
-            + "a" * 64,
+            "initial": "mirror.example.com/owner/trpc-agent-service@sha256:" + "a" * 64,
         },
     )
     monkeypatch.setattr(renderer, "_load_runtime_gate_config", lambda _path: config)
@@ -537,7 +536,7 @@ def test_render_performance_overlay_binds_config_image_and_namespace(
     assert "im-external-egress" in overlay["resources"]
     assert (output / "im-external-egress" / "kustomization.yaml").is_file()
     assert (output / "im-external-egress" / "network-policy.yaml").is_file()
-    assert overlay["images"][0]["newName"].startswith("elt91uy73y2gh25fs7.xuanyuan.run/")
+    assert overlay["images"][0]["newName"].startswith("mirror.example.com/")
     assert overlay["images"][0]["digest"] == "sha256:" + "a" * 64
     pull_patch = yaml.safe_load(
         (output / "performance-image-pull-secret-patch.yaml").read_text(encoding="utf-8")

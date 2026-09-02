@@ -1,3 +1,8 @@
+param(
+    [string]$KubeconfigPath = $env:TRPC_ACK_KUBECONFIG,
+    [string]$KubeContext = $env:TRPC_ACK_CONTEXT
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
@@ -24,12 +29,19 @@ function Get-OptionalPropertyValue {
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+$kubeconfig = if ([string]::IsNullOrWhiteSpace($KubeconfigPath)) {
+    throw "ACK kubeconfig is required; pass -KubeconfigPath or set TRPC_ACK_KUBECONFIG"
+} else {
+    (Resolve-Path -LiteralPath $KubeconfigPath -ErrorAction Stop).Path
+}
+if ([string]::IsNullOrWhiteSpace($KubeContext)) {
+    throw "ACK context is required; pass -KubeContext or set TRPC_ACK_CONTEXT"
+}
+$context = $KubeContext
 Set-Location $projectRoot
 
 $python = Join-Path $projectRoot ".venv/Scripts/python.exe"
 $kubectl = (Get-Command kubectl -ErrorAction Stop).Source
-$kubeconfig = "C:/Users/Z/.kube/trpc-ack.yaml"
-$context = "kubernetes-admin-cdecb943ac4bf48f7af5f29e4d7bf0793"
 $namespace = "trpc-service"
 $supportNamespace = "trpc-runtime-support"
 $configPath = Join-Path $projectRoot "deploy/runtime-gate.yaml"

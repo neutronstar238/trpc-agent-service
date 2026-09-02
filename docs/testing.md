@@ -214,7 +214,7 @@ kube context 使用专用测试权限，并确认镜像、数据库、Redis、�
 和至少一个 NodeMetrics 样本：
 
 ```powershell
-Set-Location E:\trpc-agent-service
+Set-Location C:\path\to\trpc-agent-service
 $ErrorActionPreference = "Stop"
 $kindName = "trpc-runtime-gate-$PID"
 $kindContext = "kind-$kindName"

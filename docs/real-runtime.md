@@ -119,7 +119,7 @@ fault-stage 项目同名；`trpc-perf-*` 性能项目也不能直接作为 `real
 
 ```powershell
 $ErrorActionPreference = "Stop"
-Set-Location E:\trpc-agent-service
+Set-Location C:\path\to\trpc-agent-service
 $env:COMPOSE_DISABLE_ENV_FILE = "1"
 $runStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $runtimeProject = "trpc-fault-runtime-$runStamp"

@@ -252,12 +252,7 @@ candidate lock；Docker credential helper 负责登录：
 ```powershell
 $repository = "docker.io/<owner>/trpc-agent-service"
 
-.venv\Scripts\python.exe -m scripts.candidate_session publish `
-  --repository $repository `
-  --output runs\multitenant\registry-image-binding.json `
-  --lock-output runs\multitenant\candidate-lock.json `
-  --private-directory runs\multitenant\.ack-runtime-private `
-  --public-directory runs\multitenant
+./runs/multitenant/run-current-candidate-session.ps1 -Repository $repository
 
 .venv\Scripts\python.exe scripts\candidate_lock.py verify
 ```
@@ -927,6 +922,14 @@ binding 的 `capabilities` 是配置声明/要求，当前不会单独执行发�
 - workload、load-driver、data/control 节点标签与 taint。
 - digest-pinned PostgreSQL、Redis、MinIO、Prometheus、Adapter、load Job 镜像。
 - `trpc_session_ready_backlog` 外部指标与 HPA driver 身份。
+
+正式验收入口不包含个人 kubeconfig 或 context。通过参数或环境变量显式传入：
+
+```powershell
+$env:TRPC_ACK_KUBECONFIG = "C:\secure\ack-admin.kubeconfig"
+$env:TRPC_ACK_CONTEXT = "your-explicit-ack-context"
+./runs/multitenant/run-current-final-acceptance.ps1 -StartStage 1 -EndStage 8
+```
 
 性能 Job 必须在专用 `trpc-role=load-driver` 节点，不在独立 IM 探针主机、开发机端口转发或业务 Pod 中执行。性能、
 Kubernetes runtime、迁移和故障注入必须串行使用同一候选，不能并发改 namespace、HPA、节点 drain 或

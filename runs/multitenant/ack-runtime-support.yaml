@@ -1,3 +1,5 @@
+# Template only: render with scripts/render_runtime_support.py before applying.
+# The renderer replaces every placeholder node, image, and pull-Secret value.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -21,12 +23,12 @@ spec:
         app: trpc-runtime-postgres
     spec:
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       containers:
         - name: postgres
-          image: elt91uy73y2gh25fs7.xuanyuan.run/pgvector/pgvector@sha256:a6579dded3ff4ed3d9565ae54ab253e2cb7ae24c5d1eb3bec8a89e73f038b68a
+          image: registry.invalid/template/pgvector@sha256:0000000000000000000000000000000000000000000000000000000000000000
           env:
             - name: POSTGRES_PASSWORD
               valueFrom:
@@ -84,12 +86,12 @@ spec:
         app: trpc-runtime-redis
     spec:
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       containers:
         - name: redis
-          image: elt91uy73y2gh25fs7.xuanyuan.run/library/redis@sha256:1db42ccef14898aa29bae778452d567534b59c107129cbc1163fb552de184d3c
+          image: registry.invalid/template/redis@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args: ["--save", "", "--appendonly", "no"]
           ports:
             - name: redis
@@ -132,12 +134,12 @@ spec:
     spec:
       restartPolicy: Never
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       containers:
         - name: bootstrap
-          image: elt91uy73y2gh25fs7.xuanyuan.run/pgvector/pgvector@sha256:a6579dded3ff4ed3d9565ae54ab253e2cb7ae24c5d1eb3bec8a89e73f038b68a
+          image: registry.invalid/template/pgvector@sha256:0000000000000000000000000000000000000000000000000000000000000000
           env:
             - name: PGPASSWORD
               valueFrom:
@@ -317,9 +319,9 @@ spec:
     spec:
       serviceAccountName: backlog-observer
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -328,7 +330,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: source
-          image: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:5025b41a159457761cb1c14977548fe0d26e6726f107f569f138a781c054e228
+          image: registry.invalid/template/trpc-agent-service@sha256:0000000000000000000000000000000000000000000000000000000000000000
           command: ["python", "/opt/metric-source/source.py"]
           ports:
             - name: http
@@ -408,9 +410,9 @@ spec:
         app: trpc-runtime-prometheus
     spec:
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
@@ -420,7 +422,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: prometheus
-          image: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:8672a850efe2f9874702406c8318704edb363587f8c2ca88586b4c8fdb5cea24
+          image: registry.invalid/template/prometheus@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
@@ -562,9 +564,9 @@ spec:
     spec:
       serviceAccountName: prometheus-adapter
       imagePullSecrets:
-        - name: xuanyuan-pull
+        - name: replace-with-image-pull-secret
       nodeSelector:
-        kubernetes.io/hostname: cn-shenzhen.10.151.161.179
+        kubernetes.io/hostname: replace-with-support-data-node
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -573,7 +575,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: adapter
-          image: elt91uy73y2gh25fs7.xuanyuan.run/zixuan760/trpc-agent-service@sha256:1ba33d7a5b4cdfb960c8824d612a459ff5ef62a15330224d422d36755bc11a11
+          image: registry.invalid/template/prometheus-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args:
             - --secure-port=6443
             - --cert-dir=/tmp/cert

@@ -2,7 +2,9 @@ param(
     [ValidateRange(1, 8)]
     [int]$StartStage = 1,
     [ValidateRange(1, 8)]
-    [int]$EndStage = 8
+    [int]$EndStage = 8,
+    [string]$KubeconfigPath = $env:TRPC_ACK_KUBECONFIG,
+    [string]$KubeContext = $env:TRPC_ACK_CONTEXT
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,12 +15,19 @@ if ($StartStage -gt $EndStage) {
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+$kubeconfig = if ([string]::IsNullOrWhiteSpace($KubeconfigPath)) {
+    throw "ACK kubeconfig is required; pass -KubeconfigPath or set TRPC_ACK_KUBECONFIG"
+} else {
+    (Resolve-Path -LiteralPath $KubeconfigPath -ErrorAction Stop).Path
+}
+if ([string]::IsNullOrWhiteSpace($KubeContext)) {
+    throw "ACK context is required; pass -KubeContext or set TRPC_ACK_CONTEXT"
+}
+$context = $KubeContext
 Set-Location $projectRoot
 
 $python = Join-Path $projectRoot ".venv/Scripts/python.exe"
 $kubectl = (Get-Command kubectl -ErrorAction Stop).Source
-$kubeconfig = "C:/Users/Z/.kube/trpc-ack.yaml"
-$context = "kubernetes-admin-cdecb943ac4bf48f7af5f29e4d7bf0793"
 $supportNamespace = "trpc-runtime-support"
 $serviceNamespace = "trpc-service"
 $hpaDriverNamespace = "trpc-runtime-driver"
@@ -194,7 +203,8 @@ if ([string]$verifiedCandidateLock.binding_sha256 -ne $candidateBindingSha256) {
 
 if ($StartStage -le 1 -and $EndStage -ge 1) {
     Write-Host "[1/8] Performance + external-metric HPA"
-    & (Join-Path $PSScriptRoot "run-final-ack-performance.ps1")
+    & (Join-Path $PSScriptRoot "run-final-ack-performance.ps1") `
+        -KubeconfigPath $kubeconfig -KubeContext $context
     if ($LASTEXITCODE -ne 0) {
         throw "formal ACK Performance gate failed"
     }

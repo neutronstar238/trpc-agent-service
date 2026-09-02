@@ -1,12 +1,20 @@
+param(
+    [string]$Repository = $env:TRPC_CANDIDATE_REPOSITORY
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($Repository)) {
+    throw "candidate repository is required; pass -Repository or set TRPC_CANDIDATE_REPOSITORY"
+}
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 Set-Location $projectRoot
 $python = Join-Path $projectRoot ".venv/Scripts/python.exe"
 
 $sessionJson = & $python -m scripts.candidate_session publish `
-    --repository "docker.io/zixuan760/trpc-agent-service" `
+    --repository $Repository `
     --output "runs/multitenant/registry-image-binding.json" `
     --lock-output "runs/multitenant/candidate-lock.json" `
     --private-directory "runs/multitenant/.ack-runtime-private" `
