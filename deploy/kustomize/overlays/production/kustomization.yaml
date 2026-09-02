@@ -19,3 +19,4 @@ patches:
   - path: replicas-patch.yaml
   - path: production-config-patch.yaml
   - path: wecom-ha-patch.yaml
+  - path: im-secret-mounts-patch.yaml
