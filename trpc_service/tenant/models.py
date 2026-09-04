@@ -122,6 +122,20 @@ class ToolRisk(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ToolEffectMode(StrEnum):
+    """Adoption mode for the Cell effect protocol.
+
+    ``observe`` preserves the proven legacy executor. ``shadow`` additionally
+    derives a native Cell intent and records only privacy-safe evidence; it
+    never authorizes or performs another provider call.  A production cutover
+    is intentionally not a valid configuration value until an independently
+    deployed Effect Executor has been validated.
+    """
+
+    OBSERVE = "observe"
+    SHADOW = "shadow"
+
+
 class TenantStatus(StrEnum):
     ACTIVE = "active"
     SUSPENDED = "suspended"
@@ -170,6 +184,21 @@ class ToolPolicy(ImmutableModel):
     allow: frozenset[str] = frozenset()
     require_confirmation: frozenset[str] = frozenset()
     classifications: dict[str, ToolRisk] = Field(default_factory=dict)
+    effect_modes: dict[str, ToolEffectMode] = Field(default_factory=dict)
+
+    def effect_mode_for(self, tool_name: str) -> ToolEffectMode:
+        """Return a backwards-compatible effect adoption mode for one tool."""
+
+        return self.effect_modes.get(tool_name, ToolEffectMode.OBSERVE)
+
+    @field_validator("effect_modes")
+    @classmethod
+    def reject_cutover_or_empty_tool_names(
+        cls, value: dict[str, ToolEffectMode]
+    ) -> dict[str, ToolEffectMode]:
+        if any(not isinstance(name, str) or not name.strip() for name in value):
+            raise ValueError("effect mode tool names cannot be empty")
+        return value
 
 
 class AuditPolicy(ImmutableModel):
@@ -288,6 +317,7 @@ __all__ = [
     "TenantContext",
     "TenantRecord",
     "TenantStatus",
+    "ToolEffectMode",
     "ToolPolicy",
     "ToolRisk",
     "validate_model_base_url",

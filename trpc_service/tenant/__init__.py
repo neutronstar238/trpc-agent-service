@@ -13,6 +13,7 @@ from trpc_service.tenant.models import (
     TenantContext,
     TenantRecord,
     TenantStatus,
+    ToolEffectMode,
     ToolPolicy,
     ToolRisk,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "TenantContext",
     "TenantRecord",
     "TenantStatus",
+    "ToolEffectMode",
     "ToolPolicy",
     "ToolRisk",
     "make_principal_id",

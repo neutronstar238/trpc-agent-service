@@ -13,7 +13,9 @@ from trpc_agent_sdk.tools import BaseTool
 from trpc_agent_sdk.types import FunctionDeclaration
 from typing_extensions import override
 
-from trpc_service.tenant.models import TenantConfig, TenantContext, ToolRisk
+from trpc_service.cell.events import CellAddress
+from trpc_service.cell.shadow import CellEffectShadowValidator
+from trpc_service.tenant.models import TenantConfig, TenantContext, ToolEffectMode, ToolRisk
 from trpc_service.tool.confirmation import arguments_hash
 from trpc_service.tool.execution import HumanReviewRequired, ToolExecutor
 from trpc_service.tool.governance import Decision, GovernancePipeline
@@ -59,6 +61,24 @@ class GovernedToolObserver(Protocol):
     ) -> None: ...
 
 
+class GovernedToolShadowObserver(Protocol):
+    """Privacy-safe sink for an opt-in native intent shadow."""
+
+    async def shadow_intent_validated(
+        self,
+        context: TenantContext,
+        *,
+        turn_id: str,
+        invocation_id: str,
+        tool_name: str,
+        intent_id: str,
+        arguments_hash: str,
+        native_effect_key: str,
+        legacy_effect_key: str,
+        risk: ToolRisk,
+    ) -> None: ...
+
+
 class GovernedTool(BaseTool):
     """Delegate to an SDK tool only after tenant policy and execution checks pass."""
 
@@ -70,6 +90,8 @@ class GovernedTool(BaseTool):
         governance: GovernancePipeline,
         executor: ToolExecutor,
         observer: GovernedToolObserver | None = None,
+        shadow_validator: CellEffectShadowValidator | None = None,
+        shadow_observer: GovernedToolShadowObserver | None = None,
     ) -> None:
         if tool.is_progress_streaming:
             raise ValueError("progress-streaming tools need a governed streaming adapter")
@@ -79,6 +101,8 @@ class GovernedTool(BaseTool):
         self._governance = governance
         self._executor = executor
         self._observer = observer
+        self._shadow_validator = shadow_validator
+        self._shadow_observer = shadow_observer
 
     @property
     def is_streaming(self) -> bool:
@@ -110,12 +134,36 @@ class GovernedTool(BaseTool):
             tool_name=self.name,
             arguments=args,
         )
+        invocation_id = str(getattr(tool_context, "invocation_id", context.request_id))
+        if self._config.tools.effect_mode_for(self.name) is ToolEffectMode.SHADOW:
+            if self._shadow_validator is None or self._shadow_observer is None:
+                raise ValueError("shadow effect mode requires a validator and evidence observer")
+            evidence = self._shadow_validator.derive(
+                context,
+                _cell_address(metadata),
+                turn_id=turn_id,
+                tool_name=self.name,
+                arguments=args,
+                risk=risk,
+                legacy_effect_key=effect_key,
+            )
+            await self._shadow_observer.shadow_intent_validated(
+                context,
+                turn_id=turn_id,
+                invocation_id=invocation_id,
+                tool_name=self.name,
+                intent_id=evidence.intent.intent_id,
+                arguments_hash=evidence.arguments_hash,
+                native_effect_key=evidence.native_effect_key,
+                legacy_effect_key=evidence.legacy_effect_key,
+                risk=risk,
+            )
         observer_token: object | None = None
         if self._observer is not None:
             observer_token = await self._observer.intent_created(
                 context,
                 turn_id=turn_id,
-                invocation_id=str(getattr(tool_context, "invocation_id", context.request_id)),
+                invocation_id=invocation_id,
                 tool_name=self.name,
                 arguments_hash=arguments_hash(args),
                 effect_key=effect_key,
@@ -242,6 +290,21 @@ def _tenant_context(metadata: dict[str, Any]) -> TenantContext:
     )
 
 
+def _cell_address(metadata: dict[str, Any]) -> CellAddress:
+    required = ("tenant_id", "app_id", "cell_id", "session_id", "capsule_digest", "branch_id")
+    missing = [name for name in required if metadata.get(name) in (None, "")]
+    if missing:
+        raise ValueError(f"shadow tool context is missing Cell metadata: {', '.join(missing)}")
+    return CellAddress(
+        tenant_id=str(metadata["tenant_id"]),
+        app_id=str(metadata["app_id"]),
+        cell_id=str(metadata["cell_id"]),
+        session_id=str(metadata["session_id"]),
+        capsule_digest=str(metadata["capsule_digest"]),
+        branch_id=str(metadata["branch_id"]),
+    )
+
+
 def _confirmation_token(metadata: dict[str, Any], tool_name: str) -> str | None:
     tokens = metadata.get("tool_confirmation_tokens")
     if not isinstance(tokens, dict):
@@ -274,4 +337,4 @@ def _value_hash(value: object) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-__all__ = ["GovernedTool", "GovernedToolObserver"]
+__all__ = ["GovernedTool", "GovernedToolObserver", "GovernedToolShadowObserver"]

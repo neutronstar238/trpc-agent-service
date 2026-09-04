@@ -33,7 +33,12 @@ from trpc_service.cell.effects import (
     EffectLeaseConflict,
     EffectReceipt,
     EffectStatus,
+    ReconciliationConflict,
+    ReconciliationEvidence,
+    ReconciliationOutcome,
     _intent_fingerprint,
+    _reconciliation_status,
+    _validate_reconciliation,
 )
 from trpc_service.cell.events import (
     GENESIS_HASH,
@@ -1268,6 +1273,32 @@ class PostgresEffectLedger(_TenantRepository):
         *,
         intent: ToolIntent | None = None,
     ) -> EffectReceipt:
+        merged = dict(row)
+        if intent is not None:
+            stored_tenant = merged.get("tenant_id")
+            if stored_tenant is not None and stored_tenant != intent.tenant_id:
+                raise NamespaceViolation("effect receipt tenant is out of scope")
+            namespace = {
+                "tenant_id": intent.tenant_id,
+                "effect_key": intent.effect_key,
+                "intent_id": intent.intent_id,
+                "app_id": intent.app_id,
+                "cell_id": intent.cell_id,
+                "session_id": intent.session_id,
+                "capsule_digest": intent.capsule_digest,
+                "branch_id": intent.branch_id,
+            }
+            for key, expected in namespace.items():
+                stored = merged.get(key)
+                if stored is not None and stored != expected:
+                    raise NamespaceViolation("effect receipt namespace is out of scope")
+                merged.setdefault(key, expected)
+        tenant_id = merged.get("tenant_id")
+        effect_key = merged.get("effect_key")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise EffectLeaseConflict("effect ledger row has no tenant scope")
+        if not isinstance(effect_key, str) or not effect_key:
+            raise EffectLeaseConflict("effect ledger row has no effect key")
         receipt = await connection.fetchrow(
             """
              SELECT result_hash, error_type, attempted_at, trace_id,
@@ -1277,14 +1308,100 @@ class PostgresEffectLedger(_TenantRepository):
               ORDER BY attempt DESC, attempted_at DESC
              LIMIT 1
              """,
-            row["tenant_id"],
-            row["effect_key"],
-            int(cast(int | None, row.get("attempt")) or 0),
+            tenant_id,
+            effect_key,
+            int(cast(int | None, merged.get("attempt")) or 0),
         )
-        merged = dict(row)
         if receipt is not None:
             merged.update(dict(receipt))
         return _receipt_from_row(cast(Mapping[str, object], merged), intent=intent)
+
+    async def _get_reconciliations(
+        self,
+        connection: asyncpg.Connection,
+        effect_key: str,
+        attempt: int,
+    ) -> list[Mapping[str, object]]:
+        query = """
+            SELECT tenant_id, effect_key, attempt, outcome, evidence_digest,
+                   evidence_summary, trace_id, reconciler_id, observed_at
+              FROM cell_effect_reconciliations
+             WHERE tenant_id=current_setting('app.tenant_id', true)
+               AND effect_key=$1 AND attempt=$2
+             ORDER BY observed_at, reconciliation_id
+        """
+        fetch = getattr(connection, "fetch", None)
+        if callable(fetch):
+            rows = await fetch(query, effect_key, attempt)
+            return [cast(Mapping[str, object], dict(item)) for item in rows]
+        row = await connection.fetchrow(query, effect_key, attempt)
+        if row is None:
+            return []
+        # Existing deterministic asyncpg doubles may only provide fetchrow.
+        return [cast(Mapping[str, object], dict(row))]
+
+    async def _get_reconciliation(
+        self,
+        connection: asyncpg.Connection,
+        effect_key: str,
+        attempt: int,
+    ) -> Mapping[str, object] | None:
+        """Compatibility helper returning the newest evidence row."""
+
+        rows = await self._get_reconciliations(connection, effect_key, attempt)
+        return rows[-1] if rows else None
+
+    @staticmethod
+    def _same_reconciliation(row: Mapping[str, object], evidence: ReconciliationEvidence) -> bool:
+        """Compare only immutable evidence fields returned by PostgreSQL."""
+
+        outcome = row.get("outcome")
+        if isinstance(outcome, ReconciliationOutcome):
+            outcome = outcome.value
+        observed_at = _aware(cast(datetime | None, row.get("observed_at")))
+        return (
+            row.get("effect_key") == evidence.effect_key
+            and int(cast(int | None, row.get("attempt")) or -1) == evidence.attempt
+            and outcome == evidence.outcome.value
+            and row.get("evidence_digest") == evidence.evidence_digest
+            and row.get("evidence_summary") == evidence.evidence_summary
+            and row.get("trace_id") == evidence.trace_id
+            and row.get("reconciler_id") == evidence.reconciler_id
+            and (observed_at is None or observed_at == evidence.observed_at)
+        )
+
+    async def _write_reconciliation(
+        self,
+        connection: asyncpg.Connection,
+        intent: ToolIntent,
+        evidence: ReconciliationEvidence,
+    ) -> None:
+        await connection.execute(
+            """
+            INSERT INTO cell_effect_reconciliations (
+                tenant_id, effect_key, attempt, app_id, cell_id, session_id,
+                capsule_digest, branch_id, outcome, evidence_digest,
+                evidence_summary, trace_id, reconciler_id, observed_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+            )
+            ON CONFLICT (tenant_id, effect_key, attempt, evidence_digest) DO NOTHING
+            """,
+            intent.tenant_id,
+            evidence.effect_key,
+            evidence.attempt,
+            intent.app_id,
+            intent.cell_id,
+            intent.session_id,
+            intent.capsule_digest,
+            intent.branch_id,
+            evidence.outcome.value,
+            evidence.evidence_digest,
+            evidence.evidence_summary,
+            evidence.trace_id,
+            evidence.reconciler_id,
+            evidence.observed_at,
+        )
 
     async def get(self, effect_key: str) -> EffectReceipt | None:
         if self.tenant_id is None:
@@ -1298,7 +1415,13 @@ class PostgresEffectLedger(_TenantRepository):
             )
             if row is None:
                 return None
-            return await self._with_latest_receipt(connection, dict(row))
+            scoped_row = dict(row)
+            stored_tenant = scoped_row.get("tenant_id")
+            if stored_tenant is not None and stored_tenant != self.tenant_id:
+                raise NamespaceViolation("effect ledger tenant is out of scope")
+            scoped_row.setdefault("tenant_id", self.tenant_id)
+            scoped_row.setdefault("effect_key", effect_key)
+            return await self._with_latest_receipt(connection, scoped_row)
 
     async def claim(
         self,
@@ -1616,6 +1739,106 @@ class PostgresEffectLedger(_TenantRepository):
         if lease_expired:
             raise EffectLeaseConflict("effect lease expired before completion")
         raise EffectLeaseConflict("effect completion did not produce a receipt")
+
+    async def reconcile(
+        self,
+        intent: ToolIntent,
+        expected_attempt: int,
+        evidence: ReconciliationEvidence,
+    ) -> EffectReceipt:
+        """Converge one ambiguous/unknown attempt using a fenced SQL CAS.
+
+        The provider is never called here.  A unique evidence key plus the
+        locked ledger row makes duplicate/concurrent reconciliation idempotent;
+        contradictory evidence and stale attempts fail closed.
+        """
+
+        _validate_reconciliation(intent, expected_attempt, evidence)
+        tenant_id = self._assert_tenant(intent.tenant_id)
+        async with self._tenant_transaction(tenant_id) as connection:
+            await self._ensure_intent(connection, intent)
+            row = await self._get_ledger(connection, intent.effect_key, for_update=True)
+            if row is None:
+                raise EffectLeaseConflict("effect was not claimed")
+            current = await self._with_latest_receipt(connection, row, intent=intent)
+            if current.attempt != expected_attempt:
+                raise ReconciliationConflict("reconciliation attempt is fenced")
+            prior_rows = await self._get_reconciliations(
+                connection,
+                intent.effect_key,
+                expected_attempt,
+            )
+            expected_status = _reconciliation_status(evidence.outcome)
+            if any(self._same_reconciliation(prior, evidence) for prior in prior_rows):
+                if current.status == expected_status:
+                    return current
+                raise ReconciliationConflict("reconciliation evidence has no matching ledger state")
+            if current.status in {EffectStatus.SUCCEEDED, EffectStatus.FAILED}:
+                if current.status != expected_status:
+                    raise ReconciliationConflict("effect has already reached a final state")
+                # Keep each confirming probe, but never rewrite a terminal
+                # receipt or ledger row after final convergence.
+                await self._write_reconciliation(connection, intent, evidence)
+                return current
+            if current.status not in {EffectStatus.AMBIGUOUS, EffectStatus.UNKNOWN}:
+                raise ReconciliationConflict(
+                    "only ambiguous or unknown effect attempts may be reconciled"
+                )
+            # Insert the immutable evidence in the same transaction as the
+            # status transition.  A failed CAS rolls both writes back.
+            await self._write_reconciliation(connection, intent, evidence)
+            transitioned = await connection.fetchval(
+                """
+                UPDATE cell_effect_ledger
+                   SET status=$3, lease_owner=NULL, lease_expires_at=NULL,
+                       updated_at=clock_timestamp()
+                 WHERE tenant_id=$1 AND effect_key=$2 AND attempt=$4
+                   AND status IN ('ambiguous', 'unknown')
+                 RETURNING effect_key
+                """,
+                intent.tenant_id,
+                intent.effect_key,
+                expected_status.value,
+                expected_attempt,
+            )
+            if transitioned is None:
+                latest_row = await self._get_ledger(connection, intent.effect_key)
+                if latest_row is not None:
+                    latest = await self._with_latest_receipt(
+                        connection,
+                        latest_row,
+                        intent=intent,
+                    )
+                    if latest.attempt == expected_attempt and latest.status == expected_status:
+                        return latest
+                raise ReconciliationConflict("effect changed concurrently during reconciliation")
+            # The execution receipt is the current projection for an attempt;
+            # the append-only reconciliation table retains every proof that
+            # caused it to converge.  Updating only an ambiguous/unknown row
+            # avoids the old ON CONFLICT no-op leaving a stale error/status.
+            await connection.execute(
+                """
+                UPDATE cell_effect_receipts
+                   SET status=$4, error_type=$5, provider_reference=$6,
+                       attempted_at=clock_timestamp()
+                 WHERE tenant_id=$1 AND effect_key=$2 AND attempt=$3
+                   AND status IN ('ambiguous', 'unknown')
+                """,
+                intent.tenant_id,
+                intent.effect_key,
+                expected_attempt,
+                expected_status.value,
+                {
+                    ReconciliationOutcome.APPLIED: None,
+                    ReconciliationOutcome.NOT_APPLIED: "provider_not_applied",
+                    ReconciliationOutcome.UNKNOWN: "provider_outcome_unknown",
+                }[evidence.outcome],
+                evidence.reconciler_id,
+            )
+            final_row = await self._get_ledger(connection, intent.effect_key)
+            if final_row is None:
+                raise ReconciliationConflict("effect disappeared after reconciliation")
+            return await self._with_latest_receipt(connection, final_row, intent=intent)
 
     async def wait(
         self,

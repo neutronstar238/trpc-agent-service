@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -35,6 +36,7 @@ from trpc_service.cell.intents import (
 
 DEFAULT_WAIT_TIMEOUT_SECONDS = 30.0
 MAX_POLICY_AUTHORIZATIONS = 4096
+_RECONCILIATION_SUMMARY_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 
 
 class EffectStatus(StrEnum):
@@ -61,6 +63,185 @@ class EffectStatus(StrEnum):
     @property
     def terminal(self) -> bool:
         return self not in {EffectStatus.PENDING, EffectStatus.RUNNING}
+
+
+class ReconciliationOutcome(StrEnum):
+    """The only outcomes a provider status probe may report.
+
+    A probe is deliberately weaker than the provider's execution API.  It
+    can establish that an effect was applied, establish that it was not
+    applied, or leave the outcome unknown.  In particular, ``unknown`` is a
+    terminal *ledger decision* that keeps automatic retries disabled.
+    """
+
+    APPLIED = "applied"
+    NOT_APPLIED = "not_applied"
+    UNKNOWN = "unknown"
+
+    # The lowercase spellings are convenient for callers that use the enum
+    # alongside the persisted status values.
+    applied = "applied"
+    not_applied = "not_applied"
+    unknown = "unknown"
+
+    @classmethod
+    def parse(cls, value: ReconciliationOutcome | str) -> ReconciliationOutcome:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError(f"unsupported reconciliation outcome: {value!r}")
+        normalized = value.strip().lower().replace("-", "_")
+        try:
+            return cls(normalized)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unsupported reconciliation outcome: {value!r}") from exc
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ReconciliationEvidence:
+    """Content-free, immutable evidence from a provider status probe.
+
+    ``evidence_summary`` is an operator-facing redacted summary, never the
+    provider response or the original intent arguments.  ``result`` is
+    accepted as a constructor alias for integrations that use the database
+    column's terminology; both attributes expose the same enum value.
+    """
+
+    effect_key: str
+    attempt: int
+    outcome: ReconciliationOutcome
+    evidence_summary: str
+    trace_id: str | None
+    observed_at: datetime
+    reconciler_id: str
+    evidence_digest: str
+    tenant_id: str | None
+
+    def __init__(
+        self,
+        effect_key: str,
+        attempt: int,
+        outcome: ReconciliationOutcome | str | None = None,
+        *,
+        result: ReconciliationOutcome | str | None = None,
+        evidence_summary: str = "provider_status_unknown",
+        trace_id: str | None = None,
+        observed_at: datetime | None = None,
+        reconciler_id: str = "provider-reconciler",
+        evidence_digest: str | None = None,
+        tenant_id: str | None = None,
+    ) -> None:
+        if outcome is None:
+            outcome = result
+        elif result is not None and ReconciliationOutcome.parse(
+            outcome
+        ) != ReconciliationOutcome.parse(result):
+            raise ValueError("outcome and result disagree")
+        if outcome is None:
+            raise ValueError("reconciliation outcome is required")
+        if not isinstance(effect_key, str) or not effect_key:
+            raise ValueError("effect_key must be a non-empty string")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+            raise ValueError("reconciliation attempt must be a non-negative integer")
+        parsed_outcome = ReconciliationOutcome.parse(outcome)
+        if not isinstance(evidence_summary, str):
+            raise TypeError("evidence_summary must be a string")
+        if not _RECONCILIATION_SUMMARY_RE.fullmatch(evidence_summary):
+            raise ValueError("evidence_summary must be a short lowercase machine-readable code")
+        if trace_id is not None and not isinstance(trace_id, str):
+            raise TypeError("trace_id must be a string or None")
+        if not isinstance(reconciler_id, str) or not reconciler_id.strip():
+            raise ValueError("reconciler_id must be a non-empty string")
+        if tenant_id is not None and (not isinstance(tenant_id, str) or not tenant_id.strip()):
+            raise ValueError("tenant_id must be non-empty when provided")
+        current_time = observed_at or datetime.now(UTC)
+        if current_time.tzinfo is None or current_time.utcoffset() is None:
+            current_time = current_time.replace(tzinfo=UTC)
+        else:
+            current_time = current_time.astimezone(UTC)
+        digest_material = {
+            "attempt": attempt,
+            "effect_key": effect_key,
+            "evidence_summary": evidence_summary,
+            "outcome": parsed_outcome.value,
+            "reconciler_id": reconciler_id,
+            "tenant_id": tenant_id or "",
+            "trace_id": trace_id or "",
+            "observed_at": current_time.isoformat(),
+        }
+        canonical_digest = hashlib.sha256(_approval_json(digest_material)).hexdigest()
+        if evidence_digest is None:
+            evidence_digest = canonical_digest
+        elif evidence_digest != canonical_digest:
+            raise ValueError("evidence_digest does not match canonical evidence")
+        if (
+            not isinstance(evidence_digest, str)
+            or len(evidence_digest) != 64
+            or any(character not in "0123456789abcdef" for character in evidence_digest)
+        ):
+            raise ValueError("evidence_digest must be a lowercase SHA-256 hex digest")
+        object.__setattr__(self, "effect_key", effect_key)
+        object.__setattr__(self, "attempt", attempt)
+        object.__setattr__(self, "outcome", parsed_outcome)
+        object.__setattr__(self, "evidence_summary", evidence_summary)
+        object.__setattr__(self, "trace_id", trace_id)
+        object.__setattr__(self, "observed_at", current_time)
+        object.__setattr__(self, "reconciler_id", reconciler_id)
+        object.__setattr__(self, "evidence_digest", evidence_digest)
+        object.__setattr__(self, "tenant_id", tenant_id)
+
+    @property
+    def result(self) -> ReconciliationOutcome:
+        """Alias for the persisted ``outcome`` column."""
+
+        return self.outcome
+
+    @property
+    def summary(self) -> str:
+        """Short alias used by provider adapters."""
+
+        return self.evidence_summary
+
+    @property
+    def canonical_digest(self) -> str:
+        """Digest of all immutable evidence fields.
+
+        This is independent of a caller-supplied ``evidence_digest`` and is
+        used for duplicate/conflict checks at the ledger boundary.
+        """
+
+        material = {
+            "attempt": self.attempt,
+            "effect_key": self.effect_key,
+            "evidence_summary": self.evidence_summary,
+            "outcome": self.outcome.value,
+            "reconciler_id": self.reconciler_id,
+            "tenant_id": self.tenant_id or "",
+            "trace_id": self.trace_id or "",
+            "observed_at": self.observed_at.isoformat(),
+        }
+        return hashlib.sha256(_approval_json(material)).hexdigest()
+
+    @property
+    def digest(self) -> str:
+        return self.evidence_digest
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "effect_key": self.effect_key,
+            "attempt": self.attempt,
+            "outcome": self.outcome.value,
+            "evidence_summary": self.evidence_summary,
+            "trace_id": self.trace_id,
+            "observed_at": self.observed_at.isoformat(),
+            "reconciler_id": self.reconciler_id,
+            "evidence_digest": self.evidence_digest,
+            "tenant_id": self.tenant_id,
+        }
+
+
+def _is_reconciliation_summary(value: object) -> bool:
+    return isinstance(value, str) and _RECONCILIATION_SUMMARY_RE.fullmatch(value) is not None
 
 
 # This alias makes the public API self-documenting for storage code that uses
@@ -180,6 +361,14 @@ class EffectKeyConflict(EffectExecutionError):
 
 class EffectLeaseConflict(EffectExecutionError):
     """A stale worker attempted to finish a newer effect attempt."""
+
+
+class ReconciliationError(EffectExecutionError):
+    """Base class for provider-outcome reconciliation failures."""
+
+
+class ReconciliationConflict(ReconciliationError):
+    """A stale, cross-tenant, or conflicting reconciliation was rejected."""
 
 
 class ApprovalError(EffectExecutionError):
@@ -501,6 +690,13 @@ class EffectLedger(Protocol):
         worker_id: str | None = None,
     ) -> EffectReceipt: ...
 
+    async def reconcile(
+        self,
+        intent: ToolIntent,
+        expected_attempt: int,
+        evidence: ReconciliationEvidence,
+    ) -> EffectReceipt: ...
+
     async def wait(
         self,
         effect_key: str,
@@ -529,6 +725,37 @@ def _intent_fingerprint(intent: ToolIntent) -> str:
     )
 
 
+def _reconciliation_status(outcome: ReconciliationOutcome) -> EffectStatus:
+    return {
+        ReconciliationOutcome.APPLIED: EffectStatus.SUCCEEDED,
+        ReconciliationOutcome.NOT_APPLIED: EffectStatus.FAILED,
+        ReconciliationOutcome.UNKNOWN: EffectStatus.UNKNOWN,
+    }[outcome]
+
+
+def _validate_reconciliation(
+    intent: ToolIntent,
+    expected_attempt: int,
+    evidence: ReconciliationEvidence,
+) -> None:
+    if isinstance(expected_attempt, bool) or not isinstance(expected_attempt, int):
+        raise ValueError("expected_attempt must be a non-negative integer")
+    if expected_attempt < 0:
+        raise ValueError("expected_attempt must be a non-negative integer")
+    if not isinstance(evidence, ReconciliationEvidence):
+        raise TypeError("evidence must be ReconciliationEvidence")
+    try:
+        intent.validate_integrity()
+    except IntentIntegrityError as exc:
+        raise EffectKeyConflict("intent integrity validation failed") from exc
+    if evidence.effect_key != intent.effect_key:
+        raise ReconciliationConflict("reconciliation effect key does not match intent")
+    if evidence.attempt != expected_attempt:
+        raise ReconciliationConflict("reconciliation evidence attempt is stale")
+    if evidence.tenant_id != intent.tenant_id:
+        raise ReconciliationConflict("reconciliation evidence tenant is out of scope")
+
+
 class InMemoryEffectLedger:
     """Concurrency-safe effect ledger for tests and a single process.
 
@@ -541,6 +768,8 @@ class InMemoryEffectLedger:
     def __init__(self) -> None:
         self.records: dict[str, EffectReceipt] = {}
         self.history: dict[str, list[EffectReceipt]] = {}
+        self.reconciliations: dict[tuple[str, int], ReconciliationEvidence] = {}
+        self.reconciliation_history: dict[tuple[str, int], list[ReconciliationEvidence]] = {}
         self._lock = asyncio.Lock()
         self._done: dict[str, asyncio.Event] = {}
 
@@ -763,6 +992,66 @@ class InMemoryEffectLedger:
                 error_type=error_type,
                 worker_id=worker_id or current.worker_id,
                 completed_at=now,
+                lease_expires_at=None,
+            )
+            self._append(receipt)
+            return receipt
+
+    async def reconcile(
+        self,
+        intent: ToolIntent,
+        expected_attempt: int,
+        evidence: ReconciliationEvidence,
+    ) -> EffectReceipt:
+        """CAS a provider probe into one ambiguous ledger attempt.
+
+        Reconciliation never claims a new attempt and never invokes provider
+        code.  The lock makes a duplicate probe idempotent while preserving a
+        hard rejection for contradictory evidence.
+        """
+
+        _validate_reconciliation(intent, expected_attempt, evidence)
+        async with self._lock:
+            current = self.records.get(intent.effect_key)
+            self._ensure_identity(current, intent)
+            if current is None:
+                raise EffectLeaseConflict("effect was not claimed")
+            if current.attempt != expected_attempt:
+                raise ReconciliationConflict("reconciliation attempt is fenced")
+            key = (intent.effect_key, expected_attempt)
+            history = self.reconciliation_history.get(key, [])
+            if any(previous.canonical_digest == evidence.canonical_digest for previous in history):
+                if current.status == _reconciliation_status(evidence.outcome):
+                    return current
+                raise ReconciliationConflict("reconciliation evidence has no matching ledger state")
+            if current.status in {EffectStatus.SUCCEEDED, EffectStatus.FAILED}:
+                if current.status != _reconciliation_status(evidence.outcome):
+                    raise ReconciliationConflict("effect has already reached a final state")
+                # A subsequent probe that confirms the same final outcome is
+                # retained as immutable evidence without rewriting the effect
+                # receipt.  Only contradictory evidence is rejected.
+                self.reconciliations[key] = evidence
+                self.reconciliation_history.setdefault(key, []).append(evidence)
+                return current
+            if current.status not in {EffectStatus.AMBIGUOUS, EffectStatus.UNKNOWN}:
+                raise ReconciliationConflict(
+                    "only ambiguous or unknown effect attempts may be reconciled"
+                )
+            self.reconciliations[key] = evidence
+            self.reconciliation_history.setdefault(key, []).append(evidence)
+            status = _reconciliation_status(evidence.outcome)
+            error_type = {
+                ReconciliationOutcome.APPLIED: None,
+                ReconciliationOutcome.NOT_APPLIED: "provider_not_applied",
+                ReconciliationOutcome.UNKNOWN: "provider_outcome_unknown",
+            }[evidence.outcome]
+            receipt = replace(
+                current,
+                status=status,
+                result=None,
+                error_type=error_type,
+                trace_id=evidence.trace_id or current.trace_id,
+                completed_at=evidence.observed_at,
                 lease_expires_at=None,
             )
             self._append(receipt)
@@ -1273,6 +1562,10 @@ __all__ = [
     "KnownEffectFailure",
     "PolicyAuthority",
     "PolicyJudge",
+    "ReconciliationConflict",
+    "ReconciliationError",
+    "ReconciliationEvidence",
+    "ReconciliationOutcome",
     "ToolEffectExecutor",
     "UnknownEffectOutcome",
 ]

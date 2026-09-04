@@ -17,6 +17,7 @@ from trpc_agent_sdk.types import Blob, Content, Part
 
 from trpc_service.agent.registry import RevisionRegistry
 from trpc_service.agent.session import TurnBufferSessionService
+from trpc_service.cell.events import CellAddress
 from trpc_service.channels.envelopes import InboundEnvelope
 from trpc_service.storage.models import SessionLease, StoredEvent
 from trpc_service.storage.services import TenantDataServices
@@ -64,6 +65,7 @@ class TenantRunner:
         services: TenantDataServices | None = None,
         workspace: TenantWorkspace | None = None,
         query_embedding_provider: QueryEmbeddingProvider | None = None,
+        cell_address: CellAddress | None = None,
     ) -> None:
         if not lease.snapshot_hydrated:
             raise ValueError("TenantRunner requires a hydrated session snapshot")
@@ -74,6 +76,13 @@ class TenantRunner:
         self._workspace = workspace
         self._services = services
         self._query_embedding_provider = query_embedding_provider
+        self._cell_address = cell_address
+        if cell_address is not None and (
+            cell_address.tenant_id != config.tenant_id
+            or cell_address.app_id != config.app_id
+            or cell_address.session_id != lease.session_id
+        ):
+            raise ValueError("Cell address does not match the pinned tenant turn")
         self._session_service = (
             services.session.open_turn(lease.snapshot)
             if services is not None
@@ -130,6 +139,14 @@ class TenantRunner:
                 "request_id": context.request_id,
                 "trace_id": context.trace_id,
             }
+            if self._cell_address is not None:
+                metadata.update(
+                    {
+                        "cell_id": self._cell_address.cell_id,
+                        "capsule_digest": self._cell_address.capsule_digest,
+                        "branch_id": self._cell_address.branch_id,
+                    }
+                )
             if self._workspace is not None:
                 metadata.update(self._workspace.metadata)
             agent_context = new_agent_context(

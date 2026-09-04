@@ -210,6 +210,24 @@ def cell_demo(
         raise typer.Exit(code=1)
 
 
+@app.command("cell-evolve-demo")
+def cell_evolve_demo(
+    output: Annotated[Path | None, typer.Option(help="Optional JSON evidence path.")] = None,
+) -> None:
+    """Run the offline proof-carrying evolution and rollback demonstration."""
+
+    from trpc_service.cell.evolution import run_evolution_demo
+
+    result = run_evolution_demo()
+    rendered = json.dumps(result, ensure_ascii=False, indent=2)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
+    typer.echo(rendered)
+    if result.get("gate") != "pass":
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def probe(
     role: Annotated[Role, typer.Option(case_sensitive=False)],
@@ -411,6 +429,7 @@ async def _serve_worker(
     from trpc_service.agent.factory import DevelopmentAgentLoader, ProductionAgentLoader
     from trpc_service.agent.mailbox_runtime import MailboxClaimExecutor, MailboxReadyClaimer
     from trpc_service.agent.worker import AgentWorker
+    from trpc_service.cell.shadow import CellEffectShadowValidator
     from trpc_service.cell.worker_journal import PostgresCellRuntimeJournal
     from trpc_service.channels.feishu import FeishuAdapter
     from trpc_service.channels.media_locator import WeComMediaLocatorCipher
@@ -459,6 +478,8 @@ async def _serve_worker(
         tools=test_tools,
         governance=governance,
         tool_observer=cell_journal,
+        tool_shadow_validator=CellEffectShadowValidator(),
+        tool_shadow_observer=cell_journal,
         tool_executor=ToolExecutor(
             _derive_key(root_key, b"tool-execution"),
             PostgresExecutionLedger(runtime_repository.pool),

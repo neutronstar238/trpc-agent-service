@@ -12,9 +12,17 @@ from trpc_service.agent.fake import DeterministicAgent
 from trpc_service.agent.registry import RevisionRegistry
 from trpc_service.agent.runner import TenantRunner
 from trpc_service.cell.capsule import AgentCapsule, CapsuleMetadata, CapsuleSpec
-from trpc_service.cell.effects import CellApprovalAuthority, ExactlyOnceEffectExecutor
+from trpc_service.cell.effects import (
+    CellApprovalAuthority,
+    ExactlyOnceEffectExecutor,
+    ReconciliationOutcome,
+)
 from trpc_service.cell.events import EventDraft
 from trpc_service.cell.intents import IntentRisk, PolicyDecision, ToolIntent
+from trpc_service.cell.reconciliation import (
+    EffectReconciliationCoordinator,
+    ProviderReconciler,
+)
 from trpc_service.cell.replay import state_fingerprint
 from trpc_service.cell.runtime import AgentCellFabric, BranchEffectDenied
 from trpc_service.cell.scheduler import NodeSnapshot
@@ -263,6 +271,64 @@ async def run_demo() -> dict[str, Any]:
         intent,
         external_refund,
     )
+
+    # Model the hard production case: the provider applied a request but its
+    # response was lost.  Reconciliation calls only the provider's read-only
+    # status endpoint and converges the fenced attempt without replaying it.
+    ambiguous_intent = ToolIntent(
+        tenant_id="award-tenant",
+        app_id=activation.address.app_id,
+        cell_id=activation.address.cell_id,
+        session_id=activation.address.session_id,
+        tool_name="refund.notify",
+        arguments={"order_id": "ORDER-DEMO"},
+        intent_id="intent-refund-ambiguous-demo",
+        policy_decision=PolicyDecision.ALLOW,
+        risk=IntentRisk.NON_IDEMPOTENT,
+        principal_id="principal-demo",
+        request_id="request-refund-demo",
+        trace_id="trace-refund-demo",
+        capsule_digest=digest,
+    )
+    ambiguous_provider_calls = 0
+    status_probe_calls = 0
+
+    async def provider_applies_then_times_out() -> None:
+        nonlocal ambiguous_provider_calls
+        ambiguous_provider_calls += 1
+        raise TimeoutError("provider response unavailable")
+
+    ambiguous_scope = ambiguous_intent.confirmation_scope(
+        approved_by="human-reviewer",
+        approval_id="approval-demo-ambiguous-001",
+    )
+    ambiguous_credential = await approval_authority.issue(
+        ambiguous_intent,
+        approved_by="human-reviewer",
+        approval_id="approval-demo-ambiguous-001",
+    )
+    ambiguous = await fabric.execute_intent(
+        activation.address,
+        ambiguous_intent,
+        provider_applies_then_times_out,
+        confirmation_scope=ambiguous_scope,
+        approval_credential=ambiguous_credential,
+    )
+
+    async def read_only_status_probe(*_args: object) -> dict[str, str]:
+        nonlocal status_probe_calls
+        status_probe_calls += 1
+        return {"outcome": ReconciliationOutcome.APPLIED.value, "summary": "provider_applied"}
+
+    reconciled = await EffectReconciliationCoordinator(
+        effect_executor.ledger,
+        ProviderReconciler(read_only_status_probe, reconciler_id="demo-status-query"),
+    ).reconcile(ambiguous_intent, ambiguous)
+    after_reconciliation = await fabric.execute_intent(
+        activation.address,
+        ambiguous_intent,
+        provider_applies_then_times_out,
+    )
     fabric.deliver_reply(
         activation.address,
         reply="退款申请已提交",
@@ -375,6 +441,14 @@ async def run_demo() -> dict[str, Any]:
             "external_effect_calls": effect_calls,
             "effect_key": intent.effect_key,
         },
+        "reconciliation": {
+            "initial_status": ambiguous.status.value,
+            "reconciled_status": reconciled.status.value,
+            "duplicate_status": after_reconciliation.status.value,
+            "provider_effect_calls": ambiguous_provider_calls,
+            "status_probe_calls": status_probe_calls,
+            "automatic_retry_blocked": ambiguous_provider_calls == 1,
+        },
         "replay": {
             "main_event_count": main.event_count,
             "main_state_hash": main.state_hash,
@@ -393,6 +467,11 @@ async def run_demo() -> dict[str, Any]:
         if len(sdk_events) >= 1
         and any(event.is_final_response() for event in sdk_events)
         and effect_calls == 1
+        and ambiguous.status.value == "ambiguous"
+        and reconciled.status.value == "succeeded"
+        and after_reconciliation.status.value == "succeeded"
+        and ambiguous_provider_calls == 1
+        and status_probe_calls == 1
         and candidate_effect_blocked
         and candidate_real_effect_calls == 0
         and candidate_simulation_calls == 1

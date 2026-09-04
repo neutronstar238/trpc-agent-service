@@ -244,6 +244,14 @@ async def test_competition_demo_passes_all_innovation_gates() -> None:
     assert result["capsule"]["signature_verified"] is True
     assert result["placement"]["selected_node"] == "node-compliant-cn"
     assert result["intent_effect"]["external_effect_calls"] == 1
+    assert result["reconciliation"] == {
+        "initial_status": "ambiguous",
+        "reconciled_status": "succeeded",
+        "duplicate_status": "succeeded",
+        "provider_effect_calls": 1,
+        "status_probe_calls": 1,
+        "automatic_retry_blocked": True,
+    }
     assert result["replay"]["candidate_real_effect_blocked"] is True
     assert result["replay"]["candidate_real_effect_calls"] == 0
     assert result["replay"]["candidate_simulation_calls"] == 1

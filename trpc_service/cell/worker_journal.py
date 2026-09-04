@@ -468,6 +468,72 @@ class CellRuntimeJournal:
         self._tool_tokens[intent_event_id] = token
         return token
 
+    async def shadow_intent_validated(
+        self,
+        context: TenantContext,
+        *,
+        turn_id: str,
+        invocation_id: str,
+        tool_name: str,
+        intent_id: str,
+        arguments_hash: str,
+        native_effect_key: str,
+        legacy_effect_key: str,
+        risk: ToolRisk,
+    ) -> None:
+        """Persist a privacy-safe proof without executing a native effect."""
+
+        if not _is_sha256_hex(arguments_hash):
+            raise ValueError("arguments_hash must be a SHA-256 hex digest")
+        if not native_effect_key.startswith("trpc-agent-effect/v1:") or not _is_sha256_hex(
+            native_effect_key.removeprefix("trpc-agent-effect/v1:")
+        ):
+            raise ValueError("native_effect_key must use the Cell effect v1 namespace")
+        if not _is_sha256_hex(legacy_effect_key):
+            raise ValueError("legacy_effect_key must be a 64-character lowercase hex key")
+        turn = self._turns.get((context.tenant_id, context.app_id, turn_id))
+        if (
+            turn is None
+            or turn.address.session_id != context.session_id
+            or turn.config_version != context.config_version
+            or turn.principal_id != context.principal_id
+            or turn.trace_id != context.trace_id
+            or turn.request_id != context.request_id
+        ):
+            raise LookupError("shadow tool invocation has no active Cell turn")
+        await self._append(
+            turn.address,
+            event_type="tool.intent.shadow.validated",
+            event_id=self._scoped_event_id(
+                turn.address,
+                turn_id,
+                turn.fencing_token,
+                invocation_id,
+                tool_name,
+                "tool.intent.shadow",
+            ),
+            payload={
+                "intent_id": intent_id,
+                "tool_name": tool_name,
+                "arguments_commitment": self._private_hash(
+                    {"source_digest": arguments_hash, "tool_name": tool_name}
+                ),
+                "native_effect_key_commitment": self._private_hash(native_effect_key),
+                "legacy_effect_key_commitment": self._private_hash(legacy_effect_key),
+                "risk": risk.value,
+                "mode": "shadow",
+                "real_provider_call_count": 0,
+                "config_version": context.config_version,
+            },
+            causation_id=turn.accepted_event_id,
+            trace_id=context.trace_id,
+            request_id=context.request_id,
+            correlation_id=turn.correlation_id,
+            lease_owner=turn.lease_owner,
+            fencing_token=turn.fencing_token,
+            lease_expires_at=turn.lease_expires_at,
+        )
+
     async def policy_decided(
         self,
         token: object,

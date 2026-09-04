@@ -25,6 +25,7 @@ from trpc_service.agent.runner import (
     QueryEmbeddingProvider,
     TenantRunner,
 )
+from trpc_service.cell.events import CellAddress
 from trpc_service.channels.envelopes import MediaReference, OutboundEnvelope, PayloadKind
 from trpc_service.metrics.privacy import inject_trace_headers
 from trpc_service.metrics.prometheus import LEASE_CONFLICTS, TENANT_COST, TOKENS, TURN_LATENCY
@@ -348,6 +349,7 @@ class AgentWorker:
                         if self._workspace_manager is not None
                         else None
                     ),
+                    cell_address=_cell_address(cell_turn),
                 )
                 final_text = ""
                 run_options = {"prepared_media": prepared_media} if prepared_media else {}
@@ -720,6 +722,24 @@ class AgentWorker:
                 )
             )
         return tuple(prepared)
+
+
+def _cell_address(turn: object | None) -> CellAddress | None:
+    if turn is None:
+        return None
+    # Older/local journals return a small mapping token (for example
+    # ``{"turn_id": ...}``) and do not expose a Cell address.  The legacy
+    # Worker path must keep running with those journals; a real CellTurn still
+    # has to expose a correctly typed address.
+    if isinstance(turn, Mapping):
+        address = turn.get("address")
+        if address is None:
+            return None
+    else:
+        address = getattr(turn, "address", None)
+    if not isinstance(address, CellAddress):
+        raise TypeError("Cell turn did not expose a valid CellAddress")
+    return address
 
 
 def _target_id(acceptance: Acceptance) -> str:

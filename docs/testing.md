@@ -46,6 +46,49 @@ uv run python -m scripts.kubernetes_runtime_gate
 uv run python -m scripts.release_gate --output runs/multitenant/release-gate-final.json
 ```
 
+## 本机创新验收
+
+双轨创新使用一个无凭证入口生成单份可审计报告。它记录当前 git SHA、bounded source fingerprint、
+离线范围、每个 case 的 `pass`/`fail`/`not_run`、拒绝原因，并固定输出
+`offline_gate`/`development_gate` 与 `production_gate` 两套结论。入口会延迟导入本地
+`cell-evolve-demo` hook；正式验收使用 `--require-core-demo`，缺少 hook 会直接 fail-closed。
+
+```bash
+uv run python -m scripts.local_innovation_gate \
+  --output runs/multitenant/local-innovation-gate.json
+uv run python -m scripts.local_innovation_gate \
+  --require-core-demo \
+  --output runs/multitenant/local-innovation-gate-required.json
+```
+
+该入口只做本机源码和离线 demo 的编排，不启动 Compose、不连接 PostgreSQL/Kubernetes/IM、
+不读取或打印凭证、不调用模型或供应商；发布与回滚只操作进程内临时 pointer，不移动任何生产
+active pointer。正式报告应满足：
+
+本轮创新验收只执行 `docker compose config --quiet` 与 Kustomize 静态渲染；不启动 ACK，也不执行
+需要真实凭证或控制面的 `docker compose up`、在线 IM、供应商、PostgreSQL 运行态和 Kubernetes
+运行态门禁。上方完整本地门禁命令中的运行态步骤仅供显式环境的后续验收使用。
+
+| 字段 | 离线开发结论 | 生产结论 |
+|---|---|---|
+| `offline_gate` / `development_gate` | 必需 case 全部 `pass` | 不适用 |
+| `production_gate` | 固定 `not_run` | 只有真实依赖与独立报告齐全才可另行评审 |
+| `source_fingerprint` | 当前 checkout 的 bounded SHA-256 | 需与生产候选镜像/manifest 绑定 |
+| `cases` | 含 lineage、offline scope、core evolution case | 不可由离线 case 升级 |
+
+副作用轨道的必测拒绝条件是 stale attempt、冲突证据、跨租户和 `unknown` 自动重试；演进轨道的必测
+拒绝条件是双 replay hash 不一致、真实 provider call、缺样本、高危安全、超退化阈值、无严格改善、
+篡改/过期/跨租户/错误 Capsule/重复 approval/stale CAS。测试应先一次性执行完整 unit、contract、
+simulation、gate 和静态渲染批次，集中修正后再复跑，避免把半成品结果当作门禁证据。
+
+若机器没有 `uv`，使用临时 bootstrap venv 安装锁定版本，再同步锁文件依赖：
+
+```powershell
+py -m venv .cache\uv-bootstrap
+.cache\uv-bootstrap\Scripts\python.exe -m pip install uv==0.8.13
+.cache\uv-bootstrap\Scripts\uv.exe sync --extra dev --locked
+```
+
 `deployment_gate.py` 默认只做静态部署检查：静态清单通过时返回 0，但报告明确为
 `static_gate=pass`、`gate=not_run`、`production_gate=not_run`；它不会假装执行 live Kubernetes
 验收。加上 `--require-production` 会要求生产结论为 `pass`，由于该命令本身不执行运行态验收，

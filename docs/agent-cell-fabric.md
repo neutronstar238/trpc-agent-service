@@ -15,6 +15,21 @@ Outbox、RLS、Fencing 和无状态 Worker 基础，在其上增加四个可独�
 会话路由、跨节点恢复、工具副作用、Memory lineage、灰度发布和成本治理中，并提供可运行代码和
 可量化的故障演示。
 
+## 1.1 双轨渐进路线
+
+本分支把创新拆成两个互不阻塞、都能在本机离线验收的闭环。默认 Worker 继续由已经验证的
+legacy 执行链路负责真实运行；新能力先作为观察、影子或控制面流程接入，避免在没有独立
+Effect Executor、真实 PostgreSQL 和供应商证据时制造双写或重复副作用。
+
+| 轨道 | 本轮闭环 | 离线证据 | 生产边界 |
+|---|---|---|---|
+| 副作用对账 | `ambiguous` → 供应商只读查询 → `applied`/`not_applied`/`unknown` → Ledger CAS 收敛 | InMemory ledger、对账证据脱敏、并发/过期 attempt/冲突/跨租户拒绝测试 | `production=not_run`；不重新调用副作用接口，不启用 `cutover` |
+| Proof-Carrying Evolution | fork → 双重 replay → `simulate_only` shadow → Judge → Ed25519 certificate → approval + pointer CAS → receipt rollback | `cell-evolve-demo`、稳定 evidence Merkle root、篡改/过期/跨租户/stale CAS 拒绝演示 | `production=not_run`；不使用真实模型、工具、KMS 或供应商凭据 |
+
+配置默认是 `observe`：它只投影当前 legacy 决策和 effect key。显式 `shadow` 时，系统只构造并校验
+native `ToolIntent`、namespace 与 effect key，仍不增加供应商调用。本轮没有 `cutover` 配置；只有
+独立 effect 权威、真实 PostgreSQL/RLS、供应商对账和回滚证据全部具备后，才进入单独的发布评审。
+
 ## 2. Agent Cell 身份与不变量
 
 ```text
@@ -44,82 +59,69 @@ Cell 特有的控制/运行/信任/因果平面。
 
 ```mermaid
 flowchart TB
-    subgraph Interaction[Interaction Mesh]
-        WECOM[企业微信]
-        FEISHU[飞书]
-        AGUI[AG-UI]
-        A2A[A2A Agent]
+    accTitle: Cell Fabric Dual Track
+    accDescr: Architecture showing the legacy worker boundary, read-only effect reconciliation, and the offline Proof-Carrying Evolution control path.
+
+    subgraph interaction_mesh["📥 Interaction mesh"]
+        wecom["企业微信"]
+        feishu["飞书"]
+        gateway["🌐 Agent gateway"]
     end
 
-    subgraph Control[Capsule Control Plane]
-        ADMIN[Admin API]
-        REGISTRY[Capsule Registry<br/>manifest / digest / signature]
-        EVOLUTION[Replay & Evolution<br/>shadow / compare / promote]
+    subgraph legacy_runtime["⚙️ Existing production hot path"]
+        mailbox["Session mailbox"]
+        legacy_worker["Legacy worker"]
+        legacy_executor["Governance + fenced effect executor"]
     end
 
-    subgraph Runtime[Agent Cell Runtime Plane]
-        CHANNEL[Channel Adapter]
-        GATEWAY[Agent Gateway]
-        SCHEDULER[Cell Scheduler<br/>SLO / locality / compliance / cost]
-        MAILBOX[Session Mailbox]
-        WORKER[Agent Worker<br/>Stateless Cell Host]
-        RUNNER[tRPC-Agent Runner<br/>Graph / Team / LLM]
+    subgraph reconciliation_track["🔄 Side-effect reconciliation track"]
+        intent_observer["Intent observer"]
+        effect_ledger[("Effect ledger")]
+        provider_probe["🔍 Provider probe"]
+        reconciliation_evidence[("Reconciliation evidence")]
     end
 
-    subgraph Trust[Trust & Effect Plane]
-        INTENT[Intent Ledger]
-        POLICY[Policy Judge<br/>allow / deny / confirm / simulate]
-        EFFECT[Effect Executor]
+    subgraph evolution_track["🧪 Proof-Carrying Evolution track"]
+        fork_candidate["Fork candidate capsule"]
+        replay_twice["Replay twice"]
+        shadow_judge["Shadow Judge"]
+        signed_certificate["Signed certificate"]
+        promotion_cas["Approval + pointer CAS"]
+        promotion_receipt["Promotion receipt rollback"]
     end
 
-    subgraph State[Causal State Plane]
-        LOG[(Cell Causal Log)]
-        PG[(PostgreSQL / RLS)]
-        REDIS[(Redis wake-up)]
-        MEMORY[Memory / Summary Projector]
-        VECTOR[(pgvector / remote vector)]
-        OBJECT[(S3 / MinIO)]
-        STORAGE[Storage Adapter]
+    subgraph durable_state["💾 Durable state"]
+        causal_log[("Causal event log")]
+        postgres[("PostgreSQL / RLS")]
+        capsule_registry[("Capsule registry")]
     end
 
-    subgraph Observe[Telemetry]
-        TELEMETRY[Telemetry Collector<br/>OTel / metrics]
-        OBS[(OTel / Prometheus / Jaeger)]
-    end
+    wecom --> gateway
+    feishu --> gateway
+    gateway --> mailbox --> legacy_worker --> legacy_executor
+    legacy_worker --> intent_observer
+    legacy_executor --> effect_ledger
+    intent_observer --> effect_ledger
+    effect_ledger --> provider_probe
+    provider_probe --> reconciliation_evidence
+    reconciliation_evidence --> postgres
+    legacy_worker --> causal_log
+    fork_candidate --> replay_twice --> shadow_judge --> signed_certificate
+    signed_certificate --> promotion_cas --> promotion_receipt
+    fork_candidate --> causal_log
+    fork_candidate --> capsule_registry
+    shadow_judge -. no provider call .-> provider_probe
+    promotion_cas --> capsule_registry
+    causal_log --> postgres
 
-    WECOM --> CHANNEL
-    FEISHU --> CHANNEL
-    CHANNEL --> GATEWAY
-    AGUI --> GATEWAY
-    A2A --> GATEWAY
-    ADMIN --> REGISTRY
-    REGISTRY --> SCHEDULER
-    GATEWAY --> MAILBOX
-    MAILBOX --> PG
-    PG --> REDIS
-    REDIS --> SCHEDULER
-    SCHEDULER --> WORKER
-    WORKER --> RUNNER
-    RUNNER --> INTENT
-    INTENT --> POLICY
-    POLICY --> EFFECT
-    EFFECT --> LOG
-    RUNNER --> LOG
-    LOG --> PG
-    LOG --> MEMORY
-    MEMORY --> VECTOR
-    MEMORY --> OBJECT
-    GATEWAY --> STORAGE
-    WORKER --> STORAGE
-    STORAGE --> PG
-    STORAGE --> VECTOR
-    STORAGE --> OBJECT
-    GATEWAY -. sanitized span .-> TELEMETRY
-    WORKER -. sanitized span .-> TELEMETRY
-    EFFECT -. sanitized span .-> TELEMETRY
-    TELEMETRY --> OBS
-    EVOLUTION --> LOG
-    EVOLUTION --> REGISTRY
+    classDef action fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a5f
+    classDef success fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef caution fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef data fill:#f3f4f6,stroke:#6b7280,stroke-width:2px,color:#1f2937
+    class gateway,mailbox,legacy_worker,legacy_executor,intent_observer,fork_candidate,replay_twice action
+    class provider_probe,shadow_judge caution
+    class signed_certificate,promotion_cas,promotion_receipt success
+    class effect_ledger,reconciliation_evidence,causal_log,postgres,capsule_registry data
 ```
 
 ### 3.1 企业微信目标生产因果链路
@@ -129,43 +131,53 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant U as 企业微信用户
-    participant C as WeCom Connector
-    participant R as TenantRuntime
-    participant P as PostgreSQL Mailbox/Causal Log
-    participant Q as Redis SessionReady
-    participant S as Cell Scheduler
-    participant W as Stateless Cell Host
-    participant A as tRPC-Agent Runner
-    participant I as Intent/Policy Plane
-    participant E as Effect Executor
-    participant D as Channel Dispatcher
+    accTitle: Cell Turn And Reconciliation
+    accDescr: Target sequence for an inbound Cell turn showing the legacy worker boundary, one effect attempt, and read-only provider reconciliation after an ambiguous response.
 
-    U->>C: aibot_msg_callback(provider_msg_id)
-    C->>R: verified envelope + binding_id
-    R->>R: derive tenant/session/request_id/trace_id + pin capsule_digest
-    R->>P: TX: dedupe inbound + mailbox + message.accepted + outbox
-    P-->>C: durable commit
-    P->>Q: publish SessionReady(trace_id, cell_id, generation)
-    Q->>S: at-least-once wake-up
-    S->>S: capability/region/locality/SLO/cost placement
-    S->>W: claim Cell lease + node decision
-    W->>P: hydrate Session/Memory/Summary + causal head
-    W->>A: Runner.run_async(context contains cell/capsule/branch/trace)
-    A->>I: ToolIntent(effect_key, arguments_hash)
-    I->>P: append tool.intent.created + policy.decided
-    alt requires confirmation
-        I-->>U: confirmation card
-        U-->>I: scoped approval
+    participant user as 企业微信用户
+    participant connector as WeCom connector
+    participant runtime as Tenant runtime
+    participant postgres as PostgreSQL ledger
+    participant worker as Legacy worker
+    participant runner as tRPC-Agent runner
+    participant executor as Effect executor
+    participant provider as Provider
+    participant reconciler as Provider reconciler
+    participant dispatcher as Channel dispatcher
+
+    user->>connector: aibot_msg_callback(provider_msg_id)
+    connector->>runtime: verified envelope + binding_id
+    runtime->>postgres: durable ingress + mailbox + outbox
+    postgres-->>connector: commit acknowledged
+    postgres->>worker: SessionReady wake-up
+    worker->>postgres: claim session lease + hydrate head
+    worker->>runner: run pinned capsule and branch
+    runner->>postgres: append ToolIntent + policy decision
+    postgres-->>executor: allowed intent + effect lease
+    executor->>postgres: claim effect key, attempt 1
+    executor->>provider: invoke side effect once
+    alt provider response is known
+        provider-->>executor: success or explicit failure
+        executor->>postgres: receipt + terminal effect fact
+    else response is lost
+        provider--x executor: transport timeout; result ambiguous
+        executor->>postgres: mark attempt ambiguous
+        reconciler->>provider: GET status by provider idempotency key
+        Note over reconciler,provider: probe only; never repeat the side-effect request
+        alt applied
+            provider-->>reconciler: applied
+            reconciler->>postgres: CAS ambiguous → succeeded
+        else not applied
+            provider-->>reconciler: not_applied
+            reconciler->>postgres: CAS ambiguous → failed; retry may be explicit
+        else unknown
+            provider-->>reconciler: unknown
+            reconciler->>postgres: keep unknown; automatic retry remains blocked
+        end
     end
-    I->>E: allowed intent + exact confirmation scope
-    E->>P: atomically claim cell_effect_ledger
-    E->>E: invoke Tool/MCP/external system once
-    E->>P: receipt + tool.effect.* + Memory fact + reply outbox
-    P->>D: outbound ready(trace_id, request_id)
-    D->>C: channel-normalized reply
-    C-->>U: aibot_send_msg + provider ACK
-    C->>P: reply.delivered + delivery receipt
+    postgres->>dispatcher: outbound ready(trace_id, request_id)
+    dispatcher->>connector: channel-normalized reply
+    connector-->>user: aibot_send_msg + provider ACK
 ```
 
 `trace_id` 从已验证入口生成或继承，`request_id` 标识本次接入，`correlation_id` 标识用户目标，
@@ -344,6 +356,30 @@ Intent/Effect 所需最小权限；当前默认部署没有创建该身份，因
 `cell_effect_ledger`/外部副作用的重新授权；默认 Worker 是受信投影边界，原生 ledger 仍由独立
 executor 权威写入。
 
+### 7.1 副作用对账闭环
+
+副作用请求的 transport timeout 只产生 `ambiguous`，不会触发隐式重试。专用
+`ProviderReconciler.probe(intent, receipt)` 只按供应商幂等键查询状态，并生成脱敏
+`ReconciliationEvidence`；它绝不再次调用副作用接口。协调器把证据交给
+`EffectLedger.reconcile(intent, expected_attempt, evidence)`，并用 attempt、tenant 和状态条件做
+CAS：
+
+| 查询结果 | Ledger 收敛 | 后续动作 |
+|---|---|---|
+| `applied` | `ambiguous/unknown` → `succeeded` | 不再重试 |
+| `not_applied` | `ambiguous/unknown` → `failed` | 仅在安全条件下允许显式重试 |
+| `unknown` | 保持 `unknown` | 自动重试继续禁止，等待下一次查询或人工处置 |
+
+`cell_effect_reconciliations` 是不可变证据表，只保存 effect key、attempt、结果、证据摘要、trace、
+时间和对账器身份；不保存原始参数、密钥或供应商敏感响应。过期 attempt、跨租户 intent、重复
+消费和互相冲突的证据全部拒绝。内存实现用于本机验收，PostgreSQL adapter 的 RLS、专用 authority
+角色和 trigger 是生产切换前的独立门禁。
+
+默认模式为 `observe`：真实 Worker 仍由 `GovernancePipeline + ToolExecutor +
+PostgresExecutionLedger` 执行，新的对账器只观察并收敛可确认状态。`shadow` 只构造并校验 native
+`ToolIntent`、namespace 和 effect key，不增加供应商调用；本轮不提供 `cutover`，因此不会产生两套
+执行器同时写入或重复发送。
+
 ## 8. Replay、分支与演化
 
 ### 8.1 确定性回放
@@ -364,6 +400,79 @@ Capsule、模型或策略并继续产生新事件，用于回答：
 
 候选结果通过 Quality、Cost、Latency、Safety Judge 后才进入按租户灰度。生产升级仍由人工或明确的
 发布策略批准，Replay 系统不能自行获得更高权限。
+
+### 8.3 Proof-Carrying Evolution 闭环
+
+演进运行只接受完整的精确 `CellAddress`，v1 不支持 session/app wildcard。它从 main 的指定
+sequence/hash 建立新 Capsule 分支；候选运行强制 `simulate_only`，真实 provider 调用数必须为零。
+同一 reducer 回放两次并比较 state hash，任何不一致立即拒绝。每个样本只保存脱敏摘要和整数指标：
+quality basis points、cost units、latency milliseconds、safety findings，以及 baseline/candidate
+output hash；稳定排序后计算 evidence Merkle root。
+
+```mermaid
+stateDiagram-v2
+    accTitle: Evolution Certificate Lifecycle
+    accDescr: Candidate evolution state machine from a planned fork through deterministic replay, evidence sealing, signed promotion, and receipt-based rollback.
+
+    [*] --> planned: plan exact Cell
+    planned --> forked: fork source sequence/hash
+    forked --> replay_verified: reducer hashes match
+    forked --> rejected: replay mismatch
+    replay_verified --> evidence_sealed: seal shadow evidence
+    evidence_sealed --> certified: Judge hard gates + Pareto pass
+    evidence_sealed --> rejected: incomplete or unsafe evidence
+    certified --> promoted: approval use + pointer CAS
+    certified --> expired: certificate TTL elapsed
+    promoted --> rolled_back: verify receipt + active digest
+    certified --> aborted: operator aborts before promotion
+    rejected --> [*]
+    expired --> [*]
+    aborted --> [*]
+    rolled_back --> [*]
+```
+
+Judge 先执行硬门禁：样本完整、无高危安全问题、无真实副作用、质量/成本/延迟均未超过策略退化
+阈值；随后执行 Pareto 规则，至少一个指标严格改善。`EvolutionCertificate` 是 canonical JSON 的
+Ed25519 签名，绑定完整 source/candidate `CellAddress`、Capsule 与 head、fork sequence/hash、
+dataset、runner、model、policy、tool manifest、reducer、evidence digest、Judge 策略、key、有效期、
+expected active Capsule 和 control version。证书只证明候选证据，不授权工具副作用。
+
+Promotion 同时要求证书验证、租户范围一致、一次性人工 approval 和 pointer CAS；发布事件与 pointer
+不能原子提交时由 outbox/reconciler 补偿，重复消费证书必须是幂等的。回滚使用签名 promotion receipt，
+先校验当前 active digest 与 receipt，再以 CAS 恢复 expected Capsule；stale pointer、重复 approval、
+错误 Capsule、跨租户或过期证书都必须拒绝。当前 `PromotionStore`、outbox 与 reconciler 是可完整运行的
+进程内参考实现；`0025` 只提供 RLS/authority 数据边界，尚未实现 PostgreSQL CAS/outbox adapter，因而
+不能据此宣称在线发布控制面已经生产可用。
+
+```mermaid
+sequenceDiagram
+    accTitle: Evolution Promotion Evidence
+    accDescr: Offline candidate evolution sequence showing fork, dual replay, shadow judging, signed certificate verification, pointer CAS, and receipt-based rollback.
+
+    participant operator as 👤 Operator
+    participant coordinator as ⚙️ Evolution coordinator
+    participant event_store as 💾 Event store
+    participant runner as 🧪 Simulate-only runner
+    participant judge as 🧠 Evolution Judge
+    participant authority as 🔐 Approval authority
+    participant store as 💾 Promotion store
+
+    operator->>coordinator: create_run(exact CellAddress, source head)
+    coordinator->>event_store: fork candidate branch at sequence/hash
+    coordinator->>runner: replay candidate twice
+    runner-->>coordinator: state_hash_1, state_hash_2, provider_calls=0
+    alt hashes differ or provider_calls > 0
+        coordinator-->>operator: reject candidate with reason
+    else deterministic shadow verified
+        coordinator->>judge: evaluate complete redacted samples
+        judge-->>coordinator: hard gates + Pareto decision
+        coordinator->>authority: issue one-time approval binding
+        coordinator->>store: verify certificate + approval + pointer CAS
+        store-->>operator: signed promotion receipt
+        operator->>store: rollback(receipt, expected_active_digest)
+        store-->>operator: active digest restored by CAS
+    end
+```
 
 ## 9. 与现有实现的衔接
 
@@ -393,18 +502,46 @@ Capsule、模型或策略并继续产生新事件，用于回答：
 | Projector | Memory/Knowledge 最终一致投影 | 当前补齐 Cell effect/turn terminal；branch lineage/checksum 重建仍是演进目标 |
 | Config Revision | 不可变灰度和回滚 | 内容寻址 Agent Capsule |
 
+### 9.3 证据分层与基线合入
+
+验收报告必须把代码存在、离线闭环和真实运行态分开写。`scripts/local_innovation_gate.py` 只做
+本机证据编排，不把缺失的外部依赖或未执行的生产动作填成成功。
+
+| 证据层 | 当前权威 | 可以宣称 | 不能宣称 |
+|---|---|---|---|
+| 生产热路径 | legacy `TenantRuntime`、Mailbox、`GovernancePipeline`、fenced `ToolExecutor`、`CellTurnJournal` | 现有多租户消息与 effect 投影边界保持不变 | 原生 Cell Effect Executor 已接管默认 Worker |
+| 离线完整实现 | InMemory/纯函数协议、shadow Judge、证书与 Promotion store、`cell-demo`/`cell-evolve-demo`、local gate | 协议、拒绝条件、确定性与零真实副作用可在本机复现 | 真实 PG 锁/RLS、供应商语义、KMS 或多节点恢复已经通过 |
+| 生产证据 | 本机未连接真实 IM、模型、供应商、KMS、PG 或 Kubernetes | `production=not_run` 及明确拒绝原因 | 用离线 `pass`、静态 SQL 或 mock 报告升级为生产通过 |
+
+两个创新轨道应按边界分块合入稳定基线：
+
+| 分块 | 建议 | 合入条件 |
+|---|---|---|
+| Effect reconciliation | 应合入；先以 `observe`，再以独立 reconciler/authority 部署 | InMemory 与 PG/RLS CAS、真实供应商 query-only 对账、重复/冲突/恢复证据齐全 |
+| Proof-Carrying Evolution | 应以控制面/离线工具合入；候选分支和证书不改变默认 Worker | reducer、Judge、Ed25519、approval 一次性消费、pointer CAS/outbox/rollback 的完整证据齐全 |
+| Native `cutover` | 本轮不合入 | 独立 Effect Executor、真实 PostgreSQL、供应商合同与灰度回滚门禁另行批准 |
+
+交付保存为两个提交：第一个只包含既有 import 修复；第二个包含本双轨创新实现、gate、测试和文档。
+后续合入 main 时仍按上表拆成可回滚的 pull request，不把离线创新演示与生产切换绑定。
+
 ## 10. 可演示验收场景
 
 1. 注册并验证一个签名 Capsule，篡改 manifest 后验证必须失败。
 2. 两个租户使用相同模型但不同地域/工具策略，Scheduler 输出不同节点和可解释评分。
 3. Worker 在非幂等 Effect 返回前崩溃，接管节点看到同一 effect key，不进行第二次外部调用。
-4. 修改历史 event payload，hash-chain 校验立即失败。
-5. 从生产 sequence 建立候选 branch，分别用两个 Capsule 继续运行，主分支不受影响。
-6. Replay 重建状态并与存储的 projection checksum 比较。
-7. 高风险 Intent 未确认时不执行；确认令牌跨租户或参数变化时拒绝。
-8. trace_id 串联 IM 入站、Cell 调度、Runner、Intent、Effect、投影和 IM 回复。
+4. 对同一 `ambiguous` attempt 分别查询 `applied`、`not_applied` 和 `unknown`，验证 CAS 收敛、
+   安全重试和持续封锁；供应商执行次数始终为一次。
+5. 修改历史 event payload，hash-chain 校验立即失败。
+6. 从生产 sequence 建立候选 branch，分别用两个 Capsule 继续运行，主分支不受影响。
+7. Replay 重建状态两次并比较 state hash；候选运行的 provider call count 必须为零。
+8. 让 Judge 逐项拒绝不完整样本、高危安全问题、真实副作用、超阈值退化和无严格改善的候选。
+9. 篡改 evidence、跨租户、过期、错误 Capsule、重复 approval 和 stale pointer 均不能签发或发布；
+   有效 Promotion receipt 可验证当前 active digest 后回滚。
+10. `local_innovation_gate` 输出 git SHA、source fingerprint、每项 case result、
+    `offline/development=pass` 和 `production=not_run`。
+11. trace_id 串联 IM 入站、Cell 调度、Runner、Intent、Effect、投影和 IM 回复。
 
-第 8 项是目标生产验收：当前 Feishu HTTP callback 已建立入口 span，WeCom 入站及完整存储子 span 仍需
+第 11 项是目标生产验收：当前 Feishu HTTP callback 已建立入口 span，WeCom 入站及完整存储子 span 仍需
 真实 OTel 运行态验证，生产矩阵保持 `not_run`。
 
 ## 11. 量化指标
@@ -421,12 +558,16 @@ Capsule、模型或策略并继续产生新事件，用于回答：
 
 ## 12. 交付边界
 
-本仓库提供核心领域模型、确定性内存实现、PostgreSQL schema/adapter、默认 Worker 的 PostgreSQL
+本仓库提供核心领域模型、确定性内存实现、既有 Cell PostgreSQL schema/adapter、默认 Worker 的 PostgreSQL
 `CellTurnJournal`、Session-fenced append、`post_turn.ready` commit reconciler、CLI 演示与单元/契约测试。
 Worker 只能登记不可调度的 `runtime_projection` Capsule；可授权 placement 的 `deployment` Capsule 仍需
-生产控制面/KMS 验签与独立登记凭证。
+生产控制面/KMS 验签与独立登记凭证。`scripts/local_innovation_gate.py` 是本机创新验收入口，默认
+只加载本地 lineage 与可用的演进 demo hook；它不启动服务、不访问网络，也不改变生产指针。
 
 生产接入继续复用原有 Gateway、Mailbox Worker、Outbox 和 Channel Dispatcher。Semantic Scheduler 与
 容量 reservation、原生 Policy/Approval/Effect adapter 虽已实现，但尚未接管默认 Worker 热路径；外部
-KMS 信任根、真实多节点调度状态、模型质量 Judge 和生产回放批处理也未在本地环境完成验证。它们在验收
-矩阵中保持 `not_run`，不能用离线 `cell-demo` 或静态 SQL 契约冒充生产通过。
+KMS 信任根、真实多节点调度状态、模型质量 Judge 和生产回放批处理也未在本地环境完成验证。副作用
+对账和 Proof-Carrying Evolution 的离线拒绝路径可以由本地 gate/演示复现；真实供应商 query-only
+语义、PG RLS/角色、PostgreSQL Promotion CAS/outbox adapter、KMS、IM、模型和发布恢复在验收矩阵中
+保持 `production=not_run`，不能用离线
+`cell-demo`、`cell-evolve-demo` 或静态 SQL 契约冒充生产通过。
