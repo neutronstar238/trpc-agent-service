@@ -73,7 +73,6 @@ import yaml
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from runs.multitenant.project_kubernetes_secrets import project_secrets
 from scripts.deployment_preflight import build_preflight
 from scripts.evidence_lineage import build_evidence, runtime_fingerprint
 from scripts.report_io import atomic_write_json
@@ -351,6 +350,11 @@ def _project_secret_yaml(
     image_pull_secret: str,
 ) -> str:
     """Render one allowlisted Secret profile without exposing its values."""
+
+    # ``runs/`` holds operational artifacts and is not an installed package.
+    # Import it lazily so ``python -m scripts.kubernetes_runtime_gate`` and the
+    # unit suite stay importable from a clean checkout.
+    from runs.multitenant.project_kubernetes_secrets import project_secrets
 
     documents = project_secrets(
         Path(manifest_path),
