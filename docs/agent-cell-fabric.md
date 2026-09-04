@@ -440,9 +440,10 @@ expected active Capsule 和 control version。证书只证明候选证据，不�
 Promotion 同时要求证书验证、租户范围一致、一次性人工 approval 和 pointer CAS；发布事件与 pointer
 不能原子提交时由 outbox/reconciler 补偿，重复消费证书必须是幂等的。回滚使用签名 promotion receipt，
 先校验当前 active digest 与 receipt，再以 CAS 恢复 expected Capsule；stale pointer、重复 approval、
-错误 Capsule、跨租户或过期证书都必须拒绝。当前 `PromotionStore`、outbox 与 reconciler 是可完整运行的
-进程内参考实现；`0025` 只提供 RLS/authority 数据边界，尚未实现 PostgreSQL CAS/outbox adapter，因而
-不能据此宣称在线发布控制面已经生产可用。
+错误 Capsule、跨租户或过期证书都必须拒绝。除进程内参考实现外，`0026` 与
+`PostgresEvolutionControlPlane` 已实现 tenant RLS、证书/approval 一次性消费、pointer CAS、epoch-fenced
+outbox 和 receipt 回滚；本机 kind 门禁可在一次性 PostgreSQL 上验证该适配器。它仍不等于生产控制面：
+真实 KMS、模型/工具 Judge、托管数据库、多可用区与 ACK 故障恢复尚未验收。
 
 ```mermaid
 sequenceDiagram
@@ -511,7 +512,8 @@ sequenceDiagram
 |---|---|---|---|
 | 生产热路径 | legacy `TenantRuntime`、Mailbox、`GovernancePipeline`、fenced `ToolExecutor`、`CellTurnJournal` | 现有多租户消息与 effect 投影边界保持不变 | 原生 Cell Effect Executor 已接管默认 Worker |
 | 离线完整实现 | InMemory/纯函数协议、shadow Judge、证书与 Promotion store、`cell-demo`/`cell-evolve-demo`、local gate | 协议、拒绝条件、确定性与零真实副作用可在本机复现 | 真实 PG 锁/RLS、供应商语义、KMS 或多节点恢复已经通过 |
-| 生产证据 | 本机未连接真实 IM、模型、供应商、KMS、PG 或 Kubernetes | `production=not_run` 及明确拒绝原因 | 用离线 `pass`、静态 SQL 或 mock 报告升级为生产通过 |
+| 本机多节点预验收 | `kind_ack_gate --execute`；候选 Gateway/Worker、一次性 PostgreSQL/Redis、假 IM/供应商 | 可在 1 控制面 + 3 Worker 上验证真实 Pod/Service/DNS、PG/RLS/CAS、Redis PEL、重复回调和 Pod 替换 | ACK 网络/存储/IAM 等价，或真实供应商、真实 IM、模型与 KMS 已通过 |
+| 生产证据 | 当前创新轮不访问真实 IM、模型、供应商、KMS 或 ACK | `production=not_run` 及明确拒绝原因 | 用离线/kind `pass`、静态 SQL 或 mock 报告升级为生产通过 |
 
 两个创新轨道应按边界分块合入稳定基线：
 
@@ -566,8 +568,8 @@ Worker 只能登记不可调度的 `runtime_projection` Capsule；可授权 plac
 
 生产接入继续复用原有 Gateway、Mailbox Worker、Outbox 和 Channel Dispatcher。Semantic Scheduler 与
 容量 reservation、原生 Policy/Approval/Effect adapter 虽已实现，但尚未接管默认 Worker 热路径；外部
-KMS 信任根、真实多节点调度状态、模型质量 Judge 和生产回放批处理也未在本地环境完成验证。副作用
-对账和 Proof-Carrying Evolution 的离线拒绝路径可以由本地 gate/演示复现；真实供应商 query-only
-语义、PG RLS/角色、PostgreSQL Promotion CAS/outbox adapter、KMS、IM、模型和发布恢复在验收矩阵中
-保持 `production=not_run`，不能用离线
-`cell-demo`、`cell-evolve-demo` 或静态 SQL 契约冒充生产通过。
+KMS 信任根、模型质量 Judge 和生产回放批处理也未完成验证。副作用对账和 Proof-Carrying Evolution 的
+离线拒绝路径由本地 gate/演示复现，PostgreSQL authority/CAS/outbox 与多 Pod 恢复则由显式
+`kind_ack_gate --execute` 预验收；真实供应商 query-only 语义、ACK、KMS、在线 IM、模型和生产发布恢复
+仍保持 `production=not_run`。不能用离线 `cell-demo`、`cell-evolve-demo`、静态 SQL 或本机 kind
+冒充生产通过。

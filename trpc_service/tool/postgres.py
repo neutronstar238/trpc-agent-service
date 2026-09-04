@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -14,8 +14,21 @@ import asyncpg
 
 from trpc_service.tenant.models import TenantConfig, TenantContext, ToolRisk
 from trpc_service.tool.confirmation import ConfirmationScope
-from trpc_service.tool.execution import ExecutionRecord, ExecutionStatus
+from trpc_service.tool.execution import (
+    ExecutionReconciliationConflict,
+    ExecutionRecord,
+    ExecutionStatus,
+)
 from trpc_service.tool.governance import Decision
+from trpc_service.tool.reconciliation import (
+    ExecutionProbeIntent,
+    ExecutionReconciliationClaim,
+    ReconciliationConflict,
+    ReconciliationEvidence,
+    ReconciliationOutcome,
+    reconciliation_status,
+    validate_reconciliation_evidence,
+)
 
 
 class _TenantStore:
@@ -237,7 +250,7 @@ class PostgresExecutionLedger(_TenantStore):
             existing = await connection.fetchrow(
                 """
                 SELECT turn_id,tool_name,classification,arguments_hash,status,
-                       lease_owner,lease_epoch
+                       lease_owner,lease_epoch,attempt
                   FROM tool_executions
                  WHERE tenant_id=$1 AND execution_key=$2
                  FOR UPDATE
@@ -274,8 +287,13 @@ class PostgresExecutionLedger(_TenantStore):
                             execution_key,
                             status,
                             replay_terminal=True,
+                            attempt=_row_int(existing, "attempt", 1),
                         )
-                    return ExecutionRecord(execution_key, status)
+                    return ExecutionRecord(
+                        execution_key,
+                        status,
+                        attempt=_row_int(existing, "attempt", 1),
+                    )
                 existing_turn_id = UUID(str(existing["turn_id"]))
                 await self._assert_active_turn(
                     connection,
@@ -298,9 +316,15 @@ class PostgresExecutionLedger(_TenantStore):
                         """
                         UPDATE tool_executions
                            SET lease_owner=$3,lease_epoch=$4,
-                               status='started',completed_at=NULL
+                               status='started',completed_at=NULL,
+                               attempt=attempt+1,
+                               reconciliation_owner=NULL,
+                               reconciliation_lease_expires_at=NULL,
+                               reconciliation_outcome=NULL,
+                               reconciliation_evidence_digest=NULL,
+                               reconciled_at=NULL
                          WHERE tenant_id=$1 AND execution_key=$2
-                           AND status IN ('started','failed','ambiguous')
+                            AND status IN ('started','failed','ambiguous','unknown')
                            AND (
                                lease_owner IS DISTINCT FROM $3
                                OR lease_epoch IS DISTINCT FROM $4
@@ -317,15 +341,24 @@ class PostgresExecutionLedger(_TenantStore):
                             "tool execution was changed while taking its fence",
                             requires_confirmation=True,
                         )
-                    return ExecutionRecord(execution_key, ExecutionStatus.STARTED, fresh=True)
-                return ExecutionRecord(execution_key, status)
+                    return ExecutionRecord(
+                        execution_key,
+                        ExecutionStatus.STARTED,
+                        fresh=True,
+                        attempt=_row_int(existing, "attempt", 1) + 1,
+                    )
+                return ExecutionRecord(
+                    execution_key,
+                    status,
+                    attempt=_row_int(existing, "attempt", 1),
+                )
 
             inserted = await connection.fetchval(
                 """
                 INSERT INTO tool_executions (
                     tenant_id,execution_key,turn_id,tool_name,classification,
-                    arguments_hash,status,lease_owner,lease_epoch
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                    arguments_hash,status,lease_owner,lease_epoch,attempt
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1)
                 ON CONFLICT (tenant_id,execution_key) DO NOTHING
                 RETURNING execution_key
                 """,
@@ -340,12 +373,17 @@ class PostgresExecutionLedger(_TenantStore):
                 fencing_token,
             )
             if inserted is not None:
-                return ExecutionRecord(execution_key, ExecutionStatus.STARTED, fresh=True)
+                return ExecutionRecord(
+                    execution_key,
+                    ExecutionStatus.STARTED,
+                    fresh=True,
+                    attempt=1,
+                )
             # A concurrent insert can win after the initial SELECT.  Re-read
             # its locked row and apply exactly the same fence rules.
             existing = await connection.fetchrow(
                 """
-                SELECT turn_id,status,lease_owner,lease_epoch
+                SELECT turn_id,status,lease_owner,lease_epoch,attempt
                   FROM tool_executions
                  WHERE tenant_id=$1 AND execution_key=$2
                  FOR UPDATE
@@ -369,8 +407,13 @@ class PostgresExecutionLedger(_TenantStore):
                         execution_key,
                         status,
                         replay_terminal=True,
+                        attempt=_row_int(existing, "attempt", 1),
                     )
-                return ExecutionRecord(execution_key, status)
+                return ExecutionRecord(
+                    execution_key,
+                    status,
+                    attempt=_row_int(existing, "attempt", 1),
+                )
             await self._assert_active_turn(
                 connection,
                 tenant_id=tenant_id,
@@ -388,9 +431,15 @@ class PostgresExecutionLedger(_TenantStore):
                     """
                     UPDATE tool_executions
                        SET lease_owner=$3,lease_epoch=$4,
-                           status='started',completed_at=NULL
+                           status='started',completed_at=NULL,
+                           attempt=attempt+1,
+                           reconciliation_owner=NULL,
+                           reconciliation_lease_expires_at=NULL,
+                           reconciliation_outcome=NULL,
+                           reconciliation_evidence_digest=NULL,
+                           reconciled_at=NULL
                      WHERE tenant_id=$1 AND execution_key=$2
-                       AND status IN ('started','failed','ambiguous')
+                       AND status IN ('started','failed','ambiguous','unknown')
                     RETURNING execution_key
                     """,
                     tenant_id,
@@ -403,8 +452,17 @@ class PostgresExecutionLedger(_TenantStore):
                         "tool execution was changed while taking its fence",
                         requires_confirmation=True,
                     )
-                return ExecutionRecord(execution_key, ExecutionStatus.STARTED, fresh=True)
-            return ExecutionRecord(execution_key, status)
+                return ExecutionRecord(
+                    execution_key,
+                    ExecutionStatus.STARTED,
+                    fresh=True,
+                    attempt=_row_int(existing, "attempt", 1) + 1,
+                )
+            return ExecutionRecord(
+                execution_key,
+                status,
+                attempt=_row_int(existing, "attempt", 1),
+            )
 
     async def finish(
         self,
@@ -424,7 +482,7 @@ class PostgresExecutionLedger(_TenantStore):
         async with self._transaction(tenant_id) as connection:
             existing = await connection.fetchrow(
                 """
-                SELECT turn_id,status,lease_owner,lease_epoch
+                SELECT turn_id,status,lease_owner,lease_epoch,attempt
                   FROM tool_executions
                  WHERE tenant_id=$1 AND execution_key=$2
                  FOR UPDATE
@@ -451,7 +509,10 @@ class PostgresExecutionLedger(_TenantStore):
             updated = await connection.fetchval(
                 """
                 UPDATE tool_executions AS execution
-                   SET status=$3,completed_at=clock_timestamp()
+                   SET status=$3,
+                       completed_at=clock_timestamp(),
+                       reconciliation_owner=NULL,
+                       reconciliation_lease_expires_at=NULL
                  WHERE tenant_id=$1 AND execution_key=$2
                    AND status='started'
                    AND lease_owner=$4 AND lease_epoch=$5
@@ -480,8 +541,370 @@ class PostgresExecutionLedger(_TenantStore):
         if updated is None:
             raise RuntimeError("tool execution does not exist or is no longer owned")
 
+    async def get_record(
+        self,
+        execution_key: str,
+        *,
+        tenant_id: str,
+    ) -> ExecutionRecord | None:
+        """Read one execution row under the caller's tenant RLS context."""
 
-class ToolExecutionConflict(RuntimeError):
+        async with self._transaction(tenant_id) as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT execution_key,status,attempt
+                  FROM tool_executions
+                 WHERE tenant_id=$1 AND execution_key=$2
+                """,
+                tenant_id,
+                execution_key,
+            )
+        if row is None:
+            return None
+        return ExecutionRecord(
+            execution_key,
+            _execution_status(_row_value(row, "status")),
+            attempt=_row_int(row, "attempt", 1),
+        )
+
+    async def list_ambiguous(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[ExecutionProbeIntent]:
+        """List only ambiguous/unknown rows; this method never invokes tools."""
+
+        _validate_reconciliation_limit(limit)
+        async with self._transaction(tenant_id) as connection:
+            rows = await connection.fetch(
+                """
+                SELECT execution.tenant_id,execution.execution_key,
+                       execution.turn_id,execution.tool_name,
+                       execution.arguments_hash,execution.status,
+                       execution.attempt,turn.session_id,session.app_id
+                  FROM tool_executions AS execution
+                  JOIN session_turns AS turn
+                    ON turn.tenant_id=execution.tenant_id
+                   AND turn.turn_id=execution.turn_id
+                  JOIN sessions AS session
+                    ON session.tenant_id=turn.tenant_id
+                   AND session.session_id=turn.session_id
+                 WHERE execution.tenant_id=$1
+                   AND execution.status IN ('ambiguous','unknown')
+                 ORDER BY execution.started_at,execution.execution_key
+                 LIMIT $2
+                """,
+                tenant_id,
+                limit,
+            )
+        return [_probe_intent_from_row(row) for row in rows]
+
+    async def claim_ambiguous(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        limit: int = 100,
+        lease_seconds: float = 30.0,
+    ) -> list[ExecutionReconciliationClaim]:
+        """Atomically lease ambiguous rows for a reconciler worker.
+
+        ``FOR UPDATE SKIP LOCKED`` plus the epoch increment makes two
+        reconciler Pods safe to run concurrently.  The lease is independent
+        from the tool worker lease, so a recovered worker cannot finish a
+        stale probe after a reconciler hand-off.
+        """
+
+        _validate_reconciliation_limit(limit)
+        _validate_reconciliation_owner(owner_id)
+        _validate_reconciliation_lease(lease_seconds)
+        async with self._transaction(tenant_id) as connection:
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT execution.tenant_id,execution.execution_key,
+                           execution.turn_id
+                      FROM tool_executions AS execution
+                      JOIN session_turns AS turn
+                        ON turn.tenant_id=execution.tenant_id
+                       AND turn.turn_id=execution.turn_id
+                      JOIN sessions AS session
+                        ON session.tenant_id=turn.tenant_id
+                       AND session.session_id=turn.session_id
+                     WHERE execution.tenant_id=$1
+                       AND execution.status IN ('ambiguous','unknown')
+                       AND (
+                           execution.reconciliation_lease_expires_at IS NULL
+                           OR execution.reconciliation_lease_expires_at <= clock_timestamp()
+                       )
+                     ORDER BY execution.started_at,execution.execution_key
+                     FOR UPDATE OF execution SKIP LOCKED
+                     LIMIT $2
+                ), claimed AS (
+                    UPDATE tool_executions AS execution
+                       SET reconciliation_owner=$3,
+                           reconciliation_epoch=execution.reconciliation_epoch+1,
+                           reconciliation_lease_expires_at=(
+                               clock_timestamp() + ($4::double precision * interval '1 second')
+                           )
+                      FROM candidates
+                     WHERE execution.tenant_id=candidates.tenant_id
+                       AND execution.execution_key=candidates.execution_key
+                     RETURNING execution.tenant_id,execution.execution_key,
+                               execution.turn_id,execution.tool_name,
+                               execution.arguments_hash,execution.status,
+                               execution.attempt,execution.reconciliation_owner,
+                               execution.reconciliation_epoch,
+                               execution.reconciliation_lease_expires_at,
+                               execution.started_at,execution.lease_owner,
+                               execution.lease_epoch,execution.error_type,
+                               execution.completed_at
+                )
+                SELECT claimed.tenant_id,claimed.execution_key,
+                       claimed.turn_id,claimed.tool_name,
+                       claimed.arguments_hash,claimed.status,
+                       claimed.attempt,claimed.reconciliation_owner,
+                       claimed.reconciliation_epoch,
+                       claimed.reconciliation_lease_expires_at,
+                       claimed.started_at,claimed.lease_owner,
+                       claimed.lease_epoch,claimed.error_type,
+                       claimed.completed_at,turn.session_id,session.app_id
+                  FROM claimed
+                  JOIN session_turns AS turn
+                    ON turn.tenant_id=claimed.tenant_id
+                   AND turn.turn_id=claimed.turn_id
+                  JOIN sessions AS session
+                    ON session.tenant_id=turn.tenant_id
+                   AND session.session_id=turn.session_id
+                """,
+                tenant_id,
+                limit,
+                owner_id,
+                float(lease_seconds),
+            )
+        return [_claim_from_row(row) for row in rows]
+
+    async def list_reconciliation_evidence(
+        self,
+        *,
+        tenant_id: str,
+        execution_key: str,
+        attempt: int | None = None,
+    ) -> list[ReconciliationEvidence]:
+        """Read immutable probe evidence for audit and recovery tooling."""
+
+        if attempt is not None and (
+            isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1
+        ):
+            raise ValueError("reconciliation attempt must be a positive integer")
+        async with self._transaction(tenant_id) as connection:
+            rows = await connection.fetch(
+                """
+                SELECT execution_key,attempt,outcome,evidence_summary,
+                       evidence_digest,trace_id,reconciler_id,observed_at,tenant_id
+                  FROM tool_execution_reconciliations
+                 WHERE tenant_id=$1 AND execution_key=$2
+                   AND ($3::integer IS NULL OR attempt=$3)
+                 ORDER BY attempt,observed_at,reconciliation_id
+                """,
+                tenant_id,
+                execution_key,
+                attempt,
+            )
+        return [_evidence_from_row(row) for row in rows]
+
+    async def reconcile(
+        self,
+        execution_key: str,
+        *,
+        tenant_id: str,
+        expected_attempt: int,
+        evidence: ReconciliationEvidence,
+        claim_owner: str | None = None,
+        claim_epoch: int | None = None,
+    ) -> ExecutionRecord:
+        """Append probe evidence and CAS its outcome into ``tool_executions``."""
+
+        validate_reconciliation_evidence(
+            evidence,
+            execution_key=execution_key,
+            tenant_id=tenant_id,
+            expected_attempt=expected_attempt,
+        )
+        if claim_owner is not None or claim_epoch is not None:
+            _validate_reconciliation_owner(claim_owner)
+            if isinstance(claim_epoch, bool) or not isinstance(claim_epoch, int) or claim_epoch < 1:
+                raise ReconciliationConflict("reconciliation claim epoch is invalid")
+        async with self._transaction(tenant_id) as connection:
+            current = await connection.fetchrow(
+                """
+                SELECT execution_key,status,attempt,reconciliation_owner,
+                       reconciliation_epoch,reconciliation_lease_expires_at
+                  FROM tool_executions
+                 WHERE tenant_id=$1 AND execution_key=$2
+                 FOR UPDATE
+                """,
+                tenant_id,
+                execution_key,
+            )
+            if current is None:
+                raise ReconciliationConflict("tool execution was not claimed")
+            current_attempt = _row_int(current, "attempt", 1)
+            if current_attempt != expected_attempt:
+                raise ReconciliationConflict("reconciliation attempt is stale")
+            status = _execution_status(_row_value(current, "status"))
+            if status not in {
+                ExecutionStatus.AMBIGUOUS,
+                ExecutionStatus.UNKNOWN,
+                ExecutionStatus.SUCCEEDED,
+                ExecutionStatus.FAILED,
+            }:
+                raise ReconciliationConflict(
+                    "only ambiguous or unknown executions may be reconciled"
+                )
+            if claim_owner is not None or claim_epoch is not None:
+                if (
+                    _row_value(current, "reconciliation_owner") != claim_owner
+                    or _row_int(current, "reconciliation_epoch", 0) != claim_epoch
+                    or not _lease_is_valid(current)
+                ):
+                    raise ReconciliationConflict("reconciliation claim is stale")
+
+            target_status = reconciliation_status(evidence.outcome)
+            previous = await connection.fetchrow(
+                """
+                SELECT outcome
+                  FROM tool_execution_reconciliations
+                 WHERE tenant_id=$1 AND execution_key=$2 AND attempt=$3
+                   AND outcome IN ('applied','not_applied')
+                 ORDER BY observed_at DESC,reconciliation_id DESC
+                 LIMIT 1
+                """,
+                tenant_id,
+                execution_key,
+                expected_attempt,
+            )
+            previous_outcome = _row_value(previous, "outcome") if previous else None
+            if previous_outcome is not None:
+                previous_status = reconciliation_status(
+                    ReconciliationOutcome.parse(str(previous_outcome))
+                )
+                if previous_status != target_status:
+                    raise ReconciliationConflict("reconciliation evidence conflicts")
+            if status in {ExecutionStatus.SUCCEEDED, ExecutionStatus.FAILED}:
+                if status != target_status:
+                    raise ReconciliationConflict(
+                        "reconciliation evidence conflicts with final execution state"
+                    )
+
+            inserted = await connection.fetchval(
+                """
+                INSERT INTO tool_execution_reconciliations (
+                    tenant_id,execution_key,attempt,outcome,evidence_digest,
+                    evidence_summary,trace_id,reconciler_id,observed_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                ON CONFLICT (tenant_id,execution_key,attempt,evidence_digest)
+                DO NOTHING
+                RETURNING reconciliation_id
+                """,
+                tenant_id,
+                execution_key,
+                expected_attempt,
+                evidence.outcome.value,
+                evidence.evidence_digest,
+                evidence.evidence_summary,
+                evidence.trace_id,
+                evidence.reconciler_id,
+                evidence.observed_at,
+            )
+            if inserted is None:
+                duplicate = await connection.fetchrow(
+                    """
+                    SELECT outcome
+                      FROM tool_execution_reconciliations
+                     WHERE tenant_id=$1 AND execution_key=$2
+                       AND attempt=$3 AND evidence_digest=$4
+                    """,
+                    tenant_id,
+                    execution_key,
+                    expected_attempt,
+                    evidence.evidence_digest,
+                )
+                if duplicate is None:
+                    raise ReconciliationConflict("reconciliation evidence was changed concurrently")
+                if str(_row_value(duplicate, "outcome")) != evidence.outcome.value:
+                    raise ReconciliationConflict("reconciliation evidence conflicts")
+                return ExecutionRecord(
+                    execution_key,
+                    status,
+                    attempt=current_attempt,
+                )
+
+            updated = await connection.fetchrow(
+                """
+                UPDATE tool_executions
+                   SET status=$4,
+                       reconciliation_outcome=$5,
+                       reconciliation_evidence_digest=$6,
+                       reconciled_at=$7,
+                       reconciliation_owner=NULL,
+                       reconciliation_lease_expires_at=NULL,
+                       completed_at=CASE
+                           WHEN $4 IN ('succeeded','failed') THEN $7
+                           ELSE completed_at
+                       END
+                 WHERE tenant_id=$1 AND execution_key=$2
+                   AND attempt=$3
+                   AND status IN ('ambiguous','unknown')
+                   AND (
+                       $8::text IS NULL
+                       OR (
+                           reconciliation_owner=$8
+                           AND reconciliation_epoch=$9
+                           AND reconciliation_lease_expires_at > clock_timestamp()
+                       )
+                   )
+                 RETURNING execution_key,status,attempt
+                """,
+                tenant_id,
+                execution_key,
+                expected_attempt,
+                target_status.value,
+                evidence.outcome.value,
+                evidence.evidence_digest,
+                evidence.observed_at,
+                claim_owner,
+                claim_epoch,
+            )
+            if updated is None:
+                # A terminal row may have been finalized by a concurrent
+                # completion only when it agrees with this evidence.
+                latest = await connection.fetchrow(
+                    """
+                    SELECT status,attempt
+                      FROM tool_executions
+                     WHERE tenant_id=$1 AND execution_key=$2
+                    """,
+                    tenant_id,
+                    execution_key,
+                )
+                latest_status = _execution_status(_row_value(latest, "status")) if latest else None
+                if latest_status == target_status:
+                    return ExecutionRecord(
+                        execution_key,
+                        latest_status,
+                        attempt=_row_int(latest, "attempt", expected_attempt),
+                    )
+                raise ReconciliationConflict("execution CAS fence was lost")
+            return ExecutionRecord(
+                execution_key,
+                target_status,
+                attempt=_row_int(updated, "attempt", expected_attempt),
+            )
+
+
+class ToolExecutionConflict(ExecutionReconciliationConflict):
     """A tool operation crossed the authoritative session fence."""
 
     def __init__(self, message: str, *, requires_confirmation: bool = False) -> None:
@@ -494,6 +917,106 @@ def _execution_status(value: object) -> ExecutionStatus:
         return ExecutionStatus(str(value))
     except ValueError as exc:
         raise RuntimeError("tool execution has an invalid status") from exc
+
+
+def _row_value(row: object, key: str, default: object = None) -> object:
+    """Read a field from asyncpg.Record or the dict rows used by tests."""
+
+    if row is None:
+        return default
+    if isinstance(row, Mapping):
+        return row.get(key, default)
+    try:
+        return row[key]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+def _row_int(row: object, key: str, default: int) -> int:
+    value = _row_value(row, key, default)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, str, bytes)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _lease_is_valid(row: object) -> bool:
+    value = _row_value(row, "reconciliation_lease_expires_at")
+    return isinstance(value, datetime) and value > datetime.now(UTC)
+
+
+def _probe_intent_from_row(row: object) -> ExecutionProbeIntent:
+    return ExecutionProbeIntent(
+        tenant_id=str(_row_value(row, "tenant_id", "")),
+        execution_key=str(_row_value(row, "execution_key", "")),
+        turn_id=str(_row_value(row, "turn_id", "")),
+        tool_name=str(_row_value(row, "tool_name", "")),
+        arguments_hash=str(_row_value(row, "arguments_hash", "")),
+        app_id=str(_row_value(row, "app_id", "")),
+        session_id=str(_row_value(row, "session_id", "")),
+        trace_id=(
+            str(_row_value(row, "trace_id")) if _row_value(row, "trace_id") is not None else None
+        ),
+        attempt=_row_int(row, "attempt", 1),
+    )
+
+
+def _claim_from_row(row: object) -> ExecutionReconciliationClaim:
+    expires = _row_value(row, "reconciliation_lease_expires_at")
+    if not isinstance(expires, datetime):
+        raise RuntimeError("reconciliation claim has no lease expiry")
+    owner = _row_value(row, "reconciliation_owner")
+    if not isinstance(owner, str) or not owner:
+        raise RuntimeError("reconciliation claim has no owner")
+    return ExecutionReconciliationClaim(
+        intent=_probe_intent_from_row(row),
+        status=_execution_status(_row_value(row, "status")),
+        attempt=_row_int(row, "attempt", 1),
+        owner_id=owner,
+        claim_epoch=_row_int(row, "reconciliation_epoch", 0),
+        lease_expires_at=expires,
+    )
+
+
+def _evidence_from_row(row: object) -> ReconciliationEvidence:
+    observed = _row_value(row, "observed_at")
+    if not isinstance(observed, datetime):
+        raise RuntimeError("reconciliation evidence has no observed_at")
+    outcome = ReconciliationOutcome.parse(str(_row_value(row, "outcome")))
+    return ReconciliationEvidence(
+        str(_row_value(row, "execution_key")),
+        _row_int(row, "attempt", 1),
+        outcome,
+        evidence_summary=str(_row_value(row, "evidence_summary")),
+        trace_id=(
+            str(_row_value(row, "trace_id")) if _row_value(row, "trace_id") is not None else None
+        ),
+        observed_at=observed,
+        reconciler_id=str(_row_value(row, "reconciler_id")),
+        evidence_digest=str(_row_value(row, "evidence_digest")),
+        tenant_id=str(_row_value(row, "tenant_id")),
+    )
+
+
+def _validate_reconciliation_limit(limit: int) -> None:
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+        raise ValueError("reconciliation limit must be between 1 and 1000")
+
+
+def _validate_reconciliation_owner(owner_id: str | None) -> None:
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        raise ValueError("reconciliation owner_id is required")
+
+
+def _validate_reconciliation_lease(lease_seconds: float) -> None:
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float)):
+        raise ValueError("reconciliation lease must be positive")
+    if lease_seconds <= 0 or lease_seconds > 3600:
+        raise ValueError("reconciliation lease must be between 0 and 3600 seconds")
 
 
 class PostgresGovernanceAuditSink(_TenantStore):

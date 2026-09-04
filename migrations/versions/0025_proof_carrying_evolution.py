@@ -133,7 +133,10 @@ BEGIN
             'trpc_evolution_authority must not have SET ROLE membership'
             USING ERRCODE = '42501';
     END IF;
-    GRANT SELECT, INSERT, UPDATE ON cell_promotion_targets
+    GRANT SELECT, INSERT ON cell_promotion_targets
+        TO trpc_evolution_authority;
+    GRANT UPDATE (active_capsule_digest, control_version, updated_at)
+        ON cell_promotion_targets
         TO trpc_evolution_authority;
     GRANT SELECT, INSERT ON cell_promotion_uses
         TO trpc_evolution_authority;

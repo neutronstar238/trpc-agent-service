@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: trpc-cell-kind
+
+resources:
+  # Reuse the reviewed application topology without changing the production
+  # base.  All kind-only behavior is supplied by the files below.
+  - ../kustomize/base
+  - namespace.yaml
+  - kind-secrets.yaml
+  - kind-postgres.yaml
+  - kind-redis.yaml
+  - kind-fake-services.yaml
+  - kind-network-policy.yaml
+
+patches:
+  - path: kind-config-patch.yaml
+  - path: kind-replicas-patch.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: trpc-gateway
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: trpc-gateway
+                app.kubernetes.io/part-of: trpc-agent-service
+
+images:
+  # The gate replaces this value in its in-memory rendered document when
+  # --image is supplied.  A tag is kept here so `kubectl kustomize` works in a
+  # clean checkout without credentials or a local image.
+  - name: trpc-agent-service
+    newName: docker.io/example/trpc-agent-service
+    newTag: kind

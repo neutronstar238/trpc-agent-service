@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kind-postgres-init
+data:
+  00-roles.sql: |
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_migration') THEN
+        CREATE ROLE trpc_migration LOGIN PASSWORD 'kind-migration-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_runtime') THEN
+        CREATE ROLE trpc_runtime LOGIN PASSWORD 'kind-runtime-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_worker') THEN
+        CREATE ROLE trpc_worker LOGIN PASSWORD 'kind-worker-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_metrics') THEN
+        CREATE ROLE trpc_metrics LOGIN PASSWORD 'kind-metrics-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_hpa') THEN
+        CREATE ROLE trpc_hpa LOGIN PASSWORD 'kind-hpa-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_cell_reconciler') THEN
+        CREATE ROLE trpc_cell_reconciler LOGIN PASSWORD 'kind-reconciler-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_evolution_authority') THEN
+        CREATE ROLE trpc_evolution_authority LOGIN PASSWORD 'kind-evolution-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_tool_reconciler') THEN
+        CREATE ROLE trpc_tool_reconciler LOGIN PASSWORD 'kind-tool-reconciler-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_scheduler') THEN
+        CREATE ROLE trpc_scheduler LOGIN PASSWORD 'kind-scheduler-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trpc_cell_executor') THEN
+        CREATE ROLE trpc_cell_executor LOGIN PASSWORD 'kind-cell-executor-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+      END IF;
+    END $$;
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    CREATE EXTENSION IF NOT EXISTS vector;
+    REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+    GRANT USAGE, CREATE ON SCHEMA public TO trpc_migration;
+    GRANT CONNECT ON DATABASE trpc_service TO trpc_migration, trpc_runtime, trpc_worker, trpc_metrics, trpc_hpa, trpc_cell_reconciler, trpc_evolution_authority, trpc_tool_reconciler, trpc_scheduler, trpc_cell_executor;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO trpc_runtime;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO trpc_worker;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: kind-postgres
+    trpc.io/support: database
+spec:
+  selector:
+    app.kubernetes.io/name: kind-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kind-postgres
+  labels:
+    app.kubernetes.io/name: kind-postgres
+    trpc.io/support: database
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kind-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kind-postgres
+        trpc.io/support: database
+    spec:
+      nodeSelector:
+        trpc.io/node-role: agent-worker
+        trpc.io/kind-pool: support
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: trpc-gateway
+                  app.kubernetes.io/part-of: trpc-agent-service
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: trpc_service
+            - name: POSTGRES_USER
+              value: trpc
+            - name: POSTGRES_PASSWORD
+              value: kind-bootstrap-password
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "trpc", "-d", "trpc_service"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "trpc", "-d", "trpc_service"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d/00-roles.sql
+              subPath: 00-roles.sql
+      volumes:
+        - name: init
+          configMap:
+            name: kind-postgres-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi

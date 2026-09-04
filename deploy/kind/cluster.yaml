@@ -1,0 +1,38 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+# Canonical 1-control-plane + 3-worker topology for the local ACK-shaped
+# acceptance environment.  It is only consumed by kind_ack_gate.py --execute.
+networking:
+  ipFamily: ipv4
+  kubeProxyMode: iptables
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "trpc.io/node-role=control-plane"
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "trpc.io/node-role=agent-worker,trpc.io/kind-pool=gateway"
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "trpc.io/node-role=agent-worker,trpc.io/kind-pool=gateway"
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "trpc.io/node-role=agent-worker,trpc.io/kind-pool=support"

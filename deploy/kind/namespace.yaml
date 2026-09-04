@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trpc-cell-kind
+  labels:
+    trpc.io/test-scope: local-k8s
+    trpc.io/managed-by: kind-ack-gate

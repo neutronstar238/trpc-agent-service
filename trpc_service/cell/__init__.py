@@ -39,6 +39,11 @@ from trpc_service.cell.evolution import (
     PromotionTarget,
     VerificationResult,
 )
+from trpc_service.cell.evolution_postgres import (
+    PostgresPromotionStore,
+    PromotionOutboxClaim,
+    PromotionOutboxConflict,
+)
 from trpc_service.cell.intents import (
     ConfirmationScope,
     IntentRisk,
@@ -93,9 +98,12 @@ __all__ = [
     "NodeSnapshot",
     "PlacementDecision",
     "PolicyDecision",
+    "PostgresPromotionStore",
     "ProjectionReplayer",
     "ProjectionResult",
     "PromotionApprovalAuthority",
+    "PromotionOutboxClaim",
+    "PromotionOutboxConflict",
     "PromotionReceipt",
     "PromotionStore",
     "PromotionTarget",

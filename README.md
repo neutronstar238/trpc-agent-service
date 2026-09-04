@@ -120,6 +120,7 @@ uv run python -m scripts.local_innovation_gate --require-core-demo \
   --output runs/multitenant/local-innovation-gate.json
 uv run python -m scripts.mock_production_gate
 kubectl kustomize deploy/kustomize/overlays/production >/dev/null
+kubectl kustomize deploy/kind >/dev/null
 ```
 
 本地覆盖率路径必须执行独立的 line/branch 门禁：`coverage.sh` 使用 `tests/unit` 生成
@@ -144,6 +145,41 @@ CI 已通过。真实 IM、真实多节点存储、故障注入、迁移、性�
 
 默认测试完全离线。真实 IM、性能、故障注入和部署门禁需要显式凭证或本地基础设施；没有完成
 这些门禁时只能称为“开发候选”，不能称为生产候选。
+
+创新版还提供一个与生产 base 解耦的本机多节点 Kubernetes 预验收环境：`deploy/kind` 由 1 个
+control-plane、3 个 worker、PostgreSQL、Redis、fake IM 和 fake provider 组成。
+`scripts/kind_ack_gate.py` 默认只执行 Kustomize 渲染、拓扑、镜像引用和安全对象检查，不会创建或连接任何集群；只有
+显式传入 `--execute` 才会操作精确的 `kind-<cluster-name>` context 和固定的
+`trpc-cell-kind` 隔离 namespace：
+
+```powershell
+# DockerHub/私有 registry 的不可变候选镜像（推荐）
+uv run python scripts/kind_ack_gate.py --execute `
+  --cluster-name trpc-cell-kind `
+  --image docker.io/<org>/trpc-agent-service@sha256:<64位digest> `
+  --output runs/multitenant/kind-ack-gate.json
+
+# 本地 Docker 镜像（显式加载到 kind 节点）
+uv run python scripts/kind_ack_gate.py --execute `
+  --image trpc-agent-service:dev --load-image
+```
+
+未传 `--execute` 时，报告中的 `preflight.status=pass` 只表示静态渲染通过；顶层 `gate` 与
+`local_k8s_gate` 均保持 `not_run`，进程故意返回非零，防止 CI 把静态预检误收为多节点运行通过。
+
+运行态 gate 会记录 git SHA、源码指纹、镜像 digest 和 Kubernetes cluster UID。候选镜像在集群内
+通过两副本 Gateway 验证加密签名 callback 与重复投递，通过真实 PostgreSQL/RLS 验证基线
+Session/Mailbox 幂等、`tool_executions` query-only 对账和演进证书/CAS/回滚，并通过生产
+`RedisStreamQueue` 验证发布去重、PEL、`XAUTOCLAIM` 接管和精确 ACK。Gateway 两副本与共享后端被强制
+分居节点，每个候选探针还必须报告实际跨节点路径；随后依次替换 Worker、fake provider 和 PostgreSQL
+Pod，核对副作用计数、同一 PVC UID、持久行哨兵、应用连接恢复及三个 Worker 节点的负载分布。各探针
+只注入所需 Secret，支持镜像使用 registry digest 固定。复用集群时会先删除并重建固定 migration
+Job，随后验证数据库 `alembic_version` 精确等于仓库唯一 head；Kind 专用 Gateway/Worker 滚动策略逐个
+释放被硬反亲和占用的节点，避免零不可用策略与固定节点数互锁。
+为验证 PostgreSQL Pod 替换后的持久性，运行态探针会保留使用随机租户 ID 的少量合成哨兵行；因此该
+namespace 仅用于可删除的本机验收，长期重复复用前应整体重建，不能把它当作零写入的共享开发库。
+`local_k8s_gate=pass` 不会升级为 `production_gate=pass`；ACK 的 Terway/ENI、RAM/RRSA、SLB、
+云盘/OSS、RDS/云 Redis、多可用区和云监控仍必须在真实 ACK 中单独验收。
 
 验收报告统一区分 `offline/development=pass` 与 `production=not_run`。未来合入 main 时，副作用
 对账应先以 `observe` 形式独立合入，Proof-Carrying Evolution 以控制面/离线工具独立合入；只有

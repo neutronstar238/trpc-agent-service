@@ -390,3 +390,90 @@ Kind wrapper 传入本地模式后，只在临时生成的 overlay 中将固定�
 HPA 保留 2--4，仅覆盖本地 HPA/驱逐机制验证，不冒充 200 turn 生产容量。生产 overlay 不会被修改。不要在生产 context
 上使用该安装参数；脚本会拒绝非 `kind-*` context。该 kind 验收仍不等价于托管 Kubernetes
 节点驱逐或真实生产容量验收。
+
+### 本机多节点 kind：ACK 行为预验收
+
+上面的 `kind_runtime_gate.py` 负责既有 Kubernetes 运行态/HPA 探针；创新版另提供
+`scripts/kind_ack_gate.py`，用于验证“基线 IM/Session 幂等 + Cell 对账 + 演进 CAS”在多 Pod
+和共享后端条件下的组合行为。两套 gate 都不会修改 `deploy/kustomize` base，创新 gate 专用清单
+全部位于 `deploy/kind`：
+
+```text
+kind control-plane × 1
+kind worker × 3
+├── trpc-gateway × 2 / trpc-worker × 3
+├── outbox/channel dispatcher、session recovery、admin
+├── PostgreSQL StatefulSet（基线迁移 Job 使用）
+├── Redis StatefulSet（SessionReady 共享队列）
+├── fake-im StatefulSet（可持久化的 IM 投递测试回执）
+└── fake-provider StatefulSet（响应丢失与 query-only 状态查询）
+```
+
+默认命令是纯本机静态验收：
+
+```powershell
+uv run python scripts/kind_ack_gate.py `
+  --output runs/multitenant/kind-ack-gate.json `
+  --render-output runs/multitenant/kind-ack-manifests.yaml
+```
+
+它只调用 `kubectl kustomize`，不会调用 `kind create`、`docker` 或任何 Kubernetes API。执行真实
+本机 kind 时必须显式加 `--execute`，context 必须精确匹配 `kind-<cluster-name>`，namespace 必须为
+专用的 `trpc-cell-kind`；集群已存在时只复用这个精确 context，不会删除或触碰其他 context：
+
+静态预检成功只写入 `preflight.status=pass`；顶层 `gate` 和 `local_k8s_gate` 保持 `not_run`，命令返回
+非零。这个行为是故意的，防止只检查退出码的 CI 把 Kustomize 渲染误当成真实多节点证据。只需要静态
+渲染成功时直接执行 `kubectl kustomize deploy/kind`。
+
+```powershell
+# DockerHub/registry digest；执行模式拒绝 tag-only 镜像
+uv run python scripts/kind_ack_gate.py --execute `
+  --cluster-name trpc-cell-kind `
+  --image docker.io/<org>/trpc-agent-service@sha256:<64位digest> `
+  --output runs/multitenant/kind-ack-gate.json
+
+# 本地镜像：先由 Docker inspect 取得 sha256 ID，再加载到 kind
+uv run python scripts/kind_ack_gate.py --execute `
+  --image trpc-agent-service:dev --load-image
+```
+
+`--execute` 的顺序是：按 `cluster.yaml` 创建或复用精确的 1+3 kind 集群→加载/拉取候选镜像→
+重新标注并校验两个 gateway 节点池和一个 support 节点池→删除固定名称的旧 migration Job→渲染并
+apply `deploy/kind`→先等待 StatefulSet，再执行迁移并校验 `alembic_version` 等于仓库唯一 head，最后
+逐个滚动重启并等待应用 Deployment→运行全部场景并集中报告失败。Gateway/Worker 在这个固定容量
+环境中使用 `maxSurge=0,maxUnavailable=1`，否则硬反亲和与零不可用滚动会互相等待；生产 base 不受影响。
+为了让 PostgreSQL 重启场景核验同一批持久哨兵，runtime probe 使用随机租户 ID 并保留少量 synthetic
+fixture；它不会覆盖既有租户，但重复运行会累积测试行。`trpc-cell-kind` 因而是一次性/可重建的隔离
+namespace，不应连接共享开发数据库，也不应把该 gate 描述为零写入测试。
+共执行 7 个 Gate 场景：
+
+1. 候选镜像向两副本真实 Gateway 并发发送 100 次相同的加密签名 Feishu callback，PostgreSQL 中
+   inbound/audit/mailbox/ready event 均只保留一份；非法签名被拒绝，同一外部 ID 在另一租户可独立接收；
+2. 同一个 runtime 场景由候选镜像直接运行基线 `TenantRuntime`：对 WeCom AI Bot envelope 再验证一次
+   100 并发、稳定 session 路由与跨租户隔离且不依赖 sticky session；随后令 fake provider 已提交
+   副作用后返回 504，使统一 `tool_executions` ledger 进入 ambiguous，再由专用 RLS authority 只做
+   GET 查询并 CAS 收敛。外部 POST 与 provider 增量都必须严格为 1，unknown 继续封锁；
+3. Evolution authority 在真实 PostgreSQL 上验证并发 CAS 只有一个 winner、证书/人工批准一次性消费、
+   outbox lease epoch 接管、签名 receipt 回滚、ABA/stale/跨租户拒绝，真实 provider 调用数必须为 0；
+4. 候选镜像直接复用生产 `RedisStreamQueue`，验证同一 outbox 只发布一次、consumer A 形成 PEL、租约
+   到期后 consumer B 通过 `XAUTOCLAIM` 接管、旧 owner 不能 defer、B 的 `XACK` 将 PEL 清零；
+5. 删除一个 Worker Pod 后由 Deployment 接管，替换前后 provider effect/call 计数不变；
+6. 替换 fake provider Pod 后 UID 必须变化，PVC 中 effect 与调用计数必须保留；
+7. 替换 PostgreSQL Pod 时，Pod UID 必须变化、PVC UID 必须完全相同、重启前后的持久 IM 行计数必须
+   相同；所有应用 Deployment 恢复后再通过 Gateway 完成一次真实 DB-backed callback。
+
+三个 Worker 必须实际分布在三个节点；两个 Gateway 必须硬分散到两个节点，PostgreSQL、Redis 和 fake
+provider 与 Gateway 分居。每个短命候选探针按其实际目标设置 required anti-affinity，并在删除前记录
+driver/目标 Pod 的 `nodeName`，同节点或节点证据缺失都 fail-closed。四类探针使用分离 Secret；演进
+authority、工具 reconciler 和 Redis 凭据不会注入无关探针。PostgreSQL、Redis 与 Python 支持镜像使用
+registry digest，而不是可变 tag。
+
+报告的 `lineage` 至少绑定 `git_sha`、`source_fingerprint` 和镜像 `digest`；执行模式额外绑定
+`cluster.uid`。缺少任何不可变镜像或 cluster UID 时，运行态不会被标记为 pass。fake IM/provider
+只用于确定性故障注入，不代表真实企业微信/飞书或供应商合约已经验证。
+
+本机 kind 与 ACK 的边界必须写进验收结论：kind 能覆盖 Pod/Service/DNS、Kubernetes lease/CAS、
+共享 PostgreSQL/Redis、滚动替换和网络故障注入；不能证明 ACK Terway/ENI、SLB/Ingress、RAM/RRSA、
+云盘 CSI、OSS、RDS/云 Redis 连接限制、多可用区调度、云带宽/SNAT 或 ACK 监控插件。因而报告固定
+区分 `offline/development=pass`、`local_k8s_gate=pass` 和 `production_gate=not_run`；只有 ACK
+真实凭证和基础设施验收产生明确证据后，才可以把后者改为 `pass`。

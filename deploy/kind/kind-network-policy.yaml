@@ -1,0 +1,166 @@
+# Kind-only connectivity.  The production base keeps an intentionally narrow
+# egress policy; these additions make the disposable fake IM/provider and the
+# in-cluster acceptance driver reachable without opening arbitrary internet
+# egress from the application pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-dns
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-support-ingress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: trpc.io/support
+        operator: In
+        values: [provider, im]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-driver-to-support
+spec:
+  podSelector:
+    matchLabels:
+      trpc.io/component: acceptance-driver
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: trpc.io/support
+                operator: In
+                values: [provider, im]
+      ports:
+        - port: 8080
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: trpc-gateway
+      ports:
+        - port: 8080
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kind-postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kind-redis
+      ports:
+        - port: 6379
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-app-to-support
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: trpc-agent-service
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: trpc.io/support
+                operator: In
+                values: [provider, im]
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-driver-to-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: trpc-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-app-to-datastores
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: trpc-agent-service
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kind-postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kind-redis
+      ports:
+        - port: 6379
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-datastore-ingress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: trpc.io/support
+        operator: In
+        values: [database, cache]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: trpc-agent-service
+        - podSelector:
+            matchLabels:
+              trpc.io/component: acceptance-driver
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP

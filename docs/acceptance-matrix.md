@@ -11,14 +11,14 @@
 | # | 题目验收要求 | 设计层证据 | 离线层证据 | 生产层证据/当前结论 |
 |---:|---|---|---|---|
 | 1 | 多租户、节点部署、同步、多后端、IM、治理监控、故障恢复 | `architecture.md`、`consistency.md`、`im-channels.md`、`operations.md`、`security.md`；总图明确 Gateway/Worker/Channel Adapter/Storage Adapter/Admin API/Telemetry Collector | 单元测试、`cell-demo`、Compose/Kustomize 静态渲染与模拟门禁 | 真实多节点、数据库、IM、故障和观测门禁；当前仓库证据为 `not_run` |
-| 2 | tenant、agent、binding、session、event、memory、summary、audit 关系 | `data-model.md` 的 ER 图与字段说明；`0001`—`0025` 迁移（当前唯一 head 为 `0025_proof_carrying_evolution`） | 迁移契约/RLS 单元测试、离线 schema 检查 | 真实 PostgreSQL/RLS/迁移门禁；当前为 `not_run` |
+| 2 | tenant、agent、binding、session、event、memory、summary、audit 关系 | `data-model.md` 的 ER 图与字段说明；`0001`—`0028` 迁移（当前唯一 head 为 `0028_evolution_least_privilege`） | 迁移契约/RLS 单元测试、离线 schema 检查 | 本机 kind 可执行真实 PostgreSQL/RLS/迁移预验收；ACK/生产仍为 `not_run` |
 | 3 | 至少两类 IM，且含微信/企业微信 | `im-channels.md` 对比企业微信 AI Bot WebSocket 与飞书加密 HTTP callback | `channels/wecom.py`、`channels/feishu.py` 及 Fake/协议测试 | 真实账号、回调、发送、重试和限流证据；当前为 `not_run` |
 | 4 | 至少三类后端及同步策略 | `consistency.md`、`migration.md`：PostgreSQL、Redis、pgvector/外部向量、S3/MinIO、外部 Memory | 适配器契约、迁移状态机和模拟测试 | 真实 PG/Redis/S3/向量迁移与恢复报告；当前为 `not_run` |
 | 5 | 完整消息链与 trace/request 贯穿 | `architecture.md`、`agent-cell-fabric.md` 时序图和 ID 语义 | 离线事件链、`cell-demo`、`SessionReady v2` W3C `trace_headers` 编解码/提取及 fake `queue.consume` span 契约测试 | 真实 OTel 父子 span 串联 IM→Runner→Tool→存储→回复；当前为 `not_run` |
 | 6 | 至少八项生产风险 | `risks.md` 统一列出 32 项，包含 Cell/Capsule/Replay/Effect 风险 | 风险对应的负向/模拟门禁 | 真实故障注入、供应链、安全和恢复证据；当前为 `not_run` |
 | 7 | 明确 SDK 复用与平台新增边界 | `agent-cell-fabric.md` §9.1、`requirements.md` | SDK 兼容契约、锁文件与离线测试 | 发布候选仍需锁定 SDK、镜像和外部门禁；当前为 `not_run` |
-| 8 | 不明确副作用的查询与对账 | `agent-cell-fabric.md` §7.1：三态结果、attempt CAS、不可变脱敏证据 | InMemory 对账协调器、重复/并发、stale attempt、冲突证据和跨租户拒绝测试；`cell-demo` 展示供应商执行次数为一次 | 真实供应商状态查询、PG/RLS authority 角色和恢复报告；当前为 `production=not_run` |
-| 9 | 可证明的候选演进与安全发布 | `agent-cell-fabric.md` §8.3：状态机、Judge、证书绑定、approval/CAS/outbox/rollback | `cell-evolve-demo`、双重 replay、零真实副作用、稳定 Merkle root、篡改/过期/跨租户/stale CAS 拒绝；`local_innovation_gate` 编排报告 | 真实模型/工具/KMS、多节点控制面和发布恢复；当前为 `production=not_run` |
+| 8 | 不明确副作用的查询与对账 | `agent-cell-fabric.md` §7.1：三态结果、attempt CAS、不可变脱敏证据 | InMemory 对账协调器、重复/并发、stale attempt、冲突证据和跨租户拒绝测试；`cell-demo` 展示供应商执行次数为一次；kind 可执行真实 PG authority/CAS 与假供应商 response-loss 查询 | 真实供应商状态查询和 ACK 恢复报告；当前为 `production=not_run` |
+| 9 | 可证明的候选演进与安全发布 | `agent-cell-fabric.md` §8.3：状态机、Judge、证书绑定、approval/CAS/outbox/rollback | `cell-evolve-demo`、双重 replay、零真实副作用、稳定 Merkle root、篡改/过期/跨租户/stale CAS 拒绝；kind 可执行真实 PG pointer/one-time use/outbox/rollback | 真实模型/工具/KMS、ACK 控制面和生产发布恢复；当前为 `production=not_run` |
 
 ## 当前状态的判定规则
 
@@ -43,8 +43,8 @@ fingerprint、每项 case result、拒绝原因和 `offline/development`、`prod
 | 事件日志可验证回放 | payload、顺序或 hash 被修改后仍通过 | hash-chain、branch、determinism、PG branch-head CAS/namespace adapter 契约 | PostgreSQL adapter 已实现，但真实多节点写入与投影重建报告 `not_run` |
 | 工具副作用受 effect key 保护 | 相同 key 造成两次外部调用 | 原生 Cell Effect ledger 并发测试；默认 Worker 将 legacy fenced execution key 投影到 Cell 事件 | 原生 Cell executor 尚未替换默认 ToolExecutor；真实非幂等供应商 ambiguous 对账 `not_run` |
 | 反事实分支不污染生产 | candidate branch 提交真实 effect 或改变 main | branch namespace、simulate-only、主分支指纹测试 | 生产还需 Judge、灰度批准和发布回滚证据 |
-| ambiguous 结果可安全收敛 | 对账器重复调用副作用接口、接受 stale/冲突/跨租户证据，或 unknown 触发自动重试 | `applied`/`not_applied`/`unknown` 映射、证据摘要和 ledger CAS 负向测试 | 真实供应商 query-only API、网络超时和 authority 角色 `not_run` |
-| 演进证书能携带证明 | replay 不确定、样本缺失、高危安全、无严格改善或证书可越权发布 | 双重 reducer hash、零 provider call、Judge 硬门禁/Pareto、canonical Ed25519 certificate、Promotion receipt | 真实模型质量、KMS 信任根和跨节点 outbox 恢复 `not_run` |
+| ambiguous 结果可安全收敛 | 对账器重复调用副作用接口、接受 stale/冲突/跨租户证据，或 unknown 触发自动重试 | `applied`/`not_applied`/`unknown` 映射、证据摘要和 ledger CAS 负向测试；kind probe 使用真实 PG 与假供应商只读查询 | 真实供应商 query-only API 与 ACK 网络故障 `not_run` |
+| 演进证书能携带证明 | replay 不确定、样本缺失、高危安全、无严格改善或证书可越权发布 | 双重 reducer hash、零 provider call、Judge 硬门禁/Pareto、canonical Ed25519 certificate、Promotion receipt；kind probe 使用真实 PG authority/CAS/outbox | 真实模型质量、KMS 信任根和 ACK 跨节点恢复 `not_run` |
 
 ## 建议评审命令
 
