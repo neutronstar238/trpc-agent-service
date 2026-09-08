@@ -221,6 +221,24 @@ async def test_duplicate_evidence_is_idempotent_but_conflicting_evidence_is_reje
     )
     assert first == duplicate
 
+    matching_but_distinct = ReconciliationEvidence(
+        intent.execution_key,
+        1,
+        ReconciliationOutcome.APPLIED,
+        evidence_summary="provider_status_applied_second_probe",
+        observed_at=observed,
+        tenant_id=intent.tenant_id,
+    )
+    history_size = len(ledger._reconciliation_evidence[intent.execution_key])
+    terminal = await ledger.reconcile(
+        intent.execution_key,
+        tenant_id=intent.tenant_id,
+        expected_attempt=1,
+        evidence=matching_but_distinct,
+    )
+    assert terminal == first
+    assert len(ledger._reconciliation_evidence[intent.execution_key]) == history_size
+
     conflict = ReconciliationEvidence(
         intent.execution_key,
         1,
@@ -379,9 +397,13 @@ async def test_postgres_reconcile_uses_same_execution_row_and_fenced_cas() -> No
     assert any(
         "ON CONFLICT (tenant_id,execution_key,attempt,evidence_digest)" in query for query in sql
     )
-    cas = [query for query in sql if "UPDATE tool_executions" in query]
-    assert cas and "status IN ('ambiguous','unknown')" in cas[0]
-    assert "reconciliation_owner=$8" in cas[0]
+    lock = [query for query in sql if "lock_tool_execution_reconciliation" in query]
+    assert lock
+    assert "FOR UPDATE" not in lock[0]
+    cas = [query for query in sql if "reconcile_tool_execution_cas" in query]
+    assert cas
+    assert "UPDATE tool_executions" not in cas[0]
+    assert "SELECT execution_key,status,attempt" in cas[0]
 
 
 @pytest.mark.asyncio
@@ -413,9 +435,21 @@ async def test_postgres_claim_query_is_tenant_scoped_and_skip_locked() -> None:
     assert len(claims) == 1
     assert claims[0].intent.tenant_id == "tenant-a"
     query = connection.calls[1][0]
-    assert "FOR UPDATE OF execution SKIP LOCKED" in query
-    assert "execution.tenant_id=$1" in query
-    assert "reconciliation_epoch=execution.reconciliation_epoch+1" in query
+    assert "public.claim_tool_execution_ambiguous" in query
+    assert connection.calls[1][1] == ("tenant-a", 100, "reconciler-a", 30.0)
+
+    migration = (
+        Path(__file__).parents[2]
+        / "migrations"
+        / "versions"
+        / "0029_reconciliation_security_hardening.py"
+    ).read_text(encoding="utf-8")
+    claim_fn = migration.split(
+        "CREATE OR REPLACE FUNCTION public.claim_tool_execution_ambiguous", 1
+    )[1].split("ALTER FUNCTION public.claim_tool_execution_ambiguous", 1)[0]
+    assert "execution.tenant_id = p_tenant_id" in claim_fn
+    assert "FOR UPDATE OF execution SKIP LOCKED" in claim_fn
+    assert "reconciliation_epoch = execution.reconciliation_epoch + 1" in claim_fn
 
 
 @pytest.mark.asyncio

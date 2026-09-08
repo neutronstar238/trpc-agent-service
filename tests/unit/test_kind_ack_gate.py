@@ -28,6 +28,23 @@ def _runtime_probe_payload(source: str = "b" * 64) -> dict[str, Any]:
         "cross_tenant_evidence_rejected": {"status": "pass"},
         "claim_cas_rejected": {"status": "pass"},
     }
+    cell_reconciliation_checks = {
+        "applied_to_succeeded": {
+            "status": "pass",
+            "executor_status": "ambiguous",
+            "reconciled_status": "succeeded",
+            "evidence_rows": 1,
+            "provider_execution_delta": 1,
+        },
+        "unknown_blocks_replay": {
+            "status": "pass",
+            "reconciled_status": "unknown",
+            "automatic_replay": False,
+            "evidence_rows": 1,
+        },
+        "stale_attempt_rejected": {"status": "pass"},
+        "cross_tenant_rejected": {"status": "pass"},
+    }
     return {
         "schema_version": 1,
         "probe": "kind_runtime_probe",
@@ -38,6 +55,11 @@ def _runtime_probe_payload(source: str = "b" * 64) -> dict[str, Any]:
         "status": "pass",
         "checks": {
             "tool_reconciliation": {"status": "pass", "checks": reconciliation_checks},
+            "cell_effect_reconciliation": {
+                "status": "pass",
+                "checks": cell_reconciliation_checks,
+                "rejection_reasons": [],
+            },
             "im_idempotency": {
                 "status": "pass",
                 "duplicate_callbacks": 100,
@@ -54,6 +76,8 @@ def _runtime_probe_payload(source: str = "b" * 64) -> dict[str, Any]:
         },
         "provider_execute_calls": 1,
         "provider_status_queries": 1,
+        "cell_provider_execute_calls": 1,
+        "cell_provider_status_queries": 1,
         "rejection_reasons": [],
         "token": "x",
     }
@@ -93,6 +117,12 @@ def _im_probe_payload(source: str = "b" * 64) -> dict[str, Any]:
 
 def _evolution_probe_payload(source: str = "b" * 64) -> dict[str, Any]:
     cases = [
+        {
+            "name": "network_egress_denial",
+            "passed": True,
+            "provider_egress_denied": True,
+            "im_egress_denied": True,
+        },
         {"name": "database_identity_and_schema", "passed": True},
         {
             "name": "concurrent_cas",
@@ -191,6 +221,7 @@ def _placement_payload(pod_name: str, script: str, *, cross_node: bool = True) -
                 "labels": {"app.kubernetes.io/name": "kind-acceptance-driver"},
             },
             "spec": {"nodeName": driver_node},
+            "status": {"phase": "Succeeded"},
         }
     ]
     for workload in gate._PROBE_REMOTE_WORKLOADS[script]:
@@ -201,6 +232,10 @@ def _placement_payload(pod_name: str, script: str, *, cross_node: bool = True) -
                     "labels": {"app.kubernetes.io/name": workload},
                 },
                 "spec": {"nodeName": remote_node},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
             }
         )
     return json.dumps({"items": items})
@@ -236,6 +271,18 @@ def test_image_identity_extracts_registry_digest_without_credentials() -> None:
         "shape_valid": True,
     }
     assert "password" not in repr(value).lower()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "containerd://sha256:" + "a" * 64,
+        "docker://sha256:" + "a" * 64,
+        "docker-pullable://docker.io/acme/app@sha256:" + "a" * 64,
+    ],
+)
+def test_runtime_image_id_accepts_kind_container_runtime_prefixes(value: str) -> None:
+    assert gate._normalise_runtime_image_id(value) == "sha256:" + "a" * 64
 
 
 def test_execute_requires_immutable_or_explicit_local_load() -> None:
@@ -304,6 +351,11 @@ def test_load_image_requires_matching_source_fingerprint_before_kind_load(
         "_run",
         fake_run,
     )
+    monkeypatch.setattr(
+        gate,
+        "_kind_loaded_image_identity",
+        lambda *_args, **_kwargs: (digest, None),
+    )
 
     status, observed_digest, reason = gate._load_local_image("kind-test", "candidate:tag")
 
@@ -311,6 +363,41 @@ def test_load_image_requires_matching_source_fingerprint_before_kind_load(
     assert observed_digest == digest
     assert reason is None
     assert invoked == [["kind", "load", "docker-image", "candidate:tag", "--name", "kind-test"]]
+
+
+def test_kind_loaded_image_identity_binds_all_containerd_nodes_to_digest_and_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    fingerprint = "b" * 64
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> gate.CommandResult:
+        calls.append(argv)
+        if argv[:4] == ["kind", "get", "nodes", "--name"]:
+            return gate.CommandResult("pass", stdout="kind-test-control-plane\nkind-test-worker\n")
+        return gate.CommandResult(
+            "pass",
+            stdout=json.dumps(
+                {
+                    "status": {"repoDigests": [f"candidate:tag@{digest}"]},
+                    "info": {
+                        "imageSpec": {
+                            "config": {"Labels": {gate.IMAGE_SOURCE_FINGERPRINT_LABEL: fingerprint}}
+                        }
+                    },
+                }
+            ),
+        )
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+
+    observed, reason = gate._kind_loaded_image_identity("kind-test", "candidate:tag", fingerprint)
+
+    assert observed == digest
+    assert reason is None
+    assert len(calls) == 3
+    assert all(call[:2] == ["docker", "exec"] for call in calls[1:])
 
 
 def test_topology_contract_requires_one_control_plane_and_three_workers() -> None:
@@ -355,35 +442,21 @@ def _kind_node(name: str, role: str, pool: str | None = None) -> dict[str, Any]:
     return {"metadata": {"name": name, "labels": labels}}
 
 
-def test_kind_node_pool_contract_labels_sorted_workers_with_explicit_overwrite(
+def test_kind_node_pool_contract_verifies_declared_pools_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     nodes = {
         "items": [
             _kind_node("kind-demo-control-plane", "control-plane"),
             _kind_node("worker-z", "agent-worker", "support"),
-            _kind_node("worker-a", "agent-worker", "legacy"),
-            _kind_node("worker-m", "agent-worker"),
+            _kind_node("worker-a", "agent-worker", "gateway"),
+            _kind_node("worker-m", "agent-worker", "gateway"),
         ]
     }
-    label_calls: list[list[str]] = []
 
     def fake_kubectl(_context: str, arguments: list[str], **_kwargs: object) -> gate.CommandResult:
-        if arguments == ["get", "nodes", "-o", "json"]:
-            return gate.CommandResult("pass", stdout=json.dumps(nodes))
-        assert arguments[:2] == ["label", "node"]
-        assert arguments[-1] == "--overwrite"
-        node_name = arguments[2]
-        label_key, pool = arguments[3].split("=", 1)
-        assert label_key == gate.KIND_POOL_LABEL
-        label_calls.append(arguments.copy())
-        for item in nodes["items"]:
-            if item["metadata"]["name"] == node_name:
-                item["metadata"]["labels"][label_key] = pool
-                break
-        else:
-            raise AssertionError(f"unknown node {node_name}")
-        return gate.CommandResult("pass")
+        assert arguments == ["get", "nodes", "-o", "json"]
+        return gate.CommandResult("pass", stdout=json.dumps(nodes))
 
     monkeypatch.setattr(gate, "_kubectl", fake_kubectl)
 
@@ -397,11 +470,34 @@ def test_kind_node_pool_contract_labels_sorted_workers_with_explicit_overwrite(
         "worker-m": "gateway",
         "worker-z": "support",
     }
-    assert label_calls == [
-        ["label", "node", "worker-a", "trpc.io/kind-pool=gateway", "--overwrite"],
-        ["label", "node", "worker-m", "trpc.io/kind-pool=gateway", "--overwrite"],
-        ["label", "node", "worker-z", "trpc.io/kind-pool=support", "--overwrite"],
-    ]
+    assert evidence["mutation_attempted"] is False
+
+
+def test_kind_node_pool_contract_rejects_drift_without_repairing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nodes = {
+        "items": [
+            _kind_node("kind-demo-control-plane", "control-plane"),
+            _kind_node("worker-a", "agent-worker", "legacy"),
+            _kind_node("worker-m", "agent-worker", "gateway"),
+            _kind_node("worker-z", "agent-worker", "support"),
+        ]
+    }
+    calls: list[list[str]] = []
+
+    def fake_kubectl(_context: str, arguments: list[str], **_kwargs: object) -> gate.CommandResult:
+        calls.append(arguments)
+        return gate.CommandResult("pass", stdout=json.dumps(nodes))
+
+    monkeypatch.setattr(gate, "_kubectl", fake_kubectl)
+
+    status, evidence, reason = gate._kind_node_pool_contract("kind-demo", "demo", execute=True)
+
+    assert status == "fail"
+    assert reason is not None and "refusing to repair" in reason
+    assert evidence["mutation_attempted"] is False
+    assert calls == [["get", "nodes", "-o", "json"]]
 
 
 @pytest.mark.parametrize(
@@ -541,6 +637,68 @@ def test_manifest_inventory_requires_app_and_support_objects() -> None:
     assert "StatefulSet/kind-postgres" in inventory["missing_objects"]
 
 
+def _secure_pod_spec(image: str = "candidate:local") -> dict[str, Any]:
+    return {
+        "automountServiceAccountToken": False,
+        "securityContext": {
+            "runAsNonRoot": True,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "containers": [
+            {
+                "name": "candidate",
+                "image": image,
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+            }
+        ],
+    }
+
+
+def test_manifest_inventory_rejects_missing_candidate_security_controls() -> None:
+    document = {
+        "kind": "Deployment",
+        "metadata": {"name": "trpc-worker"},
+        "spec": {
+            "replicas": 3,
+            "template": {"spec": {"containers": [{"name": "worker"}]}},
+        },
+    }
+
+    inventory = gate._manifest_inventory([document])
+
+    assert any(value.endswith(":serviceAccountToken") for value in inventory["insecure_objects"])
+    assert any(value.endswith(":readOnlyRootFilesystem") for value in inventory["insecure_objects"])
+
+
+def test_evolution_driver_network_policy_allows_postgres_but_not_provider() -> None:
+    documents = gate._load_yaml_documents(
+        (gate.KIND_DIR / "kind-network-policy.yaml").read_text(encoding="utf-8")
+    )
+    policies = {
+        document["metadata"]["name"]: document
+        for document in documents
+        if document.get("kind") == "NetworkPolicy"
+    }
+    evolution = policies["kind-allow-evolution-driver-to-postgres"]["spec"]
+    assert evolution["podSelector"]["matchLabels"]["trpc.io/probe"] == "kind_evolution_probe"
+    assert evolution["egress"] == [
+        {
+            "to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "kind-postgres"}}}],
+            "ports": [{"port": 5432, "protocol": "TCP"}],
+        }
+    ]
+    general = policies["kind-allow-driver-to-support"]["spec"]["podSelector"]["matchExpressions"]
+    assert {
+        "key": "trpc.io/probe",
+        "operator": "NotIn",
+        "values": ["kind_evolution_probe"],
+    } in general
+
+
 def test_runtime_readiness_checks_run_as_one_concurrent_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -638,6 +796,8 @@ def test_candidate_probe_manifest_is_keyless_and_hardened() -> None:
                 "trpc-service-secrets",
                 "trpc-worker-secrets",
                 "trpc-tool-reconciler-secrets",
+                "trpc-cell-executor-secrets",
+                "trpc-cell-reconciler-secrets",
             },
             {"kind-postgres", "kind-fake-provider"},
         ),
@@ -675,6 +835,27 @@ def test_candidate_probe_manifest_uses_least_privilege_and_cross_node_affinity(
     assert secret_names == expected_secrets
     assert selected == remote_workloads
     assert manifest["spec"]["nodeSelector"] == {"trpc.io/node-role": "agent-worker"}
+
+
+def test_runtime_probe_manifest_uses_worker_role_for_cell_fixtures() -> None:
+    manifest = gate._candidate_probe_manifest(
+        pod_name="kind-gate-runtime-0123456789",
+        namespace="trpc-cell-kind",
+        image="candidate:local",
+        script="scripts/kind_runtime_probe.py",
+        script_args=("all", "--json"),
+    )
+    env = {item["name"]: item for item in manifest["spec"]["containers"][0]["env"]}
+
+    assert env["TRPC_KIND_PROBE_FIXTURE_DSN"] == {
+        "name": "TRPC_KIND_PROBE_FIXTURE_DSN",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": "trpc-worker-secrets",
+                "key": "TRPC_SERVICE_WORKER_DATABASE_DSN",
+            }
+        },
+    }
 
 
 def test_failed_candidate_probe_returns_without_waiting_for_success_timeout(
@@ -746,7 +927,8 @@ def test_candidate_probe_collects_last_json_line_and_cleans_exact_pod(
     assert reason is None
     assert evidence["pod_cleanup"]["status"] is True
     assert evidence["probe"]["status"] == "pass"
-    assert evidence["probe"]["token"] == "<redacted>"
+    assert "token" not in evidence["probe"]
+    assert evidence["probe"]["unknown_fields_discarded"] is True
     assert evidence["probe_contract"] == {"status": "pass", "reason": None}
     delete_calls = [call for call in calls if "delete" in call]
     assert len(delete_calls) == 1
@@ -809,7 +991,7 @@ def test_failed_candidate_probe_collects_redacted_log_and_placement_before_clean
     assert reason == "candidate probe Pod did not complete successfully"
     assert evidence["placement"]["status"] == "pass"
     assert evidence["probe"]["status"] == "pass"
-    assert evidence["probe"]["token"] == "<redacted>"
+    assert "token" not in evidence["probe"]
     assert "super-secret" not in json.dumps(evidence)
     placement_index = next(
         index for index, call in enumerate(calls) if call[2:4] == ["get", "pods"]
@@ -885,7 +1067,9 @@ def test_candidate_probe_rejects_status_only_payload_for_every_script(
 
     assert status == "fail"
     assert reason is not None and "result contract failed" in reason
-    assert evidence["probe"] == {"status": "pass"}
+    assert evidence["probe"]["status"] == "pass"
+    assert evidence["probe"]["probe"] == "<invalid>"
+    assert evidence["probe"]["unknown_fields_discarded"] is True
     assert evidence["probe_contract"]["status"] == "fail"
     assert evidence["pod_cleanup"]["status"] is True
 
@@ -921,6 +1105,62 @@ def test_candidate_probe_contract_accepts_complete_script_specific_payloads(
     )
     for runner_name, script, payload in payloads:
         assert gate._validate_candidate_probe_payload(runner_name, script, payload) is None
+
+
+def test_probe_report_projection_discards_unknown_secret_shapes() -> None:
+    payload = _runtime_probe_payload()
+    payload["innocent_name"] = "postgresql://user:secret@database/private"
+    payload["nested_exfiltration"] = {"pin": 123456, "array": ["secret-value"]}
+
+    summary = gate._probe_evidence_summary("scripts/kind_runtime_probe.py", payload)
+
+    rendered = json.dumps(summary)
+    assert "innocent_name" not in summary
+    assert "nested_exfiltration" not in summary
+    assert "secret" not in rendered
+    assert "123456" not in rendered
+
+
+def test_probe_report_projection_preserves_only_safe_exception_types() -> None:
+    payload = _runtime_probe_payload()
+    cell_check = payload["checks"]["cell_effect_reconciliation"]
+    assert isinstance(cell_check, dict)
+    cell_check["rejection_reasons"] = [
+        "InsufficientPrivilegeError",
+        "postgresql://user:secret@database/private",
+        "secret-value",
+    ]
+    payload["rejection_reasons"] = ["RuntimeError", "sensitive response body"]
+
+    summary = gate._probe_evidence_summary("scripts/kind_runtime_probe.py", payload)
+
+    assert summary["rejection_reasons"] == ["RuntimeError"]
+    assert summary["cell_effect_reconciliation"]["rejection_reasons"] == [
+        "InsufficientPrivilegeError"
+    ]
+    assert "secret" not in json.dumps(summary)
+
+
+@pytest.mark.parametrize(
+    ("after", "expected_status"),
+    [({"effects": 4, "provider_calls": 2}, "pass"), ({"effects": 5, "provider_calls": 3}, "fail")],
+)
+def test_evolution_probe_uses_independent_provider_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    after: dict[str, int],
+    expected_status: str,
+) -> None:
+    metrics = iter(({"effects": 4, "provider_calls": 2}, after))
+    monkeypatch.setattr(gate, "_provider_metrics", lambda *_args: next(metrics))
+    monkeypatch.setattr(gate, "_run_candidate_probe", lambda *_args: ("pass", {}, None))
+
+    status, evidence, reason = gate._candidate_evolution_scenario(
+        "kind-test", "trpc-cell-kind", "candidate:local"
+    )
+
+    assert status == expected_status
+    assert evidence["independent_provider_oracle"]["status"] == expected_status
+    assert (reason is None) is (expected_status == "pass")
 
 
 @pytest.mark.parametrize("cross_node", [True, False])
@@ -975,6 +1215,34 @@ def test_worker_replacement_evidence_proves_provider_counts_are_unchanged(
     assert evidence["provider_counts_before"] == evidence["provider_counts_after"]
 
 
+def test_postgres_runtime_marker_uses_runtime_role_and_tenant_rls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    inputs: list[str | None] = []
+
+    def fake_kubectl(_context: str, arguments: list[str], **_kwargs: object) -> gate.CommandResult:
+        calls.append(arguments)
+        inputs.append(_kwargs.get("input_text"))
+        return gate.CommandResult("pass", stdout="kind_gate_marker_x\n1\n")
+
+    monkeypatch.setattr(gate, "_kubectl", fake_kubectl)
+
+    observed = gate._postgres_runtime_marker(
+        "kind-test", "trpc-cell-kind", "kind_gate_marker_x", "marker123", "verify"
+    )
+
+    assert observed == "1"
+    command = calls[0]
+    assert command[command.index("-U") + 1] == "trpc_runtime"
+    assert "PGPASSWORD=kind-runtime-password" in command
+    statement = inputs[0]
+    assert isinstance(statement, str)
+    assert "set_config('app.tenant_id', :'tenant', true)" in statement
+    assert "audit_logs" in statement
+    assert "marker123" not in statement
+
+
 @pytest.mark.parametrize(
     ("pvc_after_uid", "rows_after", "expected_status"),
     [("pvc-stable", 2, "pass"), ("pvc-replaced", 2, "fail"), ("pvc-stable", 1, "fail")],
@@ -1002,9 +1270,9 @@ def test_postgres_replacement_requires_same_pvc_and_persistent_rows(
             return gate.CommandResult("pass", stdout="t\n")
         return gate.CommandResult("pass")
 
-    row_counts = iter(("2", str(rows_after)))
+    marker_counts = iter(("1", "1" if rows_after == 2 else "0", "0"))
     monkeypatch.setattr(gate, "_kubectl", fake_kubectl)
-    monkeypatch.setattr(gate, "_postgres_scalar", lambda *_args: next(row_counts))
+    monkeypatch.setattr(gate, "_postgres_runtime_marker", lambda *_args: next(marker_counts))
     monkeypatch.setattr(
         gate, "_wait_for_runtime_target", lambda *_args, **_kwargs: gate.CommandResult("pass")
     )
@@ -1017,7 +1285,69 @@ def test_postgres_replacement_requires_same_pvc_and_persistent_rows(
     assert status == expected_status
     assert evidence["pvc_preserved"] is (pvc_after_uid == "pvc-stable")
     assert evidence["persistent_rows_preserved"] is (rows_after == 2)
+    assert evidence["runtime_role_rls_marker"] == {
+        "created": True,
+        "survived_restart": rows_after == 2,
+        "cleaned": True,
+    }
     assert "pvc-stable" not in json.dumps(evidence)
+    assert (reason is None) is (expected_status == "pass")
+
+
+@pytest.mark.parametrize(
+    ("pvc_after_uid", "observed", "expected_status"),
+    [
+        ("pvc-stable", "stored", "pass"),
+        ("pvc-replaced", "stored", "fail"),
+        ("pvc-stable", "lost", "fail"),
+    ],
+)
+def test_redis_replacement_requires_pvc_aof_and_fresh_queue_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    pvc_after_uid: str,
+    observed: str,
+    expected_status: str,
+) -> None:
+    pod_uids = iter(("pod-before", "pod-after"))
+    pvc_uids = iter(("pvc-stable", pvc_after_uid))
+
+    def fake_kubectl(_context: str, arguments: list[str], **_kwargs: object) -> gate.CommandResult:
+        joined = " ".join(arguments)
+        if "get pod/kind-redis-0" in joined:
+            return gate.CommandResult(
+                "pass", stdout=json.dumps({"metadata": {"uid": next(pod_uids)}})
+            )
+        if "get pvc/data-kind-redis-0" in joined:
+            return gate.CommandResult(
+                "pass", stdout=json.dumps({"metadata": {"uid": next(pvc_uids)}})
+            )
+        return gate.CommandResult("pass")
+
+    redis_calls: list[tuple[str, ...]] = []
+    stored_value = ""
+
+    def fake_redis(_context: str, _namespace: str, *arguments: str) -> str:
+        nonlocal stored_value
+        redis_calls.append(arguments)
+        if arguments[0] == "SET":
+            stored_value = arguments[2]
+            return "OK"
+        if arguments[0] == "GET":
+            return stored_value if observed == "stored" else "different"
+        return "1"
+
+    monkeypatch.setattr(gate, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(gate, "_redis_scalar", fake_redis)
+    monkeypatch.setattr(gate, "_candidate_redis_scenario", lambda *_args: ("pass", {}, None))
+
+    status, evidence, reason = gate._redis_restart_scenario(
+        "kind-test", "trpc-cell-kind", "candidate:local"
+    )
+
+    assert status == expected_status
+    assert evidence["pvc_preserved"] is (pvc_after_uid == "pvc-stable")
+    assert evidence["sentinel_preserved"] is (observed == "stored")
+    assert redis_calls[-1][0] == "DEL"
     assert (reason is None) is (expected_status == "pass")
 
 
@@ -1030,12 +1360,17 @@ def test_workload_distribution_requires_workers_on_three_nodes(
     node_names: list[str],
     expected_status: str,
 ) -> None:
+    ready = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
     worker_items = [
         {
             "metadata": {
                 "labels": {"app.kubernetes.io/name": "trpc-worker"},
             },
             "spec": {"nodeName": node_name},
+            "status": ready,
         }
         for node_name in node_names
     ]
@@ -1043,6 +1378,7 @@ def test_workload_distribution_requires_workers_on_three_nodes(
         {
             "metadata": {"labels": {"app.kubernetes.io/name": "trpc-gateway"}},
             "spec": {"nodeName": node_name},
+            "status": ready,
         }
         for node_name in ("gateway-node-a", "gateway-node-b")
     ]
@@ -1050,6 +1386,7 @@ def test_workload_distribution_requires_workers_on_three_nodes(
         {
             "metadata": {"labels": {"app.kubernetes.io/name": workload}},
             "spec": {"nodeName": "backend-node"},
+            "status": ready,
         }
         for workload in ("kind-postgres", "kind-redis", "kind-fake-provider")
     )
@@ -1065,6 +1402,228 @@ def test_workload_distribution_requires_workers_on_three_nodes(
     assert status == expected_status
     assert evidence["worker_node_count"] == len(set(node_names))
     assert (reason is None) is (expected_status == "pass")
+
+
+def _runtime_attestation_items(
+    *, image: str = "candidate:local", image_id: str = "sha256:" + "a" * 64
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    support_image = "support:fixed"
+    support_image_id = "sha256:" + "c" * 64
+    for workload, replicas in gate.REQUIRED_DEPLOYMENTS.items():
+        deployment_uid = f"uid-deployment-{workload}"
+        items.append(
+            {
+                "kind": "Deployment",
+                "metadata": {
+                    "name": workload,
+                    "uid": deployment_uid,
+                    "generation": 3,
+                },
+                "spec": {"template": {"spec": {"containers": [{"image": image}]}}},
+                "status": {
+                    "observedGeneration": 3,
+                    "replicas": replicas,
+                    "updatedReplicas": replicas,
+                    "readyReplicas": replicas,
+                    "availableReplicas": replicas,
+                },
+            }
+        )
+        items.append(
+            {
+                "kind": "ReplicaSet",
+                "metadata": {
+                    "name": f"{workload}-rs",
+                    "uid": f"uid-rs-{workload}",
+                    "ownerReferences": [
+                        {
+                            "kind": "Deployment",
+                            "name": workload,
+                            "uid": deployment_uid,
+                            "controller": True,
+                        }
+                    ],
+                },
+                "spec": {"template": {"spec": {"containers": [{"image": image}]}}},
+                "status": {"replicas": replicas, "readyReplicas": replicas},
+            }
+        )
+        for index in range(replicas):
+            items.append(
+                {
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": f"{workload}-{index}",
+                        "uid": f"uid-{workload}-{index}",
+                        "labels": {"app.kubernetes.io/name": workload},
+                        "ownerReferences": [
+                            {
+                                "kind": "ReplicaSet",
+                                "name": f"{workload}-rs",
+                                "uid": f"uid-rs-{workload}",
+                                "controller": True,
+                            }
+                        ],
+                    },
+                    "spec": {"containers": [{"image": image}]},
+                    "status": {
+                        "phase": "Running",
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "containerStatuses": [{"ready": True, "imageID": image_id}],
+                    },
+                }
+            )
+    for workload in ("kind-postgres", "kind-redis", "kind-fake-provider", "kind-fake-im"):
+        items.append(
+            {
+                "kind": "StatefulSet",
+                "metadata": {
+                    "name": workload,
+                    "uid": f"uid-statefulset-{workload}",
+                    "generation": 2,
+                },
+                "spec": {"template": {"spec": {"containers": [{"image": support_image}]}}},
+                "status": {
+                    "observedGeneration": 2,
+                    "currentRevision": f"revision-{workload}",
+                    "updateRevision": f"revision-{workload}",
+                    "updatedReplicas": 1,
+                    "currentReplicas": 1,
+                    "readyReplicas": 1,
+                },
+            }
+        )
+        items.append(
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": f"{workload}-0",
+                    "uid": f"uid-{workload}-0",
+                    "labels": {"app.kubernetes.io/name": workload},
+                    "ownerReferences": [
+                        {
+                            "kind": "StatefulSet",
+                            "name": workload,
+                            "uid": f"uid-statefulset-{workload}",
+                            "controller": True,
+                        }
+                    ],
+                },
+                "spec": {"containers": [{"image": support_image}]},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"ready": True, "imageID": support_image_id}],
+                },
+            }
+        )
+    items.append(
+        {
+            "kind": "Pod",
+            "metadata": {
+                "name": "trpc-schema-migration-current",
+                "uid": "uid-migration",
+                "labels": {"app.kubernetes.io/name": gate.SCHEMA_MIGRATION_JOB_NAME},
+                "ownerReferences": [
+                    {
+                        "kind": "Job",
+                        "name": gate.SCHEMA_MIGRATION_JOB_NAME,
+                        "uid": "uid-migration-job",
+                        "controller": True,
+                    }
+                ],
+            },
+            "spec": {"containers": [{"image": image}]},
+            "status": {
+                "phase": "Succeeded",
+                "containerStatuses": [{"ready": False, "imageID": image_id}],
+            },
+        }
+    )
+    items.append(
+        {
+            "kind": "Job",
+            "metadata": {"name": gate.SCHEMA_MIGRATION_JOB_NAME, "uid": "uid-migration-job"},
+            "spec": {"template": {"spec": {"containers": [{"image": image}]}}},
+            "status": {"succeeded": 1},
+        }
+    )
+    return items
+
+
+def test_runtime_attestation_binds_ready_pods_image_and_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "b" * 64
+    items = _runtime_attestation_items()
+    monkeypatch.setattr(
+        gate,
+        "_kubectl",
+        lambda *_args, **_kwargs: gate.CommandResult("pass", stdout=json.dumps({"items": items})),
+    )
+    monkeypatch.setattr(gate, "_source_lineage", lambda: {"status": "available", "value": source})
+    monkeypatch.setattr(gate, "_runtime_source_fingerprint", lambda *_args: source)
+
+    status, evidence, reason = gate._runtime_attestation_snapshot(
+        "kind-test", "trpc-cell-kind", "candidate:local"
+    )
+
+    assert status == "pass"
+    assert reason is None
+    assert evidence["candidate_image_ids"] == ["sha256:" + "a" * 64]
+    assert evidence["candidate_probe_pods"] == 0
+    assert evidence["application_pod_counts"] == gate.REQUIRED_DEPLOYMENTS
+
+
+def test_runtime_attestation_rejects_stale_or_terminating_pod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "b" * 64
+    items = _runtime_attestation_items()
+    worker = next(
+        item
+        for item in items
+        if item.get("kind") == "Pod"
+        and item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name")
+        == "trpc-worker"
+    )
+    worker["metadata"]["deletionTimestamp"] = "2026-09-05T00:00:00Z"
+    monkeypatch.setattr(
+        gate,
+        "_kubectl",
+        lambda *_args, **_kwargs: gate.CommandResult("pass", stdout=json.dumps({"items": items})),
+    )
+    monkeypatch.setattr(gate, "_source_lineage", lambda: {"status": "available", "value": source})
+    monkeypatch.setattr(gate, "_runtime_source_fingerprint", lambda *_args: source)
+
+    status, _evidence, reason = gate._runtime_attestation_snapshot(
+        "kind-test", "trpc-cell-kind", "candidate:local"
+    )
+
+    assert status == "fail"
+    assert reason is not None and "runtime identity" in reason
+
+
+def test_final_runtime_stability_requires_same_pod_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter(
+        (
+            ("pass", {"pod_set_sha256": "a", "candidate_image_ids": ["sha256:" + "1" * 64]}, None),
+            ("pass", {"pod_set_sha256": "b", "candidate_image_ids": ["sha256:" + "1" * 64]}, None),
+        )
+    )
+    monkeypatch.setattr(gate, "_runtime_attestation_snapshot", lambda *_args: next(observations))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    status, evidence, reason = gate._final_runtime_stability(
+        "kind-test", "trpc-cell-kind", "candidate:local"
+    )
+
+    assert status == "fail"
+    assert evidence["stable"] is False
+    assert reason == "runtime changed during the stability window"
 
 
 def test_execute_collects_failures_from_all_independent_scenarios(
@@ -1111,6 +1670,7 @@ def test_execute_collects_failures_from_all_independent_scenarios(
     monkeypatch.setattr(gate, "_worker_restart_scenario", lambda *_args: ("fail", {}, "worker"))
     monkeypatch.setattr(gate, "_network_recovery_scenario", lambda *_args: ("fail", {}, "provider"))
     monkeypatch.setattr(gate, "_postgres_restart_scenario", lambda *_args: ("fail", {}, "postgres"))
+    monkeypatch.setattr(gate, "_redis_restart_scenario", lambda *_args: ("fail", {}, "redis-pod"))
     monkeypatch.setattr(gate, "_kubectl", lambda *_args, **_kwargs: gate.CommandResult("pass"))
 
     result = gate._execute(
@@ -1133,8 +1693,9 @@ def test_execute_collects_failures_from_all_independent_scenarios(
         "worker_pod_replacement",
         "provider_endpoint_recovery",
         "postgres_pod_replacement",
+        "redis_pod_replacement",
     }
-    assert len(result["rejection_reasons"]) == 7
+    assert len(result["rejection_reasons"]) == 8
     assert result["node_pools"]["status"] == "pass"
     assert result["schema_migration"]["status"] == "pass"
     assert result["schema_migration_head"]["status"] == "pass"
@@ -1172,11 +1733,25 @@ def test_preflight_report_is_render_only_and_does_not_create_a_cluster(
             {
                 "kind": "Deployment",
                 "metadata": {"name": name},
-                "spec": {"replicas": replicas},
+                "spec": {
+                    "replicas": replicas,
+                    "template": {"spec": _secure_pod_spec(gate.DEFAULT_IMAGE)},
+                },
             }
             for name, replicas in gate.REQUIRED_DEPLOYMENTS.items()
         ],
-        *[{"kind": kind, "metadata": {"name": name}} for kind, name in gate.REQUIRED_OBJECTS],
+        *[
+            {
+                "kind": kind,
+                "metadata": {"name": name},
+                **(
+                    {"spec": {"template": {"spec": _secure_pod_spec(gate.DEFAULT_IMAGE)}}}
+                    if kind == "Job"
+                    else {}
+                ),
+            }
+            for kind, name in gate.REQUIRED_OBJECTS
+        ],
     ]
     rendered_calls: list[str] = []
 
@@ -1216,7 +1791,7 @@ def test_preflight_report_is_render_only_and_does_not_create_a_cluster(
     assert report["cluster"] == {
         "name": "trpc-cell-kind",
         "context": "kind-trpc-cell-kind",
-        "uid": None,
+        "instance_fingerprint": None,
         "status": "not_run",
     }
     assert rendered_calls == [gate.DEFAULT_IMAGE]

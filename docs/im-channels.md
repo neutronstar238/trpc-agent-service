@@ -292,11 +292,13 @@ WebSocket 事件与 send ack。`rate_limit_retry_after` 观察项必须包含平
 
 ## 通用投递规则
 
-`ChannelCapabilities` 表示 stream/card/media/recall/proactive 能力。适配器负责长度拆分、速率限制和
-平台错误映射；Dispatcher 记录每次 delivery attempt。明确失败可按退避策略重试，并优先遵守供应商
-`Retry-After`（包括平台 JSON 中的 retry hint）；HTTP 超时、连接
-断开等结果未知状态标记 `ambiguous`，必须由 tenant admin 带 `If-Match`、`Idempotency-Key` 和人工
-确认调用 replay。所有日志只记录 tenant/binding/message 哈希和状态，不记录正文或凭证。
+`ChannelCapabilities` 是目标能力声明，不等于当前 adapter 已经实现。当前版本的出站实现只验证文本
+（企微含 markdown）；stream/card/media/recall/proactive、平台级长度拆分和完整限流适配仍是后续目标，
+不能把 binding 中的 capability 列表当作可用功能证明。飞书入站媒体解析/下载和企微媒体定位器属于输入侧
+能力，与出站媒体发送不是同一件事。Dispatcher 已记录每次 delivery attempt，并对明确失败按退避策略
+重试，优先遵守供应商 `Retry-After`（包括平台 JSON 中的 retry hint）；HTTP 超时、连接断开等结果
+未知状态标记 `ambiguous`，必须由 tenant admin 带 `If-Match`、`Idempotency-Key` 和人工确认调用 replay。
+所有日志只记录 tenant/binding/message 哈希和状态，不记录正文或凭证。
 
 ## 平台参考
 

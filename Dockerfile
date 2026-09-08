@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG PYTHON_IMAGE=python:3.12-alpine3.24
+ARG PYTHON_IMAGE=python:3.12-alpine3.24@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
 
 FROM ${PYTHON_IMAGE} AS builder
 
@@ -45,7 +45,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 LABEL org.opencontainers.image.revision="${TRPC_SOURCE_FINGERPRINT}" \
       io.trpc.agent-service.source-fingerprint="${TRPC_SOURCE_FINGERPRINT}"
 
-RUN addgroup -S -g 10001 trpc \
+# The pinned Python base predates the libuuid security fixes. Keep the runtime
+# patch explicit so a cached base cannot silently reintroduce the affected build.
+RUN apk add --no-cache --upgrade "libuuid=2.42.3-r1" \
+    && addgroup -S -g 10001 trpc \
     && adduser -S -D -u 10001 -G trpc -h /home/trpc trpc \
     && mkdir -p /app /tmp/trpc-service \
     && chown -R trpc:trpc /app /tmp/trpc-service

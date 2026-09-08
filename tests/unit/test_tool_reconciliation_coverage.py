@@ -402,6 +402,10 @@ async def test_coordinator_probe_exception_unknown_and_fence_errors() -> None:
         await ToolExecutionReconciliationCoordinator(
             stale_ledger, ProviderReconciler(lambda _intent, _receipt: "applied")
         ).reconcile(stale_intent, receipt=stale_current, expected_attempt=2)
+    with pytest.raises(ReconciliationConflict, match="stale"):
+        await ToolExecutionReconciliationCoordinator(
+            stale_ledger, ProviderReconciler(lambda _intent, _receipt: "applied")
+        ).reconcile(stale_intent, receipt=stale_current, expected_attempt=0)
 
 
 def test_coordinator_rejects_invalid_dependencies() -> None:

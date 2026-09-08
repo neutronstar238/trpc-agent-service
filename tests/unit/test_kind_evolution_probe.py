@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from urllib import error as urllib_error
 
 import pytest
 
@@ -71,6 +72,35 @@ def test_opt_in_configuration_is_fail_closed_and_redacted() -> None:
 def test_safe_error_type_never_includes_message() -> None:
     error = RuntimeError("dsn=postgresql://user:password@db/secret")
     assert probe._safe_error_type(error) == "RuntimeError"
+
+
+def test_network_denial_probe_only_accepts_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            return b"ok"
+
+    monkeypatch.setattr(probe.urllib_request, "urlopen", lambda *_args, **_kwargs: Response())
+    assert probe._network_request_is_denied("http://fake", 0.1) is False
+
+    def denied(*_args: object, **_kwargs: object) -> object:
+        raise urllib_error.URLError("blocked")
+
+    monkeypatch.setattr(probe.urllib_request, "urlopen", denied)
+    assert probe._network_request_is_denied("http://fake", 0.1) is True
+
+    def reachable_error(*_args: object, **_kwargs: object) -> object:
+        raise urllib_error.HTTPError("http://fake", 503, "unavailable", {}, None)
+
+    monkeypatch.setattr(probe.urllib_request, "urlopen", reachable_error)
+    assert probe._network_request_is_denied("http://fake", 0.1) is False
 
 
 def test_probe_assertion_failure_keeps_safe_case_metadata_without_details(
@@ -243,6 +273,7 @@ def test_probe_source_contract() -> None:
     for marker in (
         "PostgresPromotionStore",
         "CertificateVerifier",
+        "JudgePolicy",
         "PromotionApprovalAuthority",
         "cell_promotion_uses",
         "lease_epoch",
@@ -251,6 +282,10 @@ def test_probe_source_contract() -> None:
         "PromotionReceiptError",
         "NamespaceViolation",
         "ensure_runtime_projection_capsule",
+        "read_cell_branch_head_hash",
+        "network_egress_denial",
+        "kind-fake-provider",
+        "kind-fake-im",
         "TRPC_SERVICE_WORKER_DATABASE_DSN",
         "provider_calls",
         "concurrent_cas",

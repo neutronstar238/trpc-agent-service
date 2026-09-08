@@ -375,11 +375,19 @@ class ToolExecutionReconciliationCoordinator:
         evidence: ReconciliationEvidence | None = None,
         *,
         expected_attempt: int | None = None,
+        claim_owner: str | None = None,
+        claim_epoch: int | None = None,
     ) -> ExecutionRecord:
         claim: ExecutionReconciliationClaim | None
         if isinstance(intent, ExecutionReconciliationClaim):
             claim = intent
             probe_intent = intent.intent
+            if claim_owner is not None and claim_owner != claim.owner_id:
+                raise ReconciliationConflict("reconciliation claim owner is inconsistent")
+            if claim_epoch is not None and claim_epoch != claim.claim_epoch:
+                raise ReconciliationConflict("reconciliation claim epoch is inconsistent")
+            claim_owner = claim.owner_id
+            claim_epoch = claim.claim_epoch
         else:
             claim = None
             probe_intent = intent
@@ -391,7 +399,11 @@ class ToolExecutionReconciliationCoordinator:
             )
         if current is None:
             raise ReconciliationConflict("tool execution was not claimed")
-        attempt = expected_attempt or _receipt_attempt(current, probe_intent.attempt)
+        attempt = (
+            expected_attempt
+            if expected_attempt is not None
+            else _receipt_attempt(current, probe_intent.attempt)
+        )
         if attempt != _receipt_attempt(current, attempt):
             raise ReconciliationConflict("reconciliation attempt is stale")
         if evidence is None:
@@ -420,8 +432,8 @@ class ToolExecutionReconciliationCoordinator:
             tenant_id=probe_intent.tenant_id,
             expected_attempt=attempt,
             evidence=evidence,
-            claim_owner=claim.owner_id if claim is not None else None,
-            claim_epoch=claim.claim_epoch if claim is not None else None,
+            claim_owner=claim_owner,
+            claim_epoch=claim_epoch,
         )
 
     async def reconcile_pending(

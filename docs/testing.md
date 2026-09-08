@@ -4,9 +4,12 @@
 
 - 单元/协议：HMAC Session、rollout、飞书签名/AES、WeCom frame、Filter、预算、确认、脱敏。
 - SDK 契约：固定 1.1.19 的 Runner 参数、AgentContext metadata、Event、Tool Safety 和取消行为。
-- 后端契约：InMemory/Redis/PostgreSQL/S3/pgvector 使用相同语义；真实服务测试标记 `integration`。
+- 后端契约：InMemory/Redis/PostgreSQL/S3/pgvector 共享抽象语义；内置运行时 profile 只有
+  PostgreSQL + S3/MinIO + pgvector，Redis/InMemory/外部向量或 Memory 需要预注册适配器，不能把
+  协议契约测试当成所有后端组合已实现。
 - 并发/故障：至少四 Worker 竞争同一 Session、乱序/重复、续租失败、阶段 kill 和依赖中断。
-- 在线 IM：仅 `TRPC_IM_ONLINE_TESTS_ENABLED=true` 且 Feishu/WeCom Secret 注入时运行，不从 `.env` 打印凭证。
+- 在线 IM：仅 `TRPC_IM_ONLINE_TESTS_ENABLED=true` 且 Feishu/WeCom Secret 注入时运行，不从 `.env` 打印凭证；
+  真实 integration 必须显式传 `--allow-real-tests`，使用一次性隔离 namespace/数据库/租户和专用凭证。
   生产证据还必须提供 `TRPC_IM_ONLINE_PROBE_URL`（HTTPS）和已部署探针的
   `TRPC_IM_ONLINE_IMAGE_DIGEST`；同时必须配置只含精确 HTTPS 基址的
   `TRPC_IM_ONLINE_PROBE_URL_ALLOWLIST`（可用逗号或换行分隔多个固定地址）和固定的
@@ -20,6 +23,9 @@
   `outage_seconds` 必须为有限的 0.001–604800 秒。
 - 当前仓库没有企业微信或飞书的真实线上账号/凭证；因此真实回调、发送、限流、媒体和重连证据保持
   `not_run`，Fake/离线协议测试不能升级为生产 `pass`。
+- 运行真实 integration 前必须暂停会消费同一测试数据的后台 reconciler、dispatcher、recovery 和
+  scheduler；或使用完全隔离的数据库/租户并确认没有其他 worker。测试结束后再恢复后台任务，避免
+  后台重放、对账或投递改变断言和幂等计数。
 - 在线 IM 的 `reconnect`/`prolonged_outage` 只按“单个 connector 进程不可用、冗余 owner 接管并继续
   交付”验收：必须记录旧 owner 释放、新 owner 接管、重新订阅和接管后唯一 marker 的 provider 事件
   与发送 ACK；`prolonged_outage` 的 connector 故障窗口至少 60 秒。两个 WSS 同时断开属于独立的
@@ -129,6 +135,11 @@ statement 与 branch 两项分别执行 90% 门禁；pytest 的综合覆盖率�
 callback→mailbox→worker→outbound 的消息 E2E；完整消息 E2E 仍需真实运行态验收。这些变量只能从
 Secret 注入，命令和报告不能打印其值。
 
+如果直接运行 `pytest` 的 `integration` 测试，必须显式使用
+`uv run pytest --allow-real-tests -m integration ...`；`contract_gate` 只有在检测到完整外部
+环境时才会向其子 pytest 传递该选项，`compose_e2e` 本身不是 pytest integration 测试，不能把
+脚本成功误读为允许绕过隔离或后台任务暂停要求。
+
 故障注入的 `production_gate` 只有在 `--scenario all` 的完整场景集合全部真实通过、并提供
 `TRPC_REAL_IMAGE_DIGEST=sha256:<64-hex-digest>` 时才可能为 `pass`；单场景、离线契约或缺少任一
 场景仍为 `not_run`。
@@ -165,6 +176,17 @@ Kubernetes 控制面和 IM 平台配额。
 双写、checksum 和按租户回滚；Toxiproxy 中断 PG/Redis/MinIO/IM；企业微信与飞书真实凭证完成协议验收；
 依赖漏洞、镜像漏洞和 SBOM 门禁。缺少任何必需外部环境时，报告必须明确 `not_run` 原因，不能把静态
 清单验证表述成部署通过。
+
+供应链门禁还要求依赖审计报告包含非空的 `name`、`version`、`vulns` 列表，空报告或
+畸形条目 fail-closed。SARIF 必须由与 CI 一致的 `trivy image --scanners vuln --severity HIGH,CRITICAL`
+生成；门禁保守拒绝该报告中的任意 finding，全严重度扫描应另存，不能手工删改结果冒充过滤扫描。
+Trivy SARIF 的每个 `runs[]` 必须包含 `properties.imageID`，并与当前
+`docker image inspect .Id` 逐项相等（按 image store 可能是 config 或 manifest digest，不能直接
+代入 BuildKit 的 config digest）；只要报告来自另一镜像、缺少该字段或存在高危/严重结果，
+门禁即失败。Syft SPDX 在未提供对应镜像 digest 时只报告为 `sbom_provenance=unbound`，不
+伪造已绑定结论；若 SBOM 明确提供 digest，则必须与候选镜像匹配。供应链脚本的
+`production_gate` 仅表示供应链这一项门禁，不代表 ACK、IM 或整体生产验收通过；Kind 与本机创新
+验收报告的整体生产结论仍为 `production_gate=not_run`。
 
 ## Kubernetes 运行态验收
 
@@ -438,29 +460,34 @@ uv run python scripts/kind_ack_gate.py --execute `
 ```
 
 `--execute` 的顺序是：按 `cluster.yaml` 创建或复用精确的 1+3 kind 集群→加载/拉取候选镜像→
-重新标注并校验两个 gateway 节点池和一个 support 节点池→删除固定名称的旧 migration Job→渲染并
+只读校验两个 gateway 节点池和一个 support 节点池的预置标签（标签漂移直接失败，不由门禁自动修复）→删除固定名称的旧 migration Job 并重建→渲染并
 apply `deploy/kind`→先等待 StatefulSet，再执行迁移并校验 `alembic_version` 等于仓库唯一 head，最后
 逐个滚动重启并等待应用 Deployment→运行全部场景并集中报告失败。Gateway/Worker 在这个固定容量
 环境中使用 `maxSurge=0,maxUnavailable=1`，否则硬反亲和与零不可用滚动会互相等待；生产 base 不受影响。
 为了让 PostgreSQL 重启场景核验同一批持久哨兵，runtime probe 使用随机租户 ID 并保留少量 synthetic
 fixture；它不会覆盖既有租户，但重复运行会累积测试行。`trpc-cell-kind` 因而是一次性/可重建的隔离
 namespace，不应连接共享开发数据库，也不应把该 gate 描述为零写入测试。
-共执行 7 个 Gate 场景：
+共执行 8 个 Gate 场景：
 
 1. 候选镜像向两副本真实 Gateway 并发发送 100 次相同的加密签名 Feishu callback，PostgreSQL 中
    inbound/audit/mailbox/ready event 均只保留一份；非法签名被拒绝，同一外部 ID 在另一租户可独立接收；
 2. 同一个 runtime 场景由候选镜像直接运行基线 `TenantRuntime`：对 WeCom AI Bot envelope 再验证一次
    100 并发、稳定 session 路由与跨租户隔离且不依赖 sticky session；随后令 fake provider 已提交
-   副作用后返回 504，使统一 `tool_executions` ledger 进入 ambiguous，再由专用 RLS authority 只做
-   GET 查询并 CAS 收敛。外部 POST 与 provider 增量都必须严格为 1，unknown 继续封锁；
+   副作用后返回 504，使统一 `tool_executions` ledger 进入 ambiguous，再由专用
+   `trpc_tool_reconciler` RLS authority 只做 GET 查询并 CAS 收敛。Cell reconciliation 另使用独立
+   PostgreSQL 登录 `trpc_cell_reconciler`（与 `trpc_cell_executor` 分离）。外部 POST 与 provider
+   增量都必须严格为 1，unknown 继续封锁；
 3. Evolution authority 在真实 PostgreSQL 上验证并发 CAS 只有一个 winner、证书/人工批准一次性消费、
-   outbox lease epoch 接管、签名 receipt 回滚、ABA/stale/跨租户拒绝，真实 provider 调用数必须为 0；
+   outbox lease epoch 接管、签名 receipt 回滚、ABA/stale/跨租户拒绝；同时实际探测 fake provider 和
+   fake IM 均不可达，真实 provider 调用数必须为 0。这只证明本机 NetworkPolicy 生效；
 4. 候选镜像直接复用生产 `RedisStreamQueue`，验证同一 outbox 只发布一次、consumer A 形成 PEL、租约
    到期后 consumer B 通过 `XAUTOCLAIM` 接管、旧 owner 不能 defer、B 的 `XACK` 将 PEL 清零；
 5. 删除一个 Worker Pod 后由 Deployment 接管，替换前后 provider effect/call 计数不变；
 6. 替换 fake provider Pod 后 UID 必须变化，PVC 中 effect 与调用计数必须保留；
 7. 替换 PostgreSQL Pod 时，Pod UID 必须变化、PVC UID 必须完全相同、重启前后的持久 IM 行计数必须
    相同；所有应用 Deployment 恢复后再通过 Gateway 完成一次真实 DB-backed callback。
+8. 替换 Redis Pod 时，Pod UID 必须变化、PVC UID 保持相同，AOF 中的哨兵必须保留；恢复后再次运行
+   生产 `RedisStreamQueue` 探针验证客户端重新连接和队列语义。
 
 三个 Worker 必须实际分布在三个节点；两个 Gateway 必须硬分散到两个节点，PostgreSQL、Redis 和 fake
 provider 与 Gateway 分居。每个短命候选探针按其实际目标设置 required anti-affinity，并在删除前记录
@@ -468,8 +495,9 @@ driver/目标 Pod 的 `nodeName`，同节点或节点证据缺失都 fail-closed
 authority、工具 reconciler 和 Redis 凭据不会注入无关探针。PostgreSQL、Redis 与 Python 支持镜像使用
 registry digest，而不是可变 tag。
 
-报告的 `lineage` 至少绑定 `git_sha`、`source_fingerprint` 和镜像 `digest`；执行模式额外绑定
-`cluster.uid`。缺少任何不可变镜像或 cluster UID 时，运行态不会被标记为 pass。fake IM/provider
+报告的 `lineage` 至少绑定 `git_sha`、`source_fingerprint` 和镜像 `digest`；执行模式额外绑定报告字段
+`cluster.instance_fingerprint`（当前为目标集群实例的不可变 namespace 指纹，不把它冒充云厂商 cluster UID）；
+顶层 `production_gate` 固定为 `not_run`。缺少任何不可变镜像或集群实例指纹时，运行态不会被标记为 pass。fake IM/provider
 只用于确定性故障注入，不代表真实企业微信/飞书或供应商合约已经验证。
 
 本机 kind 与 ACK 的边界必须写进验收结论：kind 能覆盖 Pod/Service/DNS、Kubernetes lease/CAS、

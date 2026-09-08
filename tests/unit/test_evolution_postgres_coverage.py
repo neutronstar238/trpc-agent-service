@@ -253,6 +253,10 @@ def test_store_constructor_and_exact_scope_guards() -> None:
         PostgresPromotionStore(_FakePool(connection), tenant_id=" ")
     with pytest.raises(ValueError, match="receipt_key_id"):
         PostgresPromotionStore(_FakePool(connection), receipt_key_id=" ")
+    with pytest.raises(PromotionReceiptError, match="persistent receipt signing key"):
+        PostgresPromotionStore(_FakePool(connection))
+    bootstrap = PostgresPromotionStore(_FakePool(connection), bootstrap_mode=True)
+    assert bootstrap.bootstrap_mode
     store = _store(connection)
     with pytest.raises(NamespaceViolation, match="tenant"):
         store._assert_tenant("tenant-b")
@@ -288,10 +292,11 @@ async def test_get_and_load_pointer_reject_missing_or_cross_namespace_rows() -> 
 
 
 @pytest.mark.asyncio
-async def test_database_clock_fallback_and_fetch_without_fetch_method() -> None:
+async def test_database_clock_fails_closed_and_fetch_without_fetch_method() -> None:
     connection = _NullClockConnection()
     store = _store(connection)
-    assert await store._database_now(connection) == NOW
+    with pytest.raises(PromotionError, match="database clock"):
+        await store._database_now(connection)
     with_fetch = _NoFetchConnection({"value": 1})
     assert await PostgresPromotionStore._fetch_many(with_fetch, "SELECT fallback") == [{"value": 1}]
     no_row = _NoFetchConnection(None)
@@ -302,19 +307,36 @@ def test_certificate_and_approval_verifier_guards() -> None:
     certificate, target, authority = _certificate()
     store = _store(_ConnectionDouble())
     with pytest.raises(CertificateError, match="invalid"):
-        store._verify_certificate(object(), target)  # type: ignore[arg-type]
+        store._verify_certificate(object(), target, database_now=NOW)  # type: ignore[arg-type]
     with pytest.raises(CertificateError, match="trusted"):
-        store._verify_certificate(certificate, target)
+        store._verify_certificate(certificate, target, database_now=NOW)
     store.certificate_verifier = _FixedVerifier(VerificationResult(False))  # type: ignore[assignment]
     with pytest.raises(CertificateError, match="failed"):
-        store._verify_certificate(certificate, target)
+        store._verify_certificate(certificate, target, database_now=NOW)
     store.certificate_verifier = _FixedVerifier(VerificationResult(False, "rejected"))  # type: ignore[assignment]
     with pytest.raises(CertificateError, match="rejected"):
-        store._verify_certificate(certificate, target)
+        store._verify_certificate(certificate, target, database_now=NOW)
     store.certificate_verifier = _FixedVerifier(VerificationResult(True))  # type: ignore[assignment]
-    store._verify_certificate(certificate, target)
+    store._verify_certificate(certificate, target, database_now=NOW)
+    with pytest.raises(CertificateError, match="not valid yet"):
+        store._verify_certificate(
+            replace(
+                certificate,
+                issued_at=NOW + timedelta(seconds=1),
+                expires_at=NOW + timedelta(minutes=1),
+            ),
+            target,
+            database_now=NOW,
+        )
+    with pytest.raises(CertificateError, match="validity interval"):
+        store._verify_certificate(
+            replace(certificate, expires_at=certificate.issued_at),
+            target,
+            database_now=NOW,
+        )
 
     approval = authority.issue(certificate, target, approved_by="reviewer")
+    store.approval_secret = b"approval-secret"
     store._verify_approval(approval, certificate, target, now=NOW)
     with pytest.raises(ApprovalError, match="invalid"):
         store._verify_approval(object(), certificate, target, now=NOW)  # type: ignore[arg-type]
@@ -335,7 +357,6 @@ def test_certificate_and_approval_verifier_guards() -> None:
         )
     with pytest.raises(ApprovalError, match="expired"):
         store._verify_approval(replace(approval, expires_at=NOW), certificate, target, now=NOW)
-    store.approval_secret = b"approval-secret"
     with pytest.raises(ApprovalError, match="signature"):
         store._verify_approval(replace(approval, mac="bad"), certificate, target, now=NOW)
     store._verify_approval(approval, certificate, target, now=NOW)
@@ -346,7 +367,14 @@ async def test_manual_cas_success_and_input_conflicts() -> None:
     certificate, target, _authority = _certificate()
     del certificate
     connection = _ConnectionDouble()
-    store = _store(connection)
+    store = PostgresPromotionStore(
+        _FakePool(connection),
+        tenant_id="tenant-a",
+        receipt_signing_key=Ed25519PrivateKey.generate(),
+        receipt_key_id="bootstrap-key",
+        bootstrap_mode=True,
+        clock=lambda: NOW,
+    )
     _seed(connection, target)
     receipt = await store.compare_and_swap(
         target.address,
@@ -357,7 +385,14 @@ async def test_manual_cas_success_and_input_conflicts() -> None:
     assert await store.get(target) is not None
 
     fresh = _ConnectionDouble()
-    fresh_store = _store(fresh)
+    fresh_store = PostgresPromotionStore(
+        _FakePool(fresh),
+        tenant_id="tenant-a",
+        receipt_signing_key=Ed25519PrivateKey.generate(),
+        receipt_key_id="bootstrap-key",
+        bootstrap_mode=True,
+        clock=lambda: NOW,
+    )
     with pytest.raises(PromotionCASConflict, match="integer"):
         await fresh_store.compare_and_swap(
             target, new_active_capsule=CANDIDATE, control_version=True
@@ -404,20 +439,20 @@ async def test_certificate_cas_scope_candidate_precondition_and_approval_guards(
     connection = _ConnectionDouble()
     store = _store(connection)
     store.certificate_verifier = _FixedVerifier(VerificationResult(True))  # type: ignore[assignment]
-    with pytest.raises(ApprovalError, match="consumed"):
+    with pytest.raises(ApprovalError, match="verifiable"):
         await store.compare_and_swap(target, certificate=certificate)
 
     connection = _ConnectionDouble()
     store = _store(connection)
     store.certificate_verifier = _FixedVerifier(VerificationResult(True))  # type: ignore[assignment]
-    receipt = await store.compare_and_swap(
-        target,
-        certificate=certificate,
-        approval_consumed=True,
-        approval_id="review-1",
-    )
-    assert connection.uses[("tenant-a", "cert-1")]["approval_id"] == "review-1"
-    assert receipt.control_version == 1
+    with pytest.raises(ApprovalError, match="verifiable"):
+        await store.compare_and_swap(
+            target,
+            certificate=certificate,
+            approval_consumed=True,
+            approval_id="review-1",
+        )
+    assert not connection.uses
 
 
 @pytest.mark.asyncio
@@ -446,7 +481,14 @@ async def test_certificate_use_repeat_and_unique_violation_are_fenced() -> None:
 async def test_cas_update_conflict_and_persisted_receipt_validation() -> None:
     connection = _ConnectionDouble()
     connection.fail_pointer_update = True
-    store = _store(connection)
+    store = PostgresPromotionStore(
+        _FakePool(connection),
+        tenant_id="tenant-a",
+        receipt_signing_key=Ed25519PrivateKey.generate(),
+        receipt_key_id="bootstrap-key",
+        bootstrap_mode=True,
+        clock=lambda: NOW,
+    )
     _certificate_value, target, _authority = _certificate()
     with pytest.raises(PromotionCASConflict, match="during CAS"):
         await store.compare_and_swap(target, new_active_capsule=CANDIDATE)

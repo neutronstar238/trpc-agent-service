@@ -85,7 +85,7 @@ class SessionReadyDelivery:
 
 
 class SessionReadyCodec:
-    """Encode/decode the seven-field v2 payload without a JSON envelope."""
+    """Encode/decode the eight-field v2 payload without a JSON envelope."""
 
     @staticmethod
     def encode(message: SessionReady) -> dict[str, str]:

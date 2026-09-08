@@ -513,7 +513,7 @@ class CellRuntimeJournal:
                 "tool.intent.shadow",
             ),
             payload={
-                "intent_id": intent_id,
+                "intent_id_commitment": self._private_hash(intent_id),
                 "tool_name": tool_name,
                 "arguments_commitment": self._private_hash(
                     {"source_digest": arguments_hash, "tool_name": tool_name}

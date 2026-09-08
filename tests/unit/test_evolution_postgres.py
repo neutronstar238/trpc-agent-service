@@ -14,8 +14,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from trpc_service.cell.events import CellAddress, NamespaceViolation
 from trpc_service.cell.evolution import (
+    ApprovalError,
+    CertificateError,
     CertificateVerifier,
     EvolutionCertificate,
+    JudgePolicy,
     PromotionAlreadyUsed,
     PromotionApprovalAuthority,
     PromotionCASConflict,
@@ -249,7 +252,7 @@ def _certificate() -> tuple[EvolutionCertificate, PromotionTarget, PromotionAppr
         tool_manifest_digest="tools",
         reducer_id="reducer",
         evidence_digest="sha256:" + "f" * 64,
-        judge_policy={},
+        judge_policy=JudgePolicy().to_dict(),
         expected_active_capsule=source,
         control_version=0,
         signing_key_id="judge",
@@ -273,6 +276,9 @@ def _store(connection: _FakeConnection) -> PostgresPromotionStore:
         tenant_id="tenant-a",
         receipt_signing_key=Ed25519PrivateKey.generate(),
         receipt_key_id="online-key",
+        candidate_head_reader=lambda _connection, address: (
+            "sha256:" + ("d" if address.branch_id == "main" else "e") * 64
+        ),
         clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
     )
 
@@ -290,6 +296,15 @@ async def test_pointer_cas_consumes_use_and_writes_receipt_outbox_atomically() -
         {"judge": judge_key.public_key()}, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)
     )
     approval = authority.issue(certificate, target, approved_by="reviewer")
+    seen_connections: list[object] = []
+    seen_addresses: list[CellAddress] = []
+
+    def read_head(connection: object, address: CellAddress) -> str:
+        seen_connections.append(connection)
+        seen_addresses.append(address)
+        return "sha256:" + ("d" if address.branch_id == "main" else "e") * 64
+
+    store.candidate_head_reader = read_head
     store.approval_secret = b"approval-secret"
     receipt = await store.compare_and_swap(
         target,
@@ -301,9 +316,98 @@ async def test_pointer_cas_consumes_use_and_writes_receipt_outbox_atomically() -
     assert len(connection.receipts) == 1
     assert len(connection.outbox) == 1
     assert (await store.get(target)).active_capsule_digest == certificate.candidate_capsule_digest  # type: ignore[union-attr]
+    assert seen_connections == [connection, connection]
+    assert seen_addresses == [certificate.source_address, certificate.candidate_address]
 
     with pytest.raises(PromotionCASConflict):
         await store.compare_and_swap(target, certificate=certificate, approval=approval)
+
+
+@pytest.mark.asyncio
+async def test_production_path_rechecks_candidate_head_and_rejects_boolean_approval() -> None:
+    connection = _FakeConnection()
+    certificate, target, authority = _certificate()
+    judge_key = Ed25519PrivateKey.generate()
+    certificate = certificate.with_signature(judge_key)
+    store = _store(connection)
+    store.certificate_verifier = CertificateVerifier(
+        {"judge": judge_key.public_key()}, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    store.approval_secret = b"approval-secret"
+
+    with pytest.raises(ApprovalError, match="verifiable"):
+        await store.compare_and_swap(target, certificate=certificate, approval_consumed=True)
+    assert not connection.uses
+
+    approval = authority.issue(certificate, target, approved_by="reviewer")
+
+    def candidate_drift(_connection: object, address: CellAddress) -> str:
+        return "sha256:" + ("d" if address == certificate.source_address else "f") * 64
+
+    store.candidate_head_reader = candidate_drift
+    with pytest.raises(PromotionCASConflict, match="candidate branch head"):
+        await store.compare_and_swap(target, certificate=certificate, approval=approval)
+    assert not connection.uses
+
+    def source_drift(_connection: object, address: CellAddress) -> str:
+        return "sha256:" + ("f" if address == certificate.source_address else "e") * 64
+
+    store.candidate_head_reader = source_drift
+    with pytest.raises(PromotionCASConflict, match="source branch head"):
+        await store.compare_and_swap(target, certificate=certificate, approval=approval)
+    assert not connection.uses
+
+
+@pytest.mark.asyncio
+async def test_production_path_requires_persistent_approval_verifier_and_candidate_reader() -> None:
+    connection = _FakeConnection()
+    certificate, target, authority = _certificate()
+    judge_key = Ed25519PrivateKey.generate()
+    certificate = certificate.with_signature(judge_key)
+    store = _store(connection)
+    store.certificate_verifier = CertificateVerifier(
+        {"judge": judge_key.public_key()}, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    approval = authority.issue(certificate, target, approved_by="reviewer")
+    store.approval_secret = None
+    with pytest.raises(ApprovalError, match="persistent approval verifier"):
+        await store.compare_and_swap(target, certificate=certificate, approval=approval)
+
+    store.approval_secret = b""
+    with pytest.raises(ApprovalError, match="persistent approval verifier"):
+        await store.compare_and_swap(target, certificate=certificate, approval=approval)
+
+    store.approval_secret = b"approval-secret"
+    store.candidate_head_reader = None
+    with pytest.raises(CertificateError, match="candidate head verifier"):
+        await store.compare_and_swap(target, certificate=certificate, approval=approval)
+
+
+@pytest.mark.asyncio
+async def test_production_path_rechecks_certificate_expiry_with_database_clock() -> None:
+    connection = _FakeConnection()
+    certificate, target, authority = _certificate()
+    judge_key = Ed25519PrivateKey.generate()
+    certificate = replace(
+        certificate,
+        expires_at=datetime(2026, 1, 1, 1, tzinfo=UTC),
+        signature="",
+    ).with_signature(judge_key)
+    # The verifier's Pod clock is still before expiry, while PostgreSQL has
+    # already advanced past it.  The durable transaction must fail closed.
+    connection.now = datetime(2026, 1, 1, 2, tzinfo=UTC)
+    store = _store(connection)
+    store.certificate_verifier = CertificateVerifier(
+        {"judge": judge_key.public_key()},
+        clock=lambda: datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
+    )
+    store.approval_secret = b"approval-secret"
+    approval = authority.issue(certificate, target, approved_by="reviewer")
+
+    with pytest.raises(CertificateError, match="database clock"):
+        await store.compare_and_swap(target, certificate=certificate, approval=approval)
+    assert not connection.receipts
+    assert not connection.uses
 
 
 @pytest.mark.asyncio

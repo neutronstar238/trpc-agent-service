@@ -622,61 +622,16 @@ class PostgresExecutionLedger(_TenantStore):
         async with self._transaction(tenant_id) as connection:
             rows = await connection.fetch(
                 """
-                WITH candidates AS (
-                    SELECT execution.tenant_id,execution.execution_key,
-                           execution.turn_id
-                      FROM tool_executions AS execution
-                      JOIN session_turns AS turn
-                        ON turn.tenant_id=execution.tenant_id
-                       AND turn.turn_id=execution.turn_id
-                      JOIN sessions AS session
-                        ON session.tenant_id=turn.tenant_id
-                       AND session.session_id=turn.session_id
-                     WHERE execution.tenant_id=$1
-                       AND execution.status IN ('ambiguous','unknown')
-                       AND (
-                           execution.reconciliation_lease_expires_at IS NULL
-                           OR execution.reconciliation_lease_expires_at <= clock_timestamp()
-                       )
-                     ORDER BY execution.started_at,execution.execution_key
-                     FOR UPDATE OF execution SKIP LOCKED
-                     LIMIT $2
-                ), claimed AS (
-                    UPDATE tool_executions AS execution
-                       SET reconciliation_owner=$3,
-                           reconciliation_epoch=execution.reconciliation_epoch+1,
-                           reconciliation_lease_expires_at=(
-                               clock_timestamp() + ($4::double precision * interval '1 second')
-                           )
-                      FROM candidates
-                     WHERE execution.tenant_id=candidates.tenant_id
-                       AND execution.execution_key=candidates.execution_key
-                     RETURNING execution.tenant_id,execution.execution_key,
-                               execution.turn_id,execution.tool_name,
-                               execution.arguments_hash,execution.status,
-                               execution.attempt,execution.reconciliation_owner,
-                               execution.reconciliation_epoch,
-                               execution.reconciliation_lease_expires_at,
-                               execution.started_at,execution.lease_owner,
-                               execution.lease_epoch,execution.error_type,
-                               execution.completed_at
-                )
-                SELECT claimed.tenant_id,claimed.execution_key,
-                       claimed.turn_id,claimed.tool_name,
-                       claimed.arguments_hash,claimed.status,
-                       claimed.attempt,claimed.reconciliation_owner,
-                       claimed.reconciliation_epoch,
-                       claimed.reconciliation_lease_expires_at,
-                       claimed.started_at,claimed.lease_owner,
-                       claimed.lease_epoch,claimed.error_type,
-                       claimed.completed_at,turn.session_id,session.app_id
-                  FROM claimed
-                  JOIN session_turns AS turn
-                    ON turn.tenant_id=claimed.tenant_id
-                   AND turn.turn_id=claimed.turn_id
-                  JOIN sessions AS session
-                    ON session.tenant_id=turn.tenant_id
-                   AND session.session_id=turn.session_id
+                -- claim_tool_execution_ambiguous performs the tenant-scoped
+                -- FOR UPDATE OF execution SKIP LOCKED CAS under its owner.
+                SELECT tenant_id,execution_key,turn_id,tool_name,
+                       arguments_hash,status,attempt,reconciliation_owner,
+                       reconciliation_epoch,reconciliation_lease_expires_at,
+                       started_at,lease_owner,lease_epoch,error_type,
+                       completed_at,session_id,app_id
+                  FROM public.claim_tool_execution_ambiguous(
+                       $1,$2,$3,$4
+                  )
                 """,
                 tenant_id,
                 limit,
@@ -732,6 +687,11 @@ class PostgresExecutionLedger(_TenantStore):
             tenant_id=tenant_id,
             expected_attempt=expected_attempt,
         )
+        # An entirely omitted claim is allowed long enough to discover an
+        # exact terminal duplicate (which is read-only).  If callers provide
+        # either half of a claim, validate its shape before touching the
+        # database so malformed claims fail deterministically even when the
+        # execution row is absent.
         if claim_owner is not None or claim_epoch is not None:
             _validate_reconciliation_owner(claim_owner)
             if isinstance(claim_epoch, bool) or not isinstance(claim_epoch, int) or claim_epoch < 1:
@@ -741,9 +701,7 @@ class PostgresExecutionLedger(_TenantStore):
                 """
                 SELECT execution_key,status,attempt,reconciliation_owner,
                        reconciliation_epoch,reconciliation_lease_expires_at
-                  FROM tool_executions
-                 WHERE tenant_id=$1 AND execution_key=$2
-                 FOR UPDATE
+                  FROM public.lock_tool_execution_reconciliation($1,$2)
                 """,
                 tenant_id,
                 execution_key,
@@ -763,28 +721,58 @@ class PostgresExecutionLedger(_TenantStore):
                 raise ReconciliationConflict(
                     "only ambiguous or unknown executions may be reconciled"
                 )
-            if claim_owner is not None or claim_epoch is not None:
-                if (
-                    _row_value(current, "reconciliation_owner") != claim_owner
-                    or _row_int(current, "reconciliation_epoch", 0) != claim_epoch
-                    or not _lease_is_valid(current)
-                ):
-                    raise ReconciliationConflict("reconciliation claim is stale")
-
             target_status = reconciliation_status(evidence.outcome)
             previous = await connection.fetchrow(
                 """
-                SELECT outcome
+                SELECT outcome,evidence_digest
                   FROM tool_execution_reconciliations
                  WHERE tenant_id=$1 AND execution_key=$2 AND attempt=$3
-                   AND outcome IN ('applied','not_applied')
-                 ORDER BY observed_at DESC,reconciliation_id DESC
+                   AND (
+                       evidence_digest=$4
+                       OR outcome IN ('applied','not_applied')
+                   )
+                 ORDER BY CASE WHEN evidence_digest=$4 THEN 0 ELSE 1 END,
+                          observed_at DESC,reconciliation_id DESC
                  LIMIT 1
                 """,
                 tenant_id,
                 execution_key,
                 expected_attempt,
+                evidence.evidence_digest,
             )
+            exact_duplicate = (
+                previous is not None
+                and _row_value(previous, "evidence_digest") == evidence.evidence_digest
+            )
+            if exact_duplicate:
+                if _row_value(previous, "outcome") != evidence.outcome.value:
+                    raise ReconciliationConflict("reconciliation evidence conflicts")
+                if status == target_status:
+                    return ExecutionRecord(
+                        execution_key,
+                        status,
+                        attempt=current_attempt,
+                    )
+                if status in {ExecutionStatus.SUCCEEDED, ExecutionStatus.FAILED}:
+                    raise ReconciliationConflict(
+                        "reconciliation evidence conflicts with final execution state"
+                    )
+
+            _validate_reconciliation_owner(claim_owner)
+            if isinstance(claim_epoch, bool) or not isinstance(claim_epoch, int) or claim_epoch < 1:
+                raise ReconciliationConflict("reconciliation claim epoch is invalid")
+            if (
+                _row_value(current, "reconciliation_owner") != claim_owner
+                or _row_int(current, "reconciliation_epoch", 0) != claim_epoch
+                or not _lease_is_valid(current)
+            ):
+                raise ReconciliationConflict("reconciliation claim is stale")
+            if exact_duplicate:
+                return ExecutionRecord(
+                    execution_key,
+                    status,
+                    attempt=current_attempt,
+                )
             previous_outcome = _row_value(previous, "outcome") if previous else None
             if previous_outcome is not None:
                 previous_status = reconciliation_status(
@@ -797,6 +785,15 @@ class PostgresExecutionLedger(_TenantStore):
                     raise ReconciliationConflict(
                         "reconciliation evidence conflicts with final execution state"
                     )
+                # Terminal rows are authoritative and read-only.  Only the
+                # exact evidence duplicate above is replayable; a new proof
+                # with the same conclusion must not append unbounded audit
+                # records after the reconciliation fence is gone.
+                return ExecutionRecord(
+                    execution_key,
+                    status,
+                    attempt=current_attempt,
+                )
 
             inserted = await connection.fetchval(
                 """
@@ -843,39 +840,20 @@ class PostgresExecutionLedger(_TenantStore):
 
             updated = await connection.fetchrow(
                 """
-                UPDATE tool_executions
-                   SET status=$4,
-                       reconciliation_outcome=$5,
-                       reconciliation_evidence_digest=$6,
-                       reconciled_at=$7,
-                       reconciliation_owner=NULL,
-                       reconciliation_lease_expires_at=NULL,
-                       completed_at=CASE
-                           WHEN $4 IN ('succeeded','failed') THEN $7
-                           ELSE completed_at
-                       END
-                 WHERE tenant_id=$1 AND execution_key=$2
-                   AND attempt=$3
-                   AND status IN ('ambiguous','unknown')
-                   AND (
-                       $8::text IS NULL
-                       OR (
-                           reconciliation_owner=$8
-                           AND reconciliation_epoch=$9
-                           AND reconciliation_lease_expires_at > clock_timestamp()
-                       )
-                   )
-                 RETURNING execution_key,status,attempt
+                SELECT execution_key,status,attempt
+                  FROM public.reconcile_tool_execution_cas(
+                       $1,$2,$3,$4,$5,$6,$7,$8,$9
+                  )
                 """,
                 tenant_id,
                 execution_key,
                 expected_attempt,
+                claim_owner,
+                claim_epoch,
                 target_status.value,
                 evidence.outcome.value,
                 evidence.evidence_digest,
                 evidence.observed_at,
-                claim_owner,
-                claim_epoch,
             )
             if updated is None:
                 # A terminal row may have been finalized by a concurrent

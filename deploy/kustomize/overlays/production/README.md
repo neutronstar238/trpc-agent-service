@@ -84,6 +84,24 @@ kubectl kustomize deploy/kustomize/overlays/production
 kubectl apply --server-side -k deploy/kustomize/overlays/production
 ```
 
+## Migration Job reruns
+
+`trpc-schema-migration` is a fixed-name, one-shot Job. A rerun must delete and recreate that Job;
+do not patch an existing Job's image, command, or environment because Kubernetes treats those pod-template
+fields as immutable. In the reviewed production namespace, first verify the candidate image digest and
+migration Secret, then run:
+
+```bash
+kubectl delete job trpc-schema-migration --ignore-not-found
+kubectl apply --server-side -k deploy/kustomize/overlays/production
+kubectl wait --for=condition=complete job/trpc-schema-migration --timeout=30m
+```
+
+After completion, verify `alembic_version` equals the single repository head before restoring or scaling
+application Deployments. Never reuse this fixed Job against a shared development database; use a disposable
+namespace and the dedicated `migrate` role. The Argo hook's `BeforeHookCreation` policy follows the same
+delete-before-recreate rule but does not replace the operator's digest, Secret, and head checks.
+
 ## Scheduler version changes
 
 The production ConfigMap is pinned to scheduler `v2` and the matching

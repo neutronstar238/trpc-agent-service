@@ -359,6 +359,8 @@ def test_judge_policy_rejects_invalid_bounds_and_duplicate_expected_ids(
         JudgePolicy(expected_sample_ids=("one", "one"))
     with pytest.raises(EvolutionValidationError):
         JudgePolicy(high_risk_findings=("",))
+    with pytest.raises(EvolutionValidationError, match="must be boolean"):
+        JudgePolicy(require_strict_improvement=cast(Any, 0))
 
 
 def test_judge_covers_each_hard_gate_and_pareto_fallback() -> None:
@@ -427,6 +429,10 @@ def test_certificate_constructor_and_serialization_reject_all_structural_tamperi
     assert cert.signing_bytes()
     assert "signature" not in cert.to_dict(include_signature=False)
     assert EvolutionCertificate.from_dict(cert.to_dict()) == cert
+    assert CertificateVerifier({"coverage-judge": key.public_key()}).verify(cert, target).valid
+    exposed_expected = cast(list[str], cert.judge_policy["expected_sample_ids"])
+    exposed_expected.append("tampered")
+    assert cert.judge_policy["expected_sample_ids"] == []
     assert CertificateVerifier({"coverage-judge": key.public_key()}).verify(cert, target).valid
 
     invalids = [
@@ -500,25 +506,62 @@ def test_certificate_verifier_covers_target_forms_and_rejection_reasons() -> Non
     verifier = CertificateVerifier(
         {"coverage-judge": key.public_key()}, clock=lambda: cert.issued_at
     )
-    assert verifier.verify(cert, address).valid
+    address_only = verifier.verify(cert, address)
+    assert not address_only.valid
+    assert "observed active Capsule" in address_only.reason
     assert verifier.verify(cert, target.to_dict()).valid
     assert verifier.verify(
         cert,
         {**target.to_dict(), "expected_active_capsule": target.active_capsule_digest},
     ).valid
-    assert verifier.verify(cert, {"address": _address_dict(address)}).valid
+    mapping_without_state = verifier.verify(cert, {"address": _address_dict(address)})
+    assert not mapping_without_state.valid
+    assert "observed active Capsule" in mapping_without_state.reason
     assert not verifier.verify(cast(Any, object()), target).valid
     assert not verifier.verify(cert, cast(Any, object())).valid
     assert not verifier.verify(
         cert, replace(target, address=replace(address, cell_id="other"))
     ).valid
     assert not verifier.verify(cert, replace(target, active_capsule_digest=HASH_C)).valid
+    stale_baseline = replace(
+        cert,
+        expected_active_capsule=HASH_C,
+        signature="",
+    ).with_signature(key)
+    result = verifier.verify(stale_baseline, replace(target, active_capsule_digest=HASH_C))
+    assert not result.valid
+    assert "baseline Capsule" in result.reason
     assert not verifier.verify(cert, replace(target, control_version=1)).valid
     expired = replace(
-        cert, expires_at=cert.issued_at - timedelta(seconds=1), signature=""
+        cert,
+        issued_at=cert.issued_at - timedelta(minutes=2),
+        expires_at=cert.issued_at - timedelta(seconds=1),
+        signature="",
     ).with_signature(key)
     expired_result = verifier.verify(expired, target)
     assert not expired_result.valid and "expired" in expired_result.reason
+    future = replace(
+        cert,
+        issued_at=cert.issued_at + timedelta(minutes=1),
+        expires_at=cert.expires_at + timedelta(minutes=1),
+        signature="",
+    ).with_signature(key)
+    future_result = verifier.verify(future, target)
+    assert not future_result.valid and "not valid yet" in future_result.reason
+    invalid_interval = replace(cert, expires_at=cert.issued_at, signature="").with_signature(key)
+    interval_result = verifier.verify(invalid_interval, target)
+    assert not interval_result.valid and "validity interval" in interval_result.reason
+    weak_policy = replace(
+        cert,
+        judge_policy=JudgePolicy(require_strict_improvement=False).to_dict(),
+        signature="",
+    ).with_signature(key)
+    policy_result = verifier.verify(weak_policy, target)
+    assert not policy_result.valid and "strict Pareto" in policy_result.reason
+    naive_clock = CertificateVerifier(
+        {"coverage-judge": key.public_key()}, clock=lambda: datetime(2026, 1, 1)
+    )
+    assert "timezone-aware" in naive_clock.verify(cert, target).reason
     bad_key = CertificateVerifier({"other": key.public_key()})
     assert not bad_key.verify(cert, target).valid
     bad_signature = replace(cert, evidence_digest=HASH_C)
@@ -684,7 +727,7 @@ def test_promotion_target_rejects_non_main_or_wildcard(value: CellAddress) -> No
 def test_promotion_store_initial_mapping_get_and_manual_cas_guards() -> None:
     _store, _coordinator, address, source, candidate, _run, _key, _cert, _target = _certified()
     target = PromotionTarget(address, source.digest or source.content_digest)
-    mapped = PromotionStore(initial={"cell": target})
+    mapped = PromotionStore(initial={"cell": target}, bootstrap_mode=True)
     assert mapped.get(address) == target
     assert mapped.current(target) == target
     missing = PromotionTarget(
@@ -698,7 +741,7 @@ def test_promotion_store_initial_mapping_get_and_manual_cas_guards() -> None:
         HASH_A,
     )
     assert mapped.get(missing) is None
-    with pytest.raises(PromotionCASConflict):
+    with pytest.raises(CertificateError, match="certificate"):
         PromotionStore().compare_and_swap(address, new_active_capsule=HASH_B)
     with pytest.raises(PromotionError):
         mapped.compare_and_swap(target, new_active_capsule=None)
@@ -728,6 +771,13 @@ def test_promotion_store_certificate_guards_and_receipt_verification() -> None:
     store = PromotionStore(initial=(target,))
     with pytest.raises(PromotionError):
         store.compare_and_swap(target, new_active_capsule=candidate.digest, certificate=cert)
+    with pytest.raises(ApprovalError, match="verifiable manual approval"):
+        store.compare_and_swap(
+            target,
+            new_active_capsule=candidate.digest,
+            certificate=cert,
+            approval_consumed=True,
+        )
     with pytest.raises(PromotionError):
         store.compare_and_swap(
             target,
@@ -774,6 +824,7 @@ def test_promotion_store_certificate_guards_and_receipt_verification() -> None:
         target,
         new_active_capsule=candidate.digest,
         certificate=cert,
+        approval=approval,
         approval_consumed=True,
     )
     assert receipt.signature
@@ -800,7 +851,7 @@ def test_promotion_store_certificate_guards_and_receipt_verification() -> None:
 
 def test_promotion_store_rollback_checks_pointer_receipt_and_caller_cas() -> None:
     _store, _coordinator, _address, source, candidate, _run, _key, _cert, target = _certified()
-    store = PromotionStore(initial=(target,))
+    store = PromotionStore(initial=(target,), bootstrap_mode=True)
     receipt = store.compare_and_swap(target, new_active_capsule=candidate.digest)
     with pytest.raises(PromotionReceiptError):
         store.rollback(cast(Any, object()))
@@ -810,7 +861,7 @@ def test_promotion_store_rollback_checks_pointer_receipt_and_caller_cas() -> Non
         store.rollback(receipt, expected_active_capsule=source.digest)
     with pytest.raises(PromotionCASConflict):
         store.rollback(receipt, expected_control_version=0)
-    store2 = PromotionStore(initial=(target,))
+    store2 = PromotionStore(initial=(target,), bootstrap_mode=True)
     receipt2 = store2.compare_and_swap(target, new_active_capsule=candidate.digest)
     store2.compare_and_swap(
         store2.get(target),  # type: ignore[arg-type]
@@ -881,6 +932,12 @@ def test_coordinator_create_fork_and_lookup_reject_invalid_inputs() -> None:
         )
     with pytest.raises(EvolutionValidationError):
         coordinator.create_run(address, candidate_capsule=candidate, ttl_seconds=0)
+    with pytest.raises(EvolutionValidationError, match="baseline Capsule"):
+        coordinator.create_run(
+            address,
+            candidate_capsule=candidate,
+            expected_active_capsule=HASH_C,
+        )
     with pytest.raises(EvolutionValidationError):
         coordinator.create_run(
             address,
@@ -1018,6 +1075,16 @@ def test_coordinator_shadow_rejects_unsafe_and_mismatched_bundles() -> None:
 
 def test_issue_certificate_rejects_judge_and_invalid_expiry_then_promotes() -> None:
     _store, coordinator, _address, _source, _candidate, run = _sealed()
+    with pytest.raises(CertificateError, match="strict Pareto"):
+        coordinator.issue_certificate(
+            run,
+            JudgePolicy(require_strict_improvement=False),
+            Ed25519PrivateKey.generate(),
+            signing_key_id="judge",
+        )
+    assert coordinator.get_run(run.run_id).state is EvolutionState.EVIDENCE_SEALED
+
+    _store, coordinator, _address, _source, _candidate, run = _sealed()
     with pytest.raises(CertificateError):
         coordinator.issue_certificate(
             run,
@@ -1142,6 +1209,9 @@ def test_remaining_constructor_and_target_branches_are_fail_closed(monkeypatch: 
         PromotionApprovalAuthority()
     monkeypatch.undo()
 
+    with pytest.raises(ApprovalError, match="cannot be empty"):
+        PromotionApprovalAuthority(b"")
+
     authority = PromotionApprovalAuthority(b"remaining-branches")
     by_address = authority.issue(cert, target.address, approved_by="reviewer")
     by_mapping = authority.issue(
@@ -1156,7 +1226,7 @@ def test_remaining_constructor_and_target_branches_are_fail_closed(monkeypatch: 
 
 def test_remaining_cas_and_rollback_pointer_branches_are_exercised() -> None:
     _store, _coordinator, address, source, candidate, _run, _key, cert, target = _certified()
-    store = PromotionStore(initial=(target,))
+    store = PromotionStore(initial=(target,), bootstrap_mode=True)
     inferred = store.compare_and_swap(
         target,
         new_active_capsule=None,
@@ -1166,7 +1236,7 @@ def test_remaining_cas_and_rollback_pointer_branches_are_exercised() -> None:
     assert inferred.active_capsule == candidate.digest
 
     _store, _coordinator, _address, _source, _candidate, _run, _key, cert, target = _certified()
-    version_store = PromotionStore(initial=(target,))
+    version_store = PromotionStore(initial=(target,), bootstrap_mode=True)
     with pytest.raises(PromotionCASConflict):
         version_store.compare_and_swap(
             target,
@@ -1176,13 +1246,13 @@ def test_remaining_cas_and_rollback_pointer_branches_are_exercised() -> None:
             approval_consumed=True,
         )
 
-    missing_store = PromotionStore(initial=(target,))
+    missing_store = PromotionStore(initial=(target,), bootstrap_mode=True)
     receipt = missing_store.compare_and_swap(target, new_active_capsule=candidate.digest)
     del missing_store._pointers[missing_store._key(target.address)]
     with pytest.raises(PromotionReceiptError):
         missing_store.rollback(receipt)
 
-    stale_store = PromotionStore(initial=(target,))
+    stale_store = PromotionStore(initial=(target,), bootstrap_mode=True)
     stale_receipt = stale_store.compare_and_swap(target, new_active_capsule=candidate.digest)
     current = stale_store.get(target)
     assert current is not None

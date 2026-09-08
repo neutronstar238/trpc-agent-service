@@ -8,7 +8,7 @@ The gate is deliberately conservative:
 * ``--execute`` is required before a cluster can be created or changed and is
   restricted to the exact ``kind-<cluster-name>`` context;
 * the report binds the checkout SHA, source fingerprint, immutable image
-  digest (when available) and Kubernetes cluster UID;
+  digest (when available) and a cluster-instance fingerprint;
 * a local kind pass is never reported as an ACK/production pass.
 
 The live scenarios run the candidate image itself as short-lived acceptance
@@ -37,16 +37,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+yaml: Any = None
 try:
-    import yaml
+    import yaml as _yaml
 except ImportError:  # pragma: no cover - exercised only without the dev extra
-    yaml = None
+    pass
+else:
+    yaml = _yaml
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.evidence_lineage import source_fingerprint
-from scripts.report_io import atomic_write_json
+from scripts.evidence_lineage import source_fingerprint  # noqa: E402
+from scripts.report_io import atomic_write_json  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 KIND_DIR = ROOT / "deploy" / "kind"
@@ -64,11 +67,12 @@ SAFE_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_:@-]{0,255}$")
 DEFAULT_KUSTOMIZE_IMAGE = "docker.io/example/trpc-agent-service:kind"
 IMAGE_SOURCE_FINGERPRINT_LABEL = "io.trpc.agent-service.source-fingerprint"
 SOURCE_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+SAFE_EXCEPTION_TYPE_RE = re.compile(r"^[A-Z][A-Za-z0-9_]{0,126}(?:Error|Exception)$")
 KIND_NODE_ROLE_LABEL = "trpc.io/node-role"
 KIND_POOL_LABEL = "trpc.io/kind-pool"
 KIND_WORKER_POOL_NAMES = frozenset({"gateway", "support"})
 SCHEMA_MIGRATION_JOB_NAME = "trpc-schema-migration"
-EXPECTED_ALEMBIC_HEAD = "0028_evolution_least_privilege"
+EXPECTED_ALEMBIC_HEAD = "0029_reconciliation_security_hardening"
 ALEMBIC_REVISION_RE = re.compile(r"^[0-9]{4}_[a-z0-9_]+$")
 REQUIRED_DEPLOYMENTS = {
     "trpc-gateway": 2,
@@ -79,6 +83,7 @@ REQUIRED_DEPLOYMENTS = {
     "trpc-post-turn-projector": 1,
     "trpc-session-recovery": 2,
     "trpc-backlog-exporter": 1,
+    "trpc-wecom-connector": 1,
 }
 REQUIRED_OBJECTS = {
     ("StatefulSet", "kind-postgres"),
@@ -89,6 +94,7 @@ REQUIRED_OBJECTS = {
     ("Service", "redis"),
     ("Service", "kind-fake-provider"),
     ("Service", "kind-fake-im"),
+    ("NetworkPolicy", "kind-allow-evolution-driver-to-postgres"),
     ("Job", "trpc-schema-migration"),
 }
 SCENARIO_PLAN = {
@@ -128,6 +134,13 @@ SCENARIO_PLAN = {
             "while applications recover"
         ),
         "fault": "database Pod failure and connection pool recovery",
+    },
+    "redis_pod_replacement": {
+        "assertion": (
+            "Redis replacement keeps the same PVC, preserves a sentinel and accepts a fresh "
+            "RedisStreamQueue probe"
+        ),
+        "fault": "Redis Pod failure, AOF recovery and client reconnect",
     },
 }
 
@@ -321,13 +334,47 @@ def _manifest_inventory(documents: list[dict[str, Any]]) -> dict[str, Any]:
                 pod_spec = template.get("spec")
         if isinstance(pod_spec, dict) and pod_spec.get("hostNetwork"):
             insecure.append(f"{kind}/{name}:hostNetwork")
+        candidate_workload = (kind == "Deployment" and name in REQUIRED_DEPLOYMENTS) or (
+            kind == "Job" and name == SCHEMA_MIGRATION_JOB_NAME
+        )
+        if candidate_workload and not isinstance(pod_spec, dict):
+            insecure.append(f"{kind}/{name}:podSpec")
+        if candidate_workload and isinstance(pod_spec, dict):
+            pod_security = pod_spec.get("securityContext")
+            pod_security = pod_security if isinstance(pod_security, dict) else {}
+            if pod_spec.get("automountServiceAccountToken") is not False:
+                insecure.append(f"{kind}/{name}:serviceAccountToken")
+            if pod_security.get("runAsNonRoot") is not True:
+                insecure.append(f"{kind}/{name}:runAsNonRoot")
+            seccomp = pod_security.get("seccompProfile")
+            seccomp = seccomp if isinstance(seccomp, dict) else {}
+            if seccomp.get("type") != "RuntimeDefault":
+                insecure.append(f"{kind}/{name}:seccompProfile")
         containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
+        if candidate_workload and not isinstance(containers, list):
+            insecure.append(f"{kind}/{name}:containers")
         if isinstance(containers, list):
             for container in containers:
-                if isinstance(container, dict) and container.get("securityContext", {}).get(
-                    "privileged"
-                ):
+                if not isinstance(container, dict):
+                    continue
+                container_security = container.get("securityContext")
+                container_security = (
+                    container_security if isinstance(container_security, dict) else {}
+                )
+                if container_security.get("privileged"):
                     insecure.append(f"{kind}/{name}:privileged")
+                if candidate_workload:
+                    container_name = container.get("name", "<unknown>")
+                    prefix = f"{kind}/{name}:{container_name}"
+                    if container_security.get("allowPrivilegeEscalation") is not False:
+                        insecure.append(f"{prefix}:allowPrivilegeEscalation")
+                    if container_security.get("readOnlyRootFilesystem") is not True:
+                        insecure.append(f"{prefix}:readOnlyRootFilesystem")
+                    capabilities = container_security.get("capabilities")
+                    capabilities = capabilities if isinstance(capabilities, dict) else {}
+                    dropped = capabilities.get("drop")
+                    if not isinstance(dropped, list) or "ALL" not in dropped:
+                        insecure.append(f"{prefix}:capabilities")
     missing_objects = sorted(REQUIRED_OBJECTS - objects)
     missing_deployments = sorted(
         name
@@ -432,16 +479,31 @@ def _kind_cluster_exists(cluster_name: str) -> tuple[bool, str | None]:
     return cluster_name in {line.strip() for line in result.stdout.splitlines()}, None
 
 
-def _cluster_uid(context: str) -> tuple[str | None, str | None]:
+def _cluster_instance_fingerprint(context: str) -> tuple[str | None, str | None]:
+    """Return a stable fingerprint for this cluster instance.
+
+    Kubernetes does not expose a cluster UID through the namespace API.  The
+    kube-system namespace UID is an instance anchor; hash it before persisting
+    it so the report does not overclaim that it is a cluster UID.
+    """
+
     result = _kubectl(context, ["get", "namespace", "kube-system", "-o", "json"], timeout=20)
     if result.status != "pass":
-        return None, result.reason or "cluster UID query failed"
+        return None, result.reason or "cluster instance fingerprint query failed"
     try:
         payload = json.loads(result.stdout)
         uid = payload.get("metadata", {}).get("uid")
     except (json.JSONDecodeError, AttributeError):
         uid = None
-    return (uid, None) if isinstance(uid, str) and uid else (None, "cluster UID was not returned")
+    if not isinstance(uid, str) or not uid:
+        return None, "cluster instance fingerprint was not returned"
+    return hashlib.sha256(f"kube-system:{uid}".encode()).hexdigest(), None
+
+
+def _cluster_uid(context: str) -> tuple[str | None, str | None]:
+    """Compatibility wrapper for older callers; use instance fingerprint naming."""
+
+    return _cluster_instance_fingerprint(context)
 
 
 def _cluster_node_contract(context: str) -> tuple[dict[str, int], str | None]:
@@ -541,7 +603,7 @@ def _read_kind_node_inventory(context: str) -> tuple[dict[str, Any], str | None]
 def _kind_node_pool_contract(
     context: str, cluster_name: str, *, execute: bool
 ) -> tuple[str, dict[str, Any], str | None]:
-    """Label and verify the deterministic worker pools for one exact kind context."""
+    """Verify node pools declared by ``cluster.yaml`` without repairing drift."""
 
     if not execute:
         return "not_run", {}, "kind node pool labeling requires --execute"
@@ -581,61 +643,17 @@ def _kind_node_pool_contract(
     expected_pools = {
         node: "gateway" if index < 2 else "support" for index, node in enumerate(worker_nodes)
     }
-    label_commands: list[dict[str, str]] = []
-    for node, pool in expected_pools.items():
-        result = _kubectl(
-            context,
-            ["label", "node", node, f"{KIND_POOL_LABEL}={pool}", "--overwrite"],
-            timeout=30,
-        )
-        label_commands.append({"node": node, "pool": pool, "status": result.status})
-        if result.status != "pass":
-            return (
-                "fail",
-                {
-                    "control_plane_nodes": control_plane_nodes,
-                    "worker_nodes": worker_nodes,
-                    "expected_pools": expected_pools,
-                    "label_commands": label_commands,
-                },
-                result.reason or f"failed to label worker node {node}",
-            )
-
-    after, reason = _read_kind_node_inventory(context)
-    if reason:
-        return (
-            "fail",
-            {"expected_pools": expected_pools, "label_commands": label_commands},
-            reason,
-        )
-    if (
-        after["control_plane_nodes"] != control_plane_nodes
-        or after["worker_nodes"] != worker_nodes
-        or after["unclassified_nodes"]
-        or after["malformed_nodes"]
-        or after["worker_pools"] != expected_pools
-    ):
-        return (
-            "fail",
-            {
-                "control_plane_nodes": after["control_plane_nodes"],
-                "worker_nodes": after["worker_nodes"],
-                "expected_pools": expected_pools,
-                "observed_pools": after["worker_pools"],
-                "label_commands": label_commands,
-            },
-            "worker node pool labels did not match the deterministic assignment",
-        )
-    if any(value in KIND_WORKER_POOL_NAMES for value in after["control_plane_pools"].values()):
+    if before["worker_pools"] != expected_pools:
         return (
             "fail",
             {
                 "control_plane_nodes": control_plane_nodes,
-                "control_plane_pools": after["control_plane_pools"],
-                "worker_pools": after["worker_pools"],
-                "label_commands": label_commands,
+                "worker_nodes": worker_nodes,
+                "expected_pools": expected_pools,
+                "observed_pools": before["worker_pools"],
+                "mutation_attempted": False,
             },
-            "control-plane must not carry a worker pool label",
+            "worker node pool labels do not match cluster.yaml; refusing to repair reused state",
         )
     return (
         "pass",
@@ -644,7 +662,7 @@ def _kind_node_pool_contract(
             "control_plane_nodes": control_plane_nodes,
             "worker_nodes": worker_nodes,
             "worker_pools": expected_pools,
-            "label_commands": label_commands,
+            "mutation_attempted": False,
         },
         None,
     )
@@ -690,8 +708,78 @@ def _docker_image_digest(image: str) -> tuple[str | None, str | None]:
     return digest, reason
 
 
+def _kind_loaded_image_identity(
+    cluster_name: str, image: str, expected_fingerprint: str
+) -> tuple[str | None, str | None]:
+    """Read the image identity from every kind node's containerd image store.
+
+    Docker's local image ID is a config digest and is not necessarily the
+    digest reported by the CRI runtime.  After ``kind load`` the runtime
+    digest and source label are therefore checked on every node, and only one
+    common repo digest is accepted.
+    """
+
+    nodes_result = _run(["kind", "get", "nodes", "--name", cluster_name], timeout=30)
+    if nodes_result.status != "pass":
+        return None, nodes_result.reason or "kind node inventory for loaded image failed"
+    nodes = [line.strip() for line in nodes_result.stdout.splitlines() if line.strip()]
+    if not nodes:
+        return None, "kind node inventory for loaded image was empty"
+
+    observed_digests: set[str] = set()
+    observed_fingerprints: set[str] = set()
+    for node in nodes:
+        inspected = _run(
+            ["docker", "exec", node, "crictl", "inspecti", "-o", "json", image],
+            timeout=60,
+        )
+        if inspected.status != "pass":
+            return None, "kind node containerd image inspection failed"
+        try:
+            payload = json.loads(inspected.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None, "kind node containerd image inspection was invalid JSON"
+        if not isinstance(payload, Mapping):
+            return None, "kind node containerd image inspection was not an object"
+        status = payload.get("status")
+        if not isinstance(status, Mapping):
+            return None, "kind node containerd image status was missing"
+        repo_digests = status.get("repoDigests")
+        if not isinstance(repo_digests, list):
+            return None, "kind node containerd image repo digests were missing"
+        node_digests = {
+            digest.lower()
+            for reference in repo_digests
+            if isinstance(reference, str)
+            and (digest := reference.rsplit("@", 1)[-1])
+            and IMAGE_DIGEST_RE.fullmatch(digest)
+        }
+        if not node_digests:
+            return None, "kind node containerd image has no immutable repo digest"
+        observed_digests.update(node_digests)
+
+        info = payload.get("info")
+        info = info if isinstance(info, Mapping) else {}
+        image_spec = info.get("imageSpec")
+        image_spec = image_spec if isinstance(image_spec, Mapping) else {}
+        config = image_spec.get("config")
+        config = config if isinstance(config, Mapping) else {}
+        labels = config.get("Labels")
+        labels = labels if isinstance(labels, Mapping) else {}
+        fingerprint = labels.get(IMAGE_SOURCE_FINGERPRINT_LABEL)
+        if not isinstance(fingerprint, str) or not SOURCE_FINGERPRINT_RE.fullmatch(fingerprint):
+            return None, "kind node containerd image source fingerprint label is missing or invalid"
+        observed_fingerprints.add(fingerprint)
+
+    if observed_fingerprints != {expected_fingerprint}:
+        return None, "kind node containerd image source fingerprint does not match checkout"
+    if len(observed_digests) != 1:
+        return None, "kind nodes do not agree on one loaded image repo digest"
+    return next(iter(observed_digests)), None
+
+
 def _load_local_image(cluster_name: str, image: str) -> tuple[str, str | None, str | None]:
-    digest, observed_fingerprint, reason = _docker_image_metadata(image)
+    _digest, observed_fingerprint, reason = _docker_image_metadata(image)
     if reason:
         return "fail", None, reason
     expected_lineage = _source_lineage()
@@ -705,7 +793,14 @@ def _load_local_image(cluster_name: str, image: str) -> tuple[str, str | None, s
     if observed_fingerprint != expected_fingerprint:
         return "fail", None, "local image source fingerprint does not match current checkout"
     result = _run(["kind", "load", "docker-image", image, "--name", cluster_name], timeout=300)
-    return result.status, digest, result.reason
+    if result.status != "pass":
+        return result.status, None, result.reason
+    runtime_digest, runtime_reason = _kind_loaded_image_identity(
+        cluster_name, image, expected_fingerprint
+    )
+    if runtime_reason:
+        return "fail", None, runtime_reason
+    return "pass", runtime_digest, None
 
 
 def _runtime_wait_targets(documents: list[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
@@ -851,6 +946,8 @@ _PROBE_SECRET_REFS = {
         "trpc-service-secrets",
         "trpc-worker-secrets",
         "trpc-tool-reconciler-secrets",
+        "trpc-cell-executor-secrets",
+        "trpc-cell-reconciler-secrets",
     ),
     "scripts/kind_evolution_probe.py": (
         "trpc-worker-secrets",
@@ -877,7 +974,7 @@ _CANDIDATE_PROBE_CONTRACTS: dict[str, dict[str, Any]] = {
         "probe": "kind_runtime_probe",
         "scenario": "kind_runtime_postgres_reconciliation",
         "assertion": SCENARIO_PLAN["candidate_runtime_probe"]["assertion"],
-        "checks": ("tool_reconciliation", "im_idempotency"),
+        "checks": ("tool_reconciliation", "cell_effect_reconciliation", "im_idempotency"),
     },
     "scripts/kind_evolution_probe.py": {
         "runner_name": "candidate-evolution",
@@ -885,6 +982,7 @@ _CANDIDATE_PROBE_CONTRACTS: dict[str, dict[str, Any]] = {
         "scenario": "kind_evolution_postgres_control",
         "assertion": SCENARIO_PLAN["candidate_evolution_probe"]["assertion"],
         "checks": (
+            "network_egress_denial",
             "database_identity_and_schema",
             "concurrent_cas",
             "certificate_approval_one_time",
@@ -910,6 +1008,7 @@ _CANDIDATE_PROBE_CONTRACTS: dict[str, dict[str, Any]] = {
     },
 }
 _EVOLUTION_CASES = (
+    "network_egress_denial",
     "database_identity_and_schema",
     "concurrent_cas",
     "certificate_approval_one_time",
@@ -918,7 +1017,6 @@ _EVOLUTION_CASES = (
     "stale_aba_rejection",
     "cross_tenant_rejection",
 )
-_SENSITIVE_PROBE_FIELDS = ("dsn", "password", "secret", "token", "encrypt_key", "private_key")
 
 
 def _evolution_probe_environment(pod_name: str) -> list[dict[str, str]]:
@@ -946,7 +1044,7 @@ def _candidate_probe_manifest(
     remote_workloads = _PROBE_REMOTE_WORKLOADS.get(script)
     if secret_refs is None or remote_workloads is None:
         raise ValueError("candidate probe script is not allow-listed")
-    env: list[dict[str, str]] = []
+    env: list[dict[str, Any]] = []
     if script == "scripts/kind_im_gateway_probe.py":
         env.append({"name": "TRPC_KIND_GATEWAY_URL", "value": "http://trpc-gateway:8080"})
     elif script == "scripts/kind_runtime_probe.py":
@@ -965,6 +1063,15 @@ def _candidate_probe_manifest(
                     "value": "http://kind-fake-provider:8080/v1/metrics",
                 },
                 {"name": "TRPC_KIND_PROBE_DUPLICATE_COUNT", "value": "100"},
+                {
+                    "name": "TRPC_KIND_PROBE_FIXTURE_DSN",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": "trpc-worker-secrets",
+                            "key": "TRPC_SERVICE_WORKER_DATABASE_DSN",
+                        }
+                    },
+                },
             ]
         )
     elif script == "scripts/kind_evolution_probe.py":
@@ -1030,14 +1137,157 @@ def _candidate_probe_manifest(
     }
 
 
-def _redact_probe_payload(value: Any, key: str = "") -> Any:
-    if isinstance(value, dict):
-        return {str(name): _redact_probe_payload(item, str(name)) for name, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_probe_payload(item, key) for item in value]
-    if isinstance(value, str) and any(marker in key.lower() for marker in _SENSITIVE_PROBE_FIELDS):
-        return "<redacted>"
-    return value
+def _probe_source_value(payload: Mapping[str, Any]) -> str | None:
+    value: Any = payload.get("source_fingerprint")
+    if isinstance(value, Mapping):
+        value = value.get("value") if value.get("status") == "available" else None
+    return value if _is_fingerprint(value) else None
+
+
+def _known_check_names(script: str, payload: Mapping[str, Any]) -> list[str]:
+    contract = _CANDIDATE_PROBE_CONTRACTS.get(script, {})
+    required = contract.get("checks", ())
+    checks = payload.get("checks")
+    if not isinstance(required, tuple) or not isinstance(checks, Mapping):
+        return []
+    return [
+        name
+        for name in required
+        if isinstance(checks.get(name), Mapping) and checks[name].get("status") == "pass"
+    ]
+
+
+def _safe_probe_exception_types(value: Any) -> list[str]:
+    """Keep only exception class names from untrusted probe diagnostics."""
+
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, str) and SAFE_EXCEPTION_TYPE_RE.fullmatch(item) is not None
+    ]
+
+
+def _probe_evidence_summary(script: str, payload: Any) -> dict[str, Any]:
+    """Project an untrusted probe result onto a small secret-free allow-list.
+
+    Candidate Pods receive live database credentials.  Their arbitrary JSON
+    must therefore never be copied into a durable gate report, even after
+    field-name based redaction.  Contract validation still examines the raw
+    value in memory; the report contains only fixed identifiers, booleans,
+    counters and already-derived hashes selected below.
+    """
+
+    if not isinstance(payload, Mapping):
+        return {}
+    summary: dict[str, Any] = {
+        "schema_version": payload.get("schema_version"),
+        "probe": payload.get("probe")
+        if payload.get("probe") == _CANDIDATE_PROBE_CONTRACTS.get(script, {}).get("probe")
+        else "<invalid>",
+        "scenario": payload.get("scenario")
+        if payload.get("scenario") == _CANDIDATE_PROBE_CONTRACTS.get(script, {}).get("scenario")
+        else "<invalid>",
+        "status": payload.get("status") if payload.get("status") in {"pass", "fail"} else None,
+        "source_fingerprint": _probe_source_value(payload),
+        "verified_checks": _known_check_names(script, payload),
+        "unknown_fields_discarded": True,
+    }
+    if script == "scripts/kind_im_gateway_probe.py":
+        summary.update(
+            {
+                "callbacks_sent": payload.get("callbacks_sent"),
+                "duplicate_callback_status_counts": payload.get("duplicate_callback_status_counts"),
+                "second_tenant_status": payload.get("second_tenant_status"),
+                "invalid_signature_status": payload.get("invalid_signature_status"),
+                "secrets_reported": payload.get("secrets_reported"),
+            }
+        )
+    elif script == "scripts/kind_runtime_probe.py":
+        summary.update(
+            {
+                "provider_execute_calls": payload.get("provider_execute_calls"),
+                "provider_status_queries": payload.get("provider_status_queries"),
+                "cell_provider_execute_calls": payload.get("cell_provider_execute_calls"),
+                "cell_provider_status_queries": payload.get("cell_provider_status_queries"),
+                "rejection_reasons": _safe_probe_exception_types(payload.get("rejection_reasons")),
+            }
+        )
+        checks = payload.get("checks")
+        cell_check = (
+            checks.get("cell_effect_reconciliation") if isinstance(checks, Mapping) else None
+        )
+        if isinstance(cell_check, Mapping):
+            cell_checks = cell_check.get("checks")
+            projected_checks: dict[str, dict[str, Any]] = {}
+            if isinstance(cell_checks, Mapping):
+                for name in (
+                    "applied_to_succeeded",
+                    "unknown_blocks_replay",
+                    "stale_attempt_rejected",
+                    "cross_tenant_rejected",
+                ):
+                    item = cell_checks.get(name)
+                    if not isinstance(item, Mapping):
+                        continue
+                    projected: dict[str, Any] = {
+                        "status": item.get("status"),
+                    }
+                    for field in (
+                        "executor_status",
+                        "reconciled_status",
+                        "evidence_rows",
+                        "provider_execution_delta",
+                        "automatic_replay",
+                    ):
+                        if field in item:
+                            projected[field] = item.get(field)
+                    projected_checks[name] = projected
+            summary["cell_effect_reconciliation"] = {
+                "status": cell_check.get("status"),
+                "checks": projected_checks,
+                "rejection_reasons": _safe_probe_exception_types(
+                    cell_check.get("rejection_reasons")
+                ),
+            }
+    elif script == "scripts/kind_evolution_probe.py":
+        cases = payload.get("cases")
+        passed_cases = (
+            {
+                item.get("name")
+                for item in cases
+                if isinstance(item, Mapping)
+                and item.get("name") in _EVOLUTION_CASES
+                and item.get("passed") is True
+            }
+            if isinstance(cases, list)
+            else set()
+        )
+        network_case = (
+            next(
+                (
+                    item
+                    for item in cases
+                    if isinstance(item, Mapping) and item.get("name") == "network_egress_denial"
+                ),
+                None,
+            )
+            if isinstance(cases, list)
+            else None
+        )
+        summary.update(
+            {
+                "provider_calls": payload.get("provider_calls"),
+                "network_egress_denied": {
+                    "provider": network_case is not None
+                    and network_case.get("provider_egress_denied") is True,
+                    "im": network_case is not None and network_case.get("im_egress_denied") is True,
+                },
+                "passed_cases": [name for name in _EVOLUTION_CASES if name in passed_cases],
+            }
+        )
+    return summary
 
 
 def _is_count(value: Any, expected: int | None = None) -> bool:
@@ -1108,6 +1358,13 @@ def _validate_runtime_probe_payload(payload: Mapping[str, Any], reasons: list[st
         or payload["provider_status_queries"] < 1
     ):
         reasons.append("provider_status_queries must be at least 1")
+    if not _is_count(payload.get("cell_provider_execute_calls"), 1):
+        reasons.append("cell_provider_execute_calls must be exactly 1")
+    if (
+        not _is_count(payload.get("cell_provider_status_queries"))
+        or payload["cell_provider_status_queries"] < 1
+    ):
+        reasons.append("cell_provider_status_queries must be at least 1")
 
     checks = payload.get("checks")
     if not isinstance(checks, Mapping):
@@ -1162,6 +1419,46 @@ def _validate_runtime_probe_payload(payload: Mapping[str, Any], reasons: list[st
             reasons.append("runtime tenant fingerprints are missing or invalid")
         elif primary_hash == secondary_hash:
             reasons.append("runtime tenant fingerprints must be distinct")
+    cell = checks.get("cell_effect_reconciliation")
+    if not isinstance(cell, Mapping):
+        reasons.append("cell_effect_reconciliation check is missing or not an object")
+        return
+    if cell.get("status") != "pass":
+        reasons.append("cell_effect_reconciliation check did not pass")
+    if cell.get("rejection_reasons") != []:
+        reasons.append("cell effect reconciliation rejection_reasons must be empty")
+    cell_checks = cell.get("checks")
+    cell_required = (
+        "applied_to_succeeded",
+        "unknown_blocks_replay",
+        "stale_attempt_rejected",
+        "cross_tenant_rejected",
+    )
+    if not isinstance(cell_checks, Mapping):
+        reasons.append("cell effect reconciliation checks are missing or not an object")
+        return
+    for name in cell_required:
+        item = cell_checks.get(name)
+        if not isinstance(item, Mapping) or item.get("status") != "pass":
+            reasons.append(f"cell effect reconciliation check {name} is missing or did not pass")
+    applied = cell_checks.get("applied_to_succeeded")
+    if isinstance(applied, Mapping):
+        if applied.get("executor_status") != "ambiguous":
+            reasons.append("cell applied reconciliation executor status is invalid")
+        if applied.get("reconciled_status") != "succeeded":
+            reasons.append("cell applied reconciliation status is invalid")
+        if not _is_count(applied.get("evidence_rows"), 1):
+            reasons.append("cell applied reconciliation evidence_rows must be exactly 1")
+        if not _is_count(applied.get("provider_execution_delta"), 1):
+            reasons.append("cell applied reconciliation provider execution delta must be exactly 1")
+    unknown = cell_checks.get("unknown_blocks_replay")
+    if isinstance(unknown, Mapping):
+        if unknown.get("reconciled_status") != "unknown":
+            reasons.append("cell unknown reconciliation status is invalid")
+        if unknown.get("automatic_replay") is not False:
+            reasons.append("cell unknown reconciliation must block automatic replay")
+        if not _is_count(unknown.get("evidence_rows"), 1):
+            reasons.append("cell unknown reconciliation evidence_rows must be exactly 1")
 
 
 def _validate_evolution_probe_payload(payload: Mapping[str, Any], reasons: list[str]) -> None:
@@ -1199,6 +1496,12 @@ def _validate_evolution_probe_payload(payload: Mapping[str, Any], reasons: list[
         item = case_by_name.get(name)
         if item is None or item.get("passed") is not True:
             reasons.append(f"evolution case {name} is missing or did not pass")
+    network = case_by_name.get("network_egress_denial")
+    if isinstance(network, Mapping) and (
+        network.get("provider_egress_denied") is not True
+        or network.get("im_egress_denied") is not True
+    ):
+        reasons.append("evolution network egress denial proof is incomplete")
 
     concurrent = case_by_name.get("concurrent_cas")
     if isinstance(concurrent, Mapping) and any(
@@ -1402,7 +1705,20 @@ def _candidate_probe_placement(
         if name == pod_name:
             driver_node = node
         workload = labels.get("app.kubernetes.io/name")
-        if isinstance(workload, str):
+        status = item.get("status")
+        remote_ready = bool(
+            metadata.get("deletionTimestamp") is None
+            and isinstance(status, Mapping)
+            and status.get("phase") == "Running"
+            and isinstance(status.get("conditions"), list)
+            and any(
+                isinstance(condition, Mapping)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+                for condition in status["conditions"]
+            )
+        )
+        if isinstance(workload, str) and remote_ready:
             nodes_by_workload.setdefault(workload, set()).add(node)
     remote_workloads = _PROBE_REMOTE_WORKLOADS.get(script, ())
     remote_nodes = {
@@ -1414,7 +1730,7 @@ def _candidate_probe_placement(
         and not missing
         and all(driver_node not in nodes for nodes in remote_nodes.values())
     )
-    evidence = {
+    evidence: dict[str, Any] = {
         "driver_node": driver_node,
         "remote_workload_nodes": remote_nodes,
         "cross_node": cross_node,
@@ -1493,17 +1809,18 @@ def _run_candidate_probe(
             "reason": placement_reason,
         },
     }
-    payload: dict[str, Any] = {}
+    raw_payload: dict[str, Any] = {}
     if logs_result.status == "pass":
         try:
             last_line = logs_result.stdout.strip().splitlines()[-1]
             decoded = json.loads(last_line)
             if isinstance(decoded, dict):
-                payload = _redact_probe_payload(decoded)
+                raw_payload = decoded
         except (IndexError, json.JSONDecodeError):
-            payload = {}
+            raw_payload = {}
+    contract_reason = _validate_candidate_probe_payload(probe_name, script, raw_payload)
+    payload = _probe_evidence_summary(script, raw_payload)
     evidence["probe"] = payload
-    contract_reason = _validate_candidate_probe_payload(probe_name, script, payload)
     evidence["probe_contract"] = {
         "status": "pass" if contract_reason is None else "fail",
         "reason": contract_reason,
@@ -1543,7 +1860,27 @@ def _candidate_evolution_scenario(
     context: str, namespace: str, image: str
 ) -> tuple[str, dict[str, Any], str | None]:
     script, args = _PROBE_SCRIPTS["candidate_evolution_probe"]
-    return _run_candidate_probe(context, namespace, image, "candidate-evolution", script, args)
+    before = _provider_metrics(context, namespace, "kind-fake-provider-0")
+    status, evidence, reason = _run_candidate_probe(
+        context, namespace, image, "candidate-evolution", script, args
+    )
+    after = _provider_metrics(context, namespace, "kind-fake-provider-0")
+    keys = ("effects", "provider_calls")
+    before_counts = {key: before.get(key) for key in keys} if before is not None else None
+    after_counts = {key: after.get(key) for key in keys} if after is not None else None
+    independently_unchanged = (
+        before_counts == after_counts
+        and before_counts is not None
+        and all(_is_count(value) for value in before_counts.values())
+    )
+    evidence["independent_provider_oracle"] = {
+        "status": "pass" if independently_unchanged else "fail",
+        "before": before_counts,
+        "after": after_counts,
+    }
+    if not independently_unchanged:
+        return "fail", evidence, "evolution changed the independent provider oracle"
+    return status, evidence, reason
 
 
 def _candidate_redis_scenario(
@@ -1622,7 +1959,7 @@ def _network_recovery_scenario(
         after_metrics.get(key) == before_metrics.get(key)
         for key in ("effects", "provider_calls", "active", "control_version")
     )
-    evidence = {
+    evidence: dict[str, Any] = {
         "provider_restarted": True,
         "pod_uid_changed": after_uid != before_uid,
         "provider_metrics_preserved": preserved,
@@ -1667,6 +2004,96 @@ def _postgres_scalar(context: str, namespace: str, statement: str) -> str | None
         return None
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return lines[-1] if lines else None
+
+
+def _postgres_runtime_marker(
+    context: str,
+    namespace: str,
+    tenant_id: str,
+    marker_id: str,
+    operation: str,
+) -> str | None:
+    """Create, verify, or remove one tenant-scoped marker as trpc_runtime.
+
+    This intentionally avoids the bootstrap ``trpc`` role.  The marker is
+    written and read under the real runtime role with ``app.tenant_id`` set,
+    so a PostgreSQL restart test proves both persistence and RLS enforcement.
+    Inputs are gate-generated hex identifiers; reject anything else before
+    interpolating the statement.
+    """
+
+    identifier_re = re.compile(r"^[a-z0-9_]{1,96}$")
+    if (
+        operation not in {"create", "verify", "cleanup"}
+        or not identifier_re.fullmatch(tenant_id)
+        or not identifier_re.fullmatch(marker_id)
+    ):
+        return None
+    if operation == "create":
+        statement = """
+BEGIN;
+SELECT set_config('app.tenant_id', :'tenant', true);
+INSERT INTO tenants (tenant_id, display_name)
+VALUES (:'tenant', 'kind-gate-marker');
+INSERT INTO audit_logs (tenant_id, decision, trace_id, metadata_json)
+VALUES (:'tenant', 'kind_gate_restart_marker', :'marker', '{}'::jsonb);
+SELECT count(*) FROM audit_logs
+ WHERE tenant_id = :'tenant' AND trace_id = :'marker';
+COMMIT;
+"""
+    elif operation == "verify":
+        statement = """
+BEGIN;
+SELECT set_config('app.tenant_id', :'tenant', true);
+SELECT count(*) FROM audit_logs
+ WHERE tenant_id = :'tenant' AND trace_id = :'marker';
+COMMIT;
+"""
+    else:
+        statement = """
+BEGIN;
+SELECT set_config('app.tenant_id', :'tenant', true);
+DELETE FROM audit_logs
+ WHERE tenant_id = :'tenant' AND trace_id = :'marker';
+DELETE FROM tenants WHERE tenant_id = :'tenant';
+SELECT count(*) FROM audit_logs
+ WHERE tenant_id = :'tenant' AND trace_id = :'marker';
+COMMIT;
+"""
+    result = _kubectl(
+        context,
+        [
+            "-n",
+            namespace,
+            "exec",
+            "-i",
+            "kind-postgres-0",
+            "--",
+            "env",
+            "PGPASSWORD=kind-runtime-password",
+            "psql",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "trpc_runtime",
+            "-d",
+            "trpc_service",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-v",
+            f"tenant={tenant_id}",
+            "-v",
+            f"marker={marker_id}",
+            "-At",
+        ],
+        input_text=statement,
+        timeout=30,
+    )
+    if result.status != "pass":
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    numeric_lines = [line for line in lines if line.isdigit()]
+    return numeric_lines[-1] if numeric_lines else None
 
 
 def _delete_schema_migration_job(
@@ -1796,6 +2223,112 @@ def _provider_metrics(context: str, namespace: str, pod_name: str) -> dict[str, 
     return value if isinstance(value, dict) else None
 
 
+def _redis_scalar(context: str, namespace: str, *arguments: str) -> str | None:
+    result = _kubectl(
+        context,
+        [
+            "-n",
+            namespace,
+            "exec",
+            "kind-redis-0",
+            "--",
+            "redis-cli",
+            "--raw",
+            *arguments,
+        ],
+        timeout=20,
+    )
+    return result.stdout.strip() if result.status == "pass" else None
+
+
+def _redis_restart_scenario(
+    context: str, namespace: str, image: str = DEFAULT_IMAGE
+) -> tuple[str, dict[str, Any], str | None]:
+    before = _kubectl(
+        context,
+        ["-n", namespace, "get", "pod/kind-redis-0", "-o", "json"],
+        timeout=20,
+    )
+    pvc_before = _kubectl(
+        context,
+        ["-n", namespace, "get", "pvc/data-kind-redis-0", "-o", "json"],
+        timeout=20,
+    )
+    before_uid = _object_uid(before.stdout) if before.status == "pass" else None
+    pvc_before_uid = _object_uid(pvc_before.stdout) if pvc_before.status == "pass" else None
+    suffix = uuid.uuid4().hex
+    sentinel_key = f"kind-gate:restart:{suffix}"
+    sentinel_value = hashlib.sha256(f"redis-restart:{suffix}".encode()).hexdigest()
+    sentinel_written = (
+        _redis_scalar(context, namespace, "SET", sentinel_key, sentinel_value) == "OK"
+    )
+    if before_uid is None or pvc_before_uid is None or not sentinel_written:
+        return "fail", {}, "Redis Pod, PVC or persistence sentinel was unavailable"
+
+    deleted = _kubectl(
+        context,
+        ["-n", namespace, "delete", "pod", "kind-redis-0", "--wait=true"],
+        timeout=60,
+    )
+    if deleted.status != "pass":
+        _redis_scalar(context, namespace, "DEL", sentinel_key)
+        return "fail", {}, "Redis Pod deletion failed"
+    ready = _kubectl(
+        context,
+        ["-n", namespace, "rollout", "status", "statefulset/kind-redis", "--timeout=180s"],
+        timeout=190,
+    )
+    after = _kubectl(
+        context,
+        ["-n", namespace, "get", "pod/kind-redis-0", "-o", "json"],
+        timeout=20,
+    )
+    pvc_after = _kubectl(
+        context,
+        ["-n", namespace, "get", "pvc/data-kind-redis-0", "-o", "json"],
+        timeout=20,
+    )
+    after_uid = _object_uid(after.stdout) if after.status == "pass" else None
+    pvc_after_uid = _object_uid(pvc_after.stdout) if pvc_after.status == "pass" else None
+    observed = (
+        _redis_scalar(context, namespace, "GET", sentinel_key) if ready.status == "pass" else None
+    )
+    cleanup = _redis_scalar(context, namespace, "DEL", sentinel_key)
+    probe_status = "not_run"
+    probe_evidence: dict[str, Any] = {}
+    probe_reason: str | None = None
+    if ready.status == "pass" and observed == sentinel_value:
+        probe_status, probe_evidence, probe_reason = _candidate_redis_scenario(
+            context, namespace, image
+        )
+    evidence = {
+        "pod_uid_changed": after_uid is not None and after_uid != before_uid,
+        "pvc_preserved": pvc_after_uid == pvc_before_uid,
+        "pvc_uid_sha256": (
+            hashlib.sha256(pvc_before_uid.encode()).hexdigest() if pvc_before_uid else None
+        ),
+        "sentinel_preserved": observed == sentinel_value,
+        "sentinel_cleaned": cleanup == "1",
+        "queue_after_recovery": {
+            "status": probe_status,
+            "evidence": probe_evidence,
+            "reason": probe_reason,
+        },
+    }
+    if not all(
+        (
+            ready.status == "pass",
+            evidence["pod_uid_changed"],
+            evidence["pvc_preserved"],
+            evidence["sentinel_preserved"],
+            evidence["sentinel_cleaned"],
+            probe_status == "pass",
+        )
+    ):
+        return "fail", evidence, "Redis recovery, AOF persistence or reconnect probe failed"
+    return "pass", evidence, None
+
+
 def _postgres_restart_scenario(
     context: str, namespace: str, image: str = DEFAULT_IMAGE
 ) -> tuple[str, dict[str, Any], str | None]:
@@ -1811,23 +2344,21 @@ def _postgres_restart_scenario(
         timeout=20,
     )
     pvc_before_uid = _object_uid(pvc_before.stdout) if pvc_before.status == "pass" else None
-    persisted_rows_before = _nonnegative_int(
-        _postgres_scalar(
-            context,
-            namespace,
-            "SELECT count(*) FROM inbound_messages WHERE tenant_id LIKE 'kind-im-%';",
-        )
-    )
+    marker_tenant = f"kind_gate_marker_{uuid.uuid4().hex}"
+    marker_id = uuid.uuid4().hex
+    marker_before = _postgres_runtime_marker(context, namespace, marker_tenant, marker_id, "create")
+    persisted_rows_before = 1 if marker_before == "1" else None
     if before_uid is None or pvc_before_uid is None or persisted_rows_before is None:
+        if marker_before == "1":
+            _postgres_runtime_marker(context, namespace, marker_tenant, marker_id, "cleanup")
         return "fail", {}, "PostgreSQL Pod or PVC was unavailable before recovery"
-    if persisted_rows_before < 2:
-        return "fail", {}, "PostgreSQL persistence sentinel rows were unavailable before recovery"
     deleted = _kubectl(
         context,
         ["-n", namespace, "delete", "pod", "kind-postgres-0", "--wait=true"],
         timeout=60,
     )
     if deleted.status != "pass":
+        _postgres_runtime_marker(context, namespace, marker_tenant, marker_id, "cleanup")
         return "fail", {}, "PostgreSQL Pod deletion failed"
     ready = _kubectl(
         context,
@@ -1835,6 +2366,7 @@ def _postgres_restart_scenario(
         timeout=190,
     )
     if ready.status != "pass":
+        _postgres_runtime_marker(context, namespace, marker_tenant, marker_id, "cleanup")
         return "fail", {}, "PostgreSQL replacement did not become ready"
     after = _kubectl(
         context,
@@ -1848,12 +2380,10 @@ def _postgres_restart_scenario(
         timeout=20,
     )
     pvc_after_uid = _object_uid(pvc_after.stdout) if pvc_after.status == "pass" else None
-    persisted_rows_after = _nonnegative_int(
-        _postgres_scalar(
-            context,
-            namespace,
-            "SELECT count(*) FROM inbound_messages WHERE tenant_id LIKE 'kind-im-%';",
-        )
+    marker_after = _postgres_runtime_marker(context, namespace, marker_tenant, marker_id, "verify")
+    persisted_rows_after = 1 if marker_after == "1" else None
+    marker_cleanup = _postgres_runtime_marker(
+        context, namespace, marker_tenant, marker_id, "cleanup"
     )
     health = _kubectl(
         context,
@@ -1917,7 +2447,7 @@ def _postgres_restart_scenario(
         callback_status, callback_evidence, callback_reason = _candidate_im_scenario(
             context, namespace, image
         )
-    evidence = {
+    evidence: dict[str, Any] = {
         "pod_uid_changed": after_uid is not None and after_uid != before_uid,
         "pvc_preserved": pvc_after_uid == pvc_before_uid,
         "pvc_uid_sha256": (
@@ -1926,6 +2456,11 @@ def _postgres_restart_scenario(
         "persistent_rows_before": persisted_rows_before,
         "persistent_rows_after": persisted_rows_after,
         "persistent_rows_preserved": persisted_rows_after == persisted_rows_before,
+        "runtime_role_rls_marker": {
+            "created": marker_before == "1",
+            "survived_restart": marker_after == "1",
+            "cleaned": marker_cleanup == "0",
+        },
         "health_smoke": health.status == "pass",
         "schema_head_smoke": schema_head.status == "pass"
         and schema_head.stdout.strip().lower().endswith("t"),
@@ -1942,6 +2477,9 @@ def _postgres_restart_scenario(
             evidence["pod_uid_changed"],
             evidence["pvc_preserved"],
             evidence["persistent_rows_preserved"],
+            evidence["runtime_role_rls_marker"]["created"],
+            evidence["runtime_role_rls_marker"]["survived_restart"],
+            evidence["runtime_role_rls_marker"]["cleaned"],
             evidence["health_smoke"],
             evidence["schema_head_smoke"],
             evidence["application_deployments_ready"],
@@ -2024,7 +2562,22 @@ def _workload_distribution(context: str, namespace: str) -> tuple[str, dict[str,
             continue
         metadata = item.get("metadata")
         spec = item.get("spec")
-        if not isinstance(metadata, dict) or not isinstance(spec, dict):
+        status = item.get("status")
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(spec, dict)
+            or not isinstance(status, dict)
+            or metadata.get("deletionTimestamp") is not None
+            or status.get("phase") != "Running"
+        ):
+            continue
+        conditions = status.get("conditions")
+        if not isinstance(conditions, list) or not any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in conditions
+        ):
             continue
         labels = metadata.get("labels")
         labels = labels if isinstance(labels, dict) else {}
@@ -2063,6 +2616,432 @@ def _workload_distribution(context: str, namespace: str) -> tuple[str, dict[str,
     return "pass", evidence, None
 
 
+def _normalise_runtime_image_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.rsplit("@", 1)[-1]
+    for prefix in ("docker-pullable://", "containerd://", "docker://"):
+        if candidate.startswith(prefix):
+            candidate = candidate.removeprefix(prefix).rsplit("@", 1)[-1]
+            break
+    return candidate.lower() if IMAGE_DIGEST_RE.fullmatch(candidate) else None
+
+
+def _runtime_source_fingerprint(context: str, namespace: str, pod_name: str) -> str | None:
+    code = (
+        "from pathlib import Path; from scripts.evidence_lineage import source_fingerprint; "
+        "value=source_fingerprint(Path('/app')); print(value.get('value',''))"
+    )
+    result = _kubectl(
+        context,
+        ["-n", namespace, "exec", pod_name, "--", "python", "-c", code],
+        timeout=30,
+    )
+    value = result.stdout.strip().splitlines()[-1] if result.status == "pass" else ""
+    return value if SOURCE_FINGERPRINT_RE.fullmatch(value) else None
+
+
+def _controller_owner(metadata: Mapping[str, Any], kind: str) -> tuple[str, str] | None:
+    """Return the one controller owner reference of the requested kind."""
+
+    references = metadata.get("ownerReferences")
+    if not isinstance(references, list):
+        return None
+    owners = [
+        reference
+        for reference in references
+        if isinstance(reference, Mapping)
+        and reference.get("kind") == kind
+        and reference.get("controller") is True
+        and isinstance(reference.get("name"), str)
+        and isinstance(reference.get("uid"), str)
+    ]
+    if len(owners) != 1:
+        return None
+    return owners[0]["name"], owners[0]["uid"]
+
+
+def _template_images(workload: Mapping[str, Any]) -> tuple[str, ...]:
+    spec = workload.get("spec")
+    if not isinstance(spec, Mapping):
+        return ()
+    template = spec.get("template")
+    if not isinstance(template, Mapping):
+        return ()
+    pod_spec = template.get("spec")
+    if not isinstance(pod_spec, Mapping):
+        return ()
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list):
+        return ()
+    images: list[str] = []
+    for container in containers:
+        if not isinstance(container, Mapping):
+            return ()
+        image = container.get("image")
+        if not isinstance(image, str):
+            return ()
+        images.append(image)
+    return tuple(images)
+
+
+def _runtime_attestation_snapshot(
+    context: str,
+    namespace: str,
+    image: str,
+    expected_runtime_digest: str | None = None,
+) -> tuple[str, dict[str, Any], str | None]:
+    result = _kubectl(
+        context,
+        [
+            "-n",
+            namespace,
+            "get",
+            "deployment,replicaset,statefulset,job,pod",
+            "-o",
+            "json",
+        ],
+        timeout=60,
+    )
+    if result.status != "pass":
+        return "fail", {}, "runtime attestation inventory was unavailable"
+    try:
+        items = json.loads(result.stdout).get("items", [])
+    except (AttributeError, json.JSONDecodeError):
+        return "fail", {}, "runtime attestation inventory was invalid JSON"
+    if not isinstance(items, list):
+        return "fail", {}, "runtime attestation inventory was not a list"
+
+    deployments: dict[str, Mapping[str, Any]] = {}
+    replicasets: dict[str, Mapping[str, Any]] = {}
+    statefulsets: dict[str, Mapping[str, Any]] = {}
+    jobs: dict[str, Mapping[str, Any]] = {}
+    pods: list[Mapping[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        metadata = item.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, Mapping) else None
+        if not isinstance(name, str):
+            continue
+        if item.get("kind") == "Deployment":
+            deployments[name] = item
+        elif item.get("kind") == "ReplicaSet":
+            replicasets[name] = item
+        elif item.get("kind") == "StatefulSet":
+            statefulsets[name] = item
+        elif item.get("kind") == "Job":
+            jobs[name] = item
+        elif item.get("kind") == "Pod":
+            pods.append(item)
+
+    reasons: list[str] = []
+    deployment_status: dict[str, bool] = {}
+    current_replicasets: dict[str, Mapping[str, Any]] = {}
+    for name, expected in REQUIRED_DEPLOYMENTS.items():
+        deployment = deployments.get(name)
+        if not isinstance(deployment, Mapping):
+            reasons.append(f"deployment/{name} is missing")
+            deployment_status[name] = False
+            continue
+        metadata = deployment.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        status = deployment.get("status")
+        status = status if isinstance(status, Mapping) else {}
+        generation = metadata.get("generation")
+        observed = status.get("observedGeneration")
+        ready = bool(
+            isinstance(generation, int)
+            and isinstance(observed, int)
+            and observed >= generation
+            and status.get("replicas", 0) == expected
+            and status.get("updatedReplicas", 0) == expected
+            and status.get("readyReplicas", 0) == expected
+            and status.get("availableReplicas", 0) == expected
+            and status.get("unavailableReplicas", 0) in {None, 0}
+        )
+        deployment_status[name] = ready
+        if not ready:
+            reasons.append(f"deployment/{name} is not fully observed and ready")
+        deployment_uid = metadata.get("uid")
+        if not isinstance(deployment_uid, str) or not deployment_uid:
+            reasons.append(f"deployment/{name} has no UID")
+            continue
+        if _template_images(deployment) != (image,):
+            reasons.append(f"deployment/{name} template image does not match candidate")
+        owned = [
+            replica_set
+            for replica_set in replicasets.values()
+            if isinstance(replica_set.get("metadata"), Mapping)
+            and _controller_owner(replica_set["metadata"], "Deployment") == (name, deployment_uid)
+            and _template_images(replica_set) == (image,)
+            and isinstance(replica_set.get("status"), Mapping)
+            and replica_set["status"].get("replicas") == expected
+            and replica_set["status"].get("readyReplicas") == expected
+        ]
+        if len(owned) != 1:
+            reasons.append(f"deployment/{name} does not have exactly one ready current ReplicaSet")
+        else:
+            current_replicasets[name] = owned[0]
+
+    support_names = ("kind-postgres", "kind-redis", "kind-fake-provider", "kind-fake-im")
+    support_status: dict[str, bool] = {}
+    support_templates: dict[str, tuple[str, ...]] = {}
+    support_uids: dict[str, str] = {}
+    for name in support_names:
+        statefulset = statefulsets.get(name)
+        if not isinstance(statefulset, Mapping):
+            reasons.append(f"statefulset/{name} is missing")
+            support_status[name] = False
+            support_templates[name] = ()
+            continue
+        metadata = statefulset.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        status = statefulset.get("status")
+        status = status if isinstance(status, Mapping) else {}
+        generation = metadata.get("generation")
+        observed = status.get("observedGeneration")
+        ready = bool(
+            isinstance(generation, int)
+            and isinstance(observed, int)
+            and observed >= generation
+            and isinstance(status.get("currentRevision"), str)
+            and bool(status.get("currentRevision"))
+            and status.get("currentRevision") == status.get("updateRevision")
+            and status.get("updatedReplicas", 0) == 1
+            and status.get("currentReplicas", 0) == 1
+            and status.get("readyReplicas", 0) == 1
+        )
+        support_status[name] = ready
+        if not ready:
+            reasons.append(f"statefulset/{name} is not fully observed and ready")
+        statefulset_uid = metadata.get("uid")
+        if not isinstance(statefulset_uid, str) or not statefulset_uid:
+            reasons.append(f"statefulset/{name} has no UID")
+        else:
+            support_uids[name] = statefulset_uid
+        support_templates[name] = _template_images(statefulset)
+        if not support_templates[name]:
+            reasons.append(f"statefulset/{name} template image is missing")
+
+    migration_job = jobs.get(SCHEMA_MIGRATION_JOB_NAME)
+    migration_job_uid = (
+        migration_job.get("metadata", {}).get("uid")
+        if isinstance(migration_job, Mapping) and isinstance(migration_job.get("metadata"), Mapping)
+        else None
+    )
+    if not isinstance(migration_job_uid, str) or not migration_job_uid:
+        reasons.append("current schema migration Job has no UID")
+    migration_status = migration_job.get("status") if isinstance(migration_job, Mapping) else None
+    if not isinstance(migration_status, Mapping) or migration_status.get("succeeded", 0) < 1:
+        reasons.append("current schema migration Job is not complete")
+    if not isinstance(migration_job, Mapping) or _template_images(migration_job) != (image,):
+        reasons.append("current schema migration Job template image does not match candidate")
+
+    pod_uids: list[str] = []
+    candidate_image_ids: set[str] = set()
+    app_pods: dict[str, list[str]] = {name: [] for name in REQUIRED_DEPLOYMENTS}
+    support_pods: dict[str, list[str]] = {name: [] for name in support_names}
+    support_image_ids: dict[str, set[str]] = {name: set() for name in support_names}
+    source_probe_pod: str | None = None
+    migration_seen = False
+    candidate_probe_count = 0
+    for pod in pods:
+        metadata = pod.get("metadata")
+        spec = pod.get("spec")
+        status = pod.get("status")
+        if (
+            not isinstance(metadata, Mapping)
+            or not isinstance(spec, Mapping)
+            or not isinstance(status, Mapping)
+        ):
+            continue
+        labels = metadata.get("labels")
+        labels = labels if isinstance(labels, Mapping) else {}
+        workload = labels.get("app.kubernetes.io/name")
+        if labels.get("trpc.io/component") == "acceptance-driver":
+            candidate_probe_count += 1
+        is_application = workload in REQUIRED_DEPLOYMENTS
+        is_migration = workload == SCHEMA_MIGRATION_JOB_NAME
+        is_support = workload in support_names
+        if not is_application and not is_migration and not is_support:
+            continue
+        containers = spec.get("containers")
+        container_statuses = status.get("containerStatuses")
+        phase_ok = status.get("phase") == ("Running" if not is_migration else "Succeeded")
+        ready_condition = (
+            any(
+                isinstance(condition, Mapping)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+                for condition in status.get("conditions", [])
+            )
+            if not is_migration and isinstance(status.get("conditions"), list)
+            else is_migration
+        )
+        if is_application:
+            current_rs = current_replicasets.get(str(workload))
+            owner = _controller_owner(metadata, "ReplicaSet")
+            current_rs_metadata = (
+                current_rs.get("metadata") if isinstance(current_rs, Mapping) else None
+            )
+            expected_owner = (
+                (current_rs_metadata.get("name"), current_rs_metadata.get("uid"))
+                if isinstance(current_rs_metadata, Mapping)
+                else None
+            )
+            owner_ok = owner is not None and owner == expected_owner
+        elif is_migration:
+            owner_ok = _controller_owner(metadata, "Job") == (
+                SCHEMA_MIGRATION_JOB_NAME,
+                migration_job_uid,
+            )
+        else:
+            owner_ok = _controller_owner(metadata, "StatefulSet") == (
+                str(workload),
+                support_uids.get(str(workload)),
+            )
+        expected_images = (
+            (image,) if is_application or is_migration else support_templates.get(str(workload), ())
+        )
+        pod_ok = bool(
+            metadata.get("deletionTimestamp") is None
+            and owner_ok
+            and phase_ok
+            and ready_condition
+            and isinstance(containers, list)
+            and containers
+            and all(
+                isinstance(container, Mapping) and container.get("image") in expected_images
+                for container in containers
+            )
+            and isinstance(container_statuses, list)
+            and container_statuses
+            and all(
+                isinstance(container, Mapping)
+                and (container.get("ready") is True or is_migration)
+                and _normalise_runtime_image_id(container.get("imageID")) is not None
+                for container in container_statuses
+            )
+        )
+        if not pod_ok:
+            reasons.append(
+                f"pod/{metadata.get('name', '<unknown>')} failed runtime identity or owner checks"
+            )
+            continue
+        if not isinstance(container_statuses, list):
+            continue
+        if is_application or is_migration:
+            for container in container_statuses:
+                image_id = _normalise_runtime_image_id(container.get("imageID"))
+                if image_id:
+                    candidate_image_ids.add(image_id)
+        uid = metadata.get("uid")
+        name = metadata.get("name")
+        if isinstance(uid, str):
+            pod_uids.append(uid)
+        if is_application and isinstance(name, str) and isinstance(workload, str):
+            app_pods[workload].append(name)
+            source_probe_pod = source_probe_pod or name
+        elif is_migration:
+            migration_seen = True
+        elif is_support and isinstance(name, str) and isinstance(workload, str):
+            support_pods[workload].append(name)
+            support_image_ids[workload].update(
+                image_id
+                for image_id in (
+                    _normalise_runtime_image_id(container.get("imageID"))
+                    for container in container_statuses
+                )
+                if image_id is not None
+            )
+
+    for name, expected in REQUIRED_DEPLOYMENTS.items():
+        if len(app_pods[name]) != expected:
+            reasons.append(f"deployment/{name} does not own exactly {expected} ready current Pods")
+    for name in support_names:
+        if len(support_pods[name]) != 1:
+            reasons.append(f"statefulset/{name} does not own exactly one ready current Pod")
+    if not migration_seen:
+        reasons.append("current schema migration Pod was not observed")
+    if candidate_probe_count:
+        reasons.append("candidate acceptance probe Pods remained after cleanup")
+    if len(candidate_image_ids) != 1:
+        reasons.append("candidate workloads do not share one runtime image ID")
+    requested_digest = expected_runtime_digest or _image_identity(image).get("digest")
+    requested_digest = _normalise_runtime_image_id(requested_digest)
+    if requested_digest is not None and candidate_image_ids != {requested_digest}:
+        reasons.append("runtime image ID does not match the expected immutable digest")
+    expected_source = _source_lineage().get("value")
+    observed_source = (
+        _runtime_source_fingerprint(context, namespace, source_probe_pod)
+        if source_probe_pod
+        else None
+    )
+    if observed_source != expected_source or not _is_fingerprint(observed_source):
+        reasons.append("running application source fingerprint does not match the checkout")
+
+    evidence = {
+        "deployments": deployment_status,
+        "statefulsets": support_status,
+        "application_pod_counts": {name: len(names) for name, names in app_pods.items()},
+        "support_pod_counts": {name: len(names) for name, names in support_pods.items()},
+        "support_image_ids": {
+            name: sorted(image_ids) for name, image_ids in support_image_ids.items()
+        },
+        "current_replicaset_names": {
+            name: current.get("metadata", {}).get("name")
+            for name, current in current_replicasets.items()
+        },
+        "candidate_probe_pods": candidate_probe_count,
+        "candidate_image_ids": sorted(candidate_image_ids),
+        "expected_runtime_digest": requested_digest,
+        "source_fingerprint": observed_source,
+        "pod_set_sha256": hashlib.sha256("\n".join(sorted(pod_uids)).encode()).hexdigest(),
+    }
+    return (
+        ("fail", evidence, "; ".join(dict.fromkeys(reasons)))
+        if reasons
+        else (
+            "pass",
+            evidence,
+            None,
+        )
+    )
+
+
+def _final_runtime_stability(
+    context: str,
+    namespace: str,
+    image: str,
+    *,
+    window_seconds: float = 3.0,
+    expected_runtime_digest: str | None = None,
+) -> tuple[str, dict[str, Any], str | None]:
+    first_status, first, first_reason = _runtime_attestation_snapshot(
+        context, namespace, image, expected_runtime_digest
+    )
+    if first_status != "pass":
+        return "fail", {"observations": [first]}, first_reason
+    time.sleep(max(0.0, window_seconds))
+    second_status, second, second_reason = _runtime_attestation_snapshot(
+        context, namespace, image, expected_runtime_digest
+    )
+    stable = (
+        second_status == "pass"
+        and first.get("pod_set_sha256") == second.get("pod_set_sha256")
+        and first.get("candidate_image_ids") == second.get("candidate_image_ids")
+    )
+    evidence = {
+        "window_seconds": window_seconds,
+        "observations": [first, second],
+        "stable": stable,
+    }
+    if not stable:
+        return "fail", evidence, second_reason or "runtime changed during the stability window"
+    return "pass", evidence, None
+
+
 def _execute(
     *,
     cluster_name: str,
@@ -2076,7 +3055,7 @@ def _execute(
 ) -> dict[str, Any]:
     reasons: list[str] = []
     cluster_created = False
-    cluster_uid: str | None = None
+    cluster_instance_fingerprint: str | None = None
     local_image_digest: str | None = None
     node_counts: dict[str, int] = {}
     node_pools: dict[str, Any] = {"status": "not_run"}
@@ -2114,7 +3093,7 @@ def _execute(
         if image_status != "pass":
             reasons.append(image_reason or "local image load failed")
     if not reasons:
-        cluster_uid, uid_reason = _cluster_uid(context)
+        cluster_instance_fingerprint, uid_reason = _cluster_uid(context)
         if uid_reason:
             reasons.append(uid_reason)
     if not reasons:
@@ -2220,6 +3199,12 @@ def _execute(
                     context_value, namespace_value, image
                 ),
             ),
+            (
+                "redis_pod_replacement",
+                lambda context_value, namespace_value: _redis_restart_scenario(
+                    context_value, namespace_value, image
+                ),
+            ),
         )
         for name, function in scenario_functions:
             status, evidence, reason = function(context, namespace)
@@ -2230,6 +3215,21 @@ def _execute(
             }
             if status != "pass":
                 reasons.append(f"scenario {name} failed")
+    final_stability: dict[str, Any] = {"status": "not_run"}
+    if not reasons:
+        stability_status, stability_evidence, stability_reason = _final_runtime_stability(
+            context,
+            namespace,
+            image,
+            expected_runtime_digest=local_image_digest or _image_identity(image).get("digest"),
+        )
+        final_stability = {
+            "status": stability_status,
+            "evidence": stability_evidence,
+            "reason": stability_reason,
+        }
+        if stability_status != "pass":
+            reasons.append("final runtime stability and image attestation failed")
     return {
         "status": "pass" if not reasons else "fail",
         "rejection_reasons": list(dict.fromkeys(reasons)),
@@ -2237,8 +3237,8 @@ def _execute(
         "cluster": {
             "name": cluster_name,
             "context": context,
-            "uid": cluster_uid,
-            "status": "observed" if cluster_uid else "not_run",
+            "instance_fingerprint": cluster_instance_fingerprint,
+            "status": "observed" if cluster_instance_fingerprint else "not_run",
             "nodes": node_counts,
             "created_by_gate": cluster_created,
             "namespace": namespace,
@@ -2249,6 +3249,7 @@ def _execute(
         "workload_distribution": workload_distribution,
         "node_pools": node_pools,
         "scenarios": scenarios,
+        "final_stability": final_stability,
     }
 
 
@@ -2276,7 +3277,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "cluster": {
             "name": args.cluster_name,
             "context": args.context,
-            "uid": None,
+            "instance_fingerprint": None,
             "status": "not_run",
         },
         "preflight": preflight,
@@ -2287,6 +3288,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         },
         "workload_distribution": {"status": "not_run"},
         "node_pools": {"status": "not_run"},
+        "final_stability": {"status": "not_run"},
         "scenarios": {},
         "scenario_plan": SCENARIO_PLAN,
         "local_k8s_gate": "not_run",
@@ -2315,6 +3317,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         report["schema_migration_head"] = execution["schema_migration_head"]
         report["workload_distribution"] = execution["workload_distribution"]
         report["node_pools"] = execution["node_pools"]
+        report["final_stability"] = execution["final_stability"]
         report["scenarios"] = execution["scenarios"]
         report["local_k8s_gate"] = execution["status"]
         report["gate"] = execution["status"]

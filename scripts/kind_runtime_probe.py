@@ -39,12 +39,35 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import asyncpg
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.evidence_lineage import source_fingerprint
 from scripts.report_io import atomic_write_json
+from trpc_service.cell.capsule import AgentCapsule, CapsuleMetadata, CapsuleSpec
+from trpc_service.cell.effects import (
+    EffectStatus as CellEffectStatus,
+)
+from trpc_service.cell.effects import (
+    ReconciliationConflict as CellReconciliationConflict,
+)
+from trpc_service.cell.effects import (
+    ReconciliationEvidence as CellReconciliationEvidence,
+)
+from trpc_service.cell.effects import (
+    ReconciliationOutcome as CellReconciliationOutcome,
+)
+from trpc_service.cell.events import CellAddress, EventDraft
+from trpc_service.cell.intents import IntentRisk, PolicyDecision, ToolIntent
+from trpc_service.cell.postgres import PostgresEffectLedger, PostgresEventStore
+from trpc_service.cell.reconciliation import (
+    EffectReconciliationCoordinator as CellEffectReconciliationCoordinator,
+)
+from trpc_service.cell.reconciliation import (
+    ProviderReconciler as CellProviderReconciler,
+)
 from trpc_service.channels.envelopes import InboundEnvelope, PayloadKind
 from trpc_service.config.settings import SchedulerVersion
 from trpc_service.runtime import TenantRuntime
@@ -137,6 +160,8 @@ class RuntimeProbeConfig:
     fixture_dsn: str = ""
     runtime_dsn: str = ""
     reconciler_dsn: str = ""
+    cell_executor_dsn: str = ""
+    cell_reconciler_dsn: str = ""
     cleanup_dsn: str = ""
     provider_execute_url: str = ""
     provider_status_url: str = ""
@@ -153,6 +178,8 @@ class RuntimeProbeConfig:
         runtime = os.getenv("TRPC_KIND_PROBE_RUNTIME_DSN", "").strip()
         reconciler = os.getenv("TRPC_KIND_TOOL_RECONCILER_DSN", "").strip()
         reconciler = reconciler or os.getenv("TRPC_KIND_PROBE_RECONCILER_DSN", "").strip()
+        cell_executor = os.getenv("TRPC_KIND_CELL_EXECUTOR_DSN", "").strip()
+        cell_reconciler = os.getenv("TRPC_KIND_CELL_RECONCILER_DSN", "").strip()
         cleanup = os.getenv("TRPC_KIND_PROBE_CLEANUP_DSN", "").strip()
         cleanup = cleanup or os.getenv("TRPC_KIND_PROBE_MIGRATION_DSN", "").strip()
         provider_base = (
@@ -179,6 +206,8 @@ class RuntimeProbeConfig:
             fixture_dsn=fixture or runtime_base or worker,
             runtime_dsn=runtime or runtime_base or worker,
             reconciler_dsn=reconciler or worker or runtime_base,
+            cell_executor_dsn=cell_executor,
+            cell_reconciler_dsn=cell_reconciler,
             cleanup_dsn=cleanup,
             provider_execute_url=provider_execute,
             provider_status_url=provider_status,
@@ -200,6 +229,10 @@ class RuntimeProbeConfig:
         if command in {"all", "reconcile"}:
             if not self.reconciler_dsn:
                 missing.append("TRPC_KIND_TOOL_RECONCILER_DSN/TRPC_KIND_PROBE_RECONCILER_DSN")
+            if not self.cell_executor_dsn:
+                missing.append("TRPC_KIND_CELL_EXECUTOR_DSN")
+            if not self.cell_reconciler_dsn:
+                missing.append("TRPC_KIND_CELL_RECONCILER_DSN")
             for name, value in (
                 ("TRPC_KIND_PROVIDER_EXECUTE_URL", self.provider_execute_url),
                 ("TRPC_KIND_PROVIDER_STATUS_URL", self.provider_status_url),
@@ -239,6 +272,15 @@ class ExecutionFixture:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CellEffectFixture:
+    """A worker-journaled Cell intent used by the real effect probe."""
+
+    tenant_id: str
+    address: CellAddress
+    intent: ToolIntent
+
+
 class ProbeFixtures:
     """Create isolated tenant rows; never reuse a customer's identifiers."""
 
@@ -250,6 +292,8 @@ class ProbeFixtures:
         self.secondary_binding = f"kind-probe-binding-b-{suffix}"
         self.pool = pool
         self.execution_fixtures: list[ExecutionFixture] = []
+        self.cell_effect_fixtures: list[CellEffectFixture] = []
+        self.cell_capsule_digest: str | None = None
 
     @property
     def tenants(self) -> tuple[str, str]:
@@ -384,6 +428,136 @@ class ProbeFixtures:
         self.execution_fixtures.append(fixture)
         return fixture
 
+    async def add_cell_effect(self, label: str) -> CellEffectFixture:
+        """Create a real capsule, Cell branch and causal intent/policy events.
+
+        This method deliberately runs with the fixture/worker pool.  The
+        executor and reconciler pools are supplied separately by the caller,
+        so a successful probe proves the role boundaries rather than merely
+        exercising the repository with one privileged connection.
+        """
+
+        if self.cell_capsule_digest is None:
+            event_store = PostgresEventStore(self.pool)
+            capsule = AgentCapsule(
+                metadata=CapsuleMetadata(
+                    tenant_id=self.primary_tenant,
+                    name=f"kind-cell-probe-{uuid.uuid4().hex}",
+                ),
+                spec=CapsuleSpec(
+                    graph="probe://kind-cell/graph",
+                    prompt="probe://kind-cell/prompt",
+                    model_policy="probe://kind-cell/model-policy",
+                    tool_manifest="probe://kind-cell/tool-manifest",
+                    governance_policy="probe://kind-cell/governance",
+                    storage_profile="probe://kind-cell/storage",
+                ),
+            ).sign(Ed25519PrivateKey.generate(), key_id="kind-cell-probe")
+            self.cell_capsule_digest = await event_store.ensure_capsule(
+                self.primary_tenant,
+                capsule,
+                trust_class="runtime_projection",
+            )
+
+        assert self.cell_capsule_digest is not None
+        suffix = f"{label}-{uuid.uuid4().hex}"
+        session_id = f"kind-cell-session-{suffix}"
+        cell_id = f"kind-cell-{suffix}"
+        address = CellAddress(
+            tenant_id=self.primary_tenant,
+            app_id="kind-probe-app",
+            cell_id=cell_id,
+            session_id=session_id,
+            capsule_digest=self.cell_capsule_digest,
+            branch_id="main",
+        )
+        event_store = PostgresEventStore(self.pool)
+        async with self.pool.acquire() as connection, connection.transaction():
+            await connection.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", self.primary_tenant
+            )
+            await connection.execute(
+                """
+                INSERT INTO sessions (
+                    tenant_id,session_id,app_id,principal_id,
+                    lease_owner,lease_epoch,lease_expires_at
+                ) VALUES ($1,$2,'kind-probe-app',$3,$4,1,
+                          clock_timestamp()+interval '10 minutes')
+                """,
+                self.primary_tenant,
+                session_id,
+                f"kind-cell-principal-{suffix}",
+                OWNER_ID,
+            )
+        await event_store.ensure_cell(address)
+        intent = ToolIntent(
+            tenant_id=self.primary_tenant,
+            app_id=address.app_id,
+            cell_id=address.cell_id,
+            session_id=address.session_id,
+            capsule_digest=address.capsule_digest,
+            branch_id=address.branch_id,
+            tool_name="probe_cell_external_effect",
+            arguments={"label": label},
+            intent_id=f"kind-cell-intent-{suffix}",
+            policy_decision=PolicyDecision.ALLOW,
+            risk=IntentRisk.NON_IDEMPOTENT,
+            trace_id=f"kind-cell-trace-{suffix}",
+            request_id=f"kind-cell-request-{suffix}",
+        )
+        intent_event = await event_store.append(
+            EventDraft(
+                tenant_id=address.tenant_id,
+                app_id=address.app_id,
+                cell_id=address.cell_id,
+                session_id=address.session_id,
+                capsule_digest=address.capsule_digest,
+                branch_id=address.branch_id,
+                event_type="tool.intent.created",
+                event_id=f"{intent.intent_id}-event",
+                payload={
+                    "intent_id": intent.intent_id,
+                    "tool_name": intent.tool_name,
+                    "arguments_hash": intent.arguments_hash,
+                    "effect_key": intent.effect_key,
+                    "risk": str(intent.risk),
+                },
+                trace_id=intent.trace_id,
+                request_id=intent.request_id,
+            ),
+            session_lease_owner=OWNER_ID,
+            session_fencing_token=1,
+            lease_owner=OWNER_ID,
+            lease_epoch=1,
+        )
+        await event_store.append(
+            EventDraft(
+                tenant_id=address.tenant_id,
+                app_id=address.app_id,
+                cell_id=address.cell_id,
+                session_id=address.session_id,
+                capsule_digest=address.capsule_digest,
+                branch_id=address.branch_id,
+                event_type="policy.decided",
+                event_id=f"{intent.intent_id}-policy",
+                causation_id=intent_event.event_id,
+                payload={
+                    "intent_id": intent.intent_id,
+                    "tool_name": intent.tool_name,
+                    "decision": str(intent.policy_decision),
+                },
+                trace_id=intent.trace_id,
+                request_id=intent.request_id,
+            ),
+            session_lease_owner=OWNER_ID,
+            session_fencing_token=1,
+            lease_owner=OWNER_ID,
+            lease_epoch=1,
+        )
+        fixture = CellEffectFixture(self.primary_tenant, address, intent)
+        self.cell_effect_fixtures.append(fixture)
+        return fixture
+
     async def cleanup(self, cleanup_dsn: str) -> None:
         """Remove only this probe's rows using the migration authority.
 
@@ -515,9 +689,17 @@ class ProviderHTTPClient:
         self.execute_calls = 0
         self.status_queries = 0
 
-    def _status_url(self, intent: ExecutionProbeIntent) -> str:
+    def _status_url(self, intent: object) -> str:
         template = self.config.provider_status_url
-        encoded = quote(intent.execution_key, safe="")
+        execution_key = getattr(intent, "execution_key", None) or getattr(
+            intent, "effect_key", None
+        )
+        if not isinstance(execution_key, str) or not execution_key:
+            raise ValueError("provider probe intent has no effect key")
+        tenant_id = getattr(intent, "tenant_id", "")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise ValueError("provider probe intent has no tenant")
+        encoded = quote(execution_key, safe="")
         if "{execution_key}" in template:
             return template.replace("{execution_key}", encoded)
         parsed = urlsplit(template)
@@ -538,9 +720,9 @@ class ProviderHTTPClient:
         query = dict(_query_pairs(parsed.query))
         query.update(
             {
-                "tenant_id": intent.tenant_id,
-                "execution_key": intent.execution_key,
-                "attempt": str(intent.attempt),
+                "tenant_id": tenant_id,
+                "execution_key": execution_key,
+                "attempt": str(getattr(intent, "attempt", 1)),
             }
         )
         return urlunsplit(
@@ -580,7 +762,7 @@ class ProviderHTTPClient:
 
     async def probe(
         self,
-        intent: ExecutionProbeIntent,
+        intent: object,
         _receipt: object,
     ) -> Mapping[str, object]:
         self.status_queries += 1
@@ -906,6 +1088,224 @@ async def _run_reconciliation(
     }
 
 
+def _cell_provider_intent(intent: ToolIntent) -> ExecutionProbeIntent:
+    """Project a Cell intent onto the provider client's content-free view."""
+
+    return ExecutionProbeIntent(
+        tenant_id=intent.tenant_id,
+        execution_key=intent.effect_key,
+        turn_id=intent.session_id,
+        tool_name=intent.tool_name,
+        arguments_hash=intent.arguments_hash,
+        app_id=intent.app_id,
+        session_id=intent.session_id,
+        trace_id=intent.trace_id,
+        attempt=1,
+    )
+
+
+async def _prepare_cell_ambiguous(ledger: PostgresEffectLedger, fixture: CellEffectFixture) -> Any:
+    claim = await ledger.claim(
+        fixture.intent,
+        worker_id=OWNER_ID,
+        lease_seconds=30,
+    )
+    if not claim.acquired or claim.receipt.status != CellEffectStatus.RUNNING:
+        raise RuntimeError("cell executor did not acquire a fresh effect")
+    return await ledger.complete(
+        fixture.intent,
+        attempt=claim.receipt.attempt,
+        status=CellEffectStatus.AMBIGUOUS,
+        worker_id=OWNER_ID,
+        error_type="provider_response_lost",
+    )
+
+
+async def _cell_evidence_count(
+    pool: asyncpg.Pool,
+    tenant_id: str,
+    effect_key: str,
+    attempt: int,
+) -> int:
+    async with pool.acquire() as connection, connection.transaction():
+        await connection.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
+        value = await connection.fetchval(
+            """
+            SELECT count(*)
+              FROM cell_effect_reconciliations
+             WHERE tenant_id=$1 AND effect_key=$2 AND attempt=$3
+            """,
+            tenant_id,
+            effect_key,
+            attempt,
+        )
+    return int(value or 0)
+
+
+async def _run_cell_reconciliation(
+    fixtures: ProbeFixtures,
+    executor_pool: asyncpg.Pool,
+    reconciler_pool: asyncpg.Pool,
+    config: RuntimeProbeConfig,
+) -> dict[str, object]:
+    """Exercise Cell executor -> reconciler SECURITY DEFINER CAS end to end."""
+
+    executor = PostgresEffectLedger(executor_pool, tenant_id=fixtures.primary_tenant)
+    reconciler_ledger = PostgresEffectLedger(
+        reconciler_pool,
+        tenant_id=fixtures.primary_tenant,
+    )
+    provider = ProviderHTTPClient(config)
+    provider_reconciler = CellProviderReconciler(
+        provider.probe,
+        reconciler_id="kind-cell-reconciler",
+    )
+    coordinator = CellEffectReconciliationCoordinator(reconciler_ledger, provider_reconciler)
+    checks: dict[str, object] = {}
+    reasons: list[str] = []
+
+    applied_fixture = await fixtures.add_cell_effect("applied")
+    ambiguous = await _prepare_cell_ambiguous(executor, applied_fixture)
+    before_metrics = await provider.metrics()
+    before_calls = _provider_call_count(before_metrics)
+    execute_status = await provider.execute_once(_cell_provider_intent(applied_fixture.intent))
+    if execute_status is not None and execute_status < 400:
+        raise RuntimeError("cell provider response-loss fault was not activated")
+    evidence = await provider_reconciler.probe(applied_fixture.intent, ambiguous)
+    succeeded = await coordinator.reconcile(
+        applied_fixture.intent,
+        ambiguous,
+        evidence=evidence,
+    )
+    duplicate = await coordinator.reconcile(
+        applied_fixture.intent,
+        succeeded,
+        evidence=evidence,
+    )
+    applied_rows = await _cell_evidence_count(
+        reconciler_pool,
+        applied_fixture.tenant_id,
+        applied_fixture.intent.effect_key,
+        1,
+    )
+    after_metrics = await provider.metrics()
+    after_calls = _provider_call_count(after_metrics)
+    provider_delta = (
+        after_calls - before_calls if before_calls is not None and after_calls is not None else None
+    )
+    applied_ok = (
+        succeeded.status == CellEffectStatus.SUCCEEDED
+        and duplicate.status == CellEffectStatus.SUCCEEDED
+        and evidence.outcome == CellReconciliationOutcome.APPLIED
+        and applied_rows == 1
+        and provider_delta == 1
+    )
+    checks["applied_to_succeeded"] = {
+        "status": "pass" if applied_ok else "fail",
+        "executor_status": CellEffectStatus.AMBIGUOUS.value,
+        "reconciled_status": succeeded.status.value,
+        "evidence_rows": applied_rows,
+        "provider_execution_delta": provider_delta,
+    }
+    if not applied_ok:
+        reasons.append("Cell applied evidence did not converge through the reconciler CAS")
+
+    unknown_fixture = await fixtures.add_cell_effect("unknown")
+    unknown_ambiguous = await _prepare_cell_ambiguous(executor, unknown_fixture)
+    unknown_evidence = await provider_reconciler.probe(
+        unknown_fixture.intent,
+        unknown_ambiguous,
+    )
+    unknown_result = await coordinator.reconcile(
+        unknown_fixture.intent,
+        unknown_ambiguous,
+        evidence=unknown_evidence,
+    )
+    unknown_duplicate = await coordinator.reconcile(
+        unknown_fixture.intent,
+        unknown_result,
+        evidence=unknown_evidence,
+    )
+    unknown_rows = await _cell_evidence_count(
+        reconciler_pool,
+        unknown_fixture.tenant_id,
+        unknown_fixture.intent.effect_key,
+        1,
+    )
+    replay = await executor.claim(
+        unknown_fixture.intent,
+        worker_id=OWNER_ID,
+        lease_seconds=30,
+    )
+    unknown_ok = (
+        unknown_result.status == CellEffectStatus.UNKNOWN
+        and unknown_duplicate.status == CellEffectStatus.UNKNOWN
+        and unknown_evidence.outcome == CellReconciliationOutcome.UNKNOWN
+        and unknown_rows == 1
+        and not replay.acquired
+    )
+    checks["unknown_blocks_replay"] = {
+        "status": "pass" if unknown_ok else "fail",
+        "reconciled_status": unknown_result.status.value,
+        "automatic_replay": replay.acquired,
+        "evidence_rows": unknown_rows,
+    }
+    if not unknown_ok:
+        reasons.append("Cell unknown outcome did not block executor replay")
+
+    stale_evidence = CellReconciliationEvidence(
+        unknown_fixture.intent.effect_key,
+        2,
+        CellReconciliationOutcome.UNKNOWN,
+        evidence_summary="provider_status_unknown",
+        trace_id=unknown_fixture.intent.trace_id,
+        reconciler_id="kind-cell-reconciler",
+        tenant_id=unknown_fixture.tenant_id,
+    )
+    stale_rejected = False
+    try:
+        await reconciler_ledger.reconcile(unknown_fixture.intent, 2, stale_evidence)
+    except CellReconciliationConflict:
+        stale_rejected = True
+    checks["stale_attempt_rejected"] = {"status": "pass" if stale_rejected else "fail"}
+    if not stale_rejected:
+        reasons.append("Cell stale reconciliation attempt was accepted")
+
+    cross_tenant_evidence = CellReconciliationEvidence(
+        applied_fixture.intent.effect_key,
+        1,
+        CellReconciliationOutcome.APPLIED,
+        evidence_summary="provider_status_applied",
+        trace_id=applied_fixture.intent.trace_id,
+        reconciler_id="kind-cell-reconciler",
+        tenant_id=fixtures.secondary_tenant,
+    )
+    cross_tenant_rejected = False
+    try:
+        await reconciler_ledger.reconcile(applied_fixture.intent, 1, cross_tenant_evidence)
+    except CellReconciliationConflict:
+        cross_tenant_rejected = True
+    checks["cross_tenant_rejected"] = {"status": "pass" if cross_tenant_rejected else "fail"}
+    if not cross_tenant_rejected:
+        reasons.append("Cell cross-tenant reconciliation evidence was accepted")
+
+    if provider.execute_calls != 1:
+        reasons.append("Cell reconciliation invoked the provider more than once")
+    return {
+        "status": "pass"
+        if not reasons
+        and all(
+            isinstance(item, Mapping) and item.get("status") == "pass" for item in checks.values()
+        )
+        else "fail",
+        "checks": checks,
+        "rejection_reasons": reasons,
+        "tenant_sha256": _safe_hash(fixtures.primary_tenant),
+        "provider_execute_calls": provider.execute_calls,
+        "provider_status_queries": provider.status_queries,
+    }
+
+
 async def _count_im_rows(
     pool: asyncpg.Pool,
     tenant_id: str,
@@ -1105,6 +1505,8 @@ async def run_probe(
     fixture_pool: asyncpg.Pool | None = None
     runtime_pool: asyncpg.Pool | None = None
     reconciler_pool: asyncpg.Pool | None = None
+    cell_executor_pool: asyncpg.Pool | None = None
+    cell_reconciler_pool: asyncpg.Pool | None = None
     fixtures: ProbeFixtures | None = None
     checks: dict[str, object] = {}
     errors: list[str] = []
@@ -1130,6 +1532,27 @@ async def run_probe(
                     "rejection_reasons": [_safe_exception(exc)],
                 }
                 errors.append("tool_reconciliation")
+            cell_executor_pool = await _create_pool(
+                config.cell_executor_dsn,
+                application_name="kind-runtime-probe-cell-executor",
+            )
+            cell_reconciler_pool = await _create_pool(
+                config.cell_reconciler_dsn,
+                application_name="kind-runtime-probe-cell-reconciler",
+            )
+            try:
+                checks["cell_effect_reconciliation"] = await _run_cell_reconciliation(
+                    fixtures,
+                    cell_executor_pool,
+                    cell_reconciler_pool,
+                    config,
+                )
+            except Exception as exc:  # keep report keyless and actionable
+                checks["cell_effect_reconciliation"] = {
+                    "status": "fail",
+                    "rejection_reasons": [_safe_exception(exc)],
+                }
+                errors.append("cell_effect_reconciliation")
         if command in {"all", "im"}:
             runtime_pool = await _create_pool(
                 config.runtime_dsn,
@@ -1172,7 +1595,13 @@ async def run_probe(
                 }
         else:
             cleanup_status = {"status": "not_run", "reason": "fixture seed did not complete"}
-        for pool in (runtime_pool, reconciler_pool, fixture_pool):
+        for pool in (
+            runtime_pool,
+            cell_reconciler_pool,
+            cell_executor_pool,
+            reconciler_pool,
+            fixture_pool,
+        ):
             if pool is not None:
                 await pool.close()
     ended = datetime.now(UTC)
@@ -1184,6 +1613,17 @@ async def run_probe(
     if isinstance(reconciliation, Mapping):
         provider_execute_calls = reconciliation.get("provider_execute_calls")
         provider_status_queries = reconciliation.get("provider_status_queries")
+    cell_reconciliation = checks.get("cell_effect_reconciliation")
+    cell_provider_execute_calls = (
+        cell_reconciliation.get("provider_execute_calls")
+        if isinstance(cell_reconciliation, Mapping)
+        else None
+    )
+    cell_provider_status_queries = (
+        cell_reconciliation.get("provider_status_queries")
+        if isinstance(cell_reconciliation, Mapping)
+        else None
+    )
     return {
         "schema_version": PROBE_SCHEMA_VERSION,
         "probe": "kind_runtime_probe",
@@ -1198,6 +1638,8 @@ async def run_probe(
         "source_fingerprint": _source_fingerprint(),
         "provider_execute_calls": provider_execute_calls,
         "provider_status_queries": provider_status_queries,
+        "cell_provider_execute_calls": cell_provider_execute_calls,
+        "cell_provider_status_queries": cell_provider_status_queries,
         "checks": checks,
         "cleanup": cleanup_status,
         "rejection_reasons": errors,
@@ -1205,6 +1647,8 @@ async def run_probe(
             "fixture_dsn": bool(config.fixture_dsn),
             "runtime_dsn": bool(config.runtime_dsn),
             "reconciler_dsn": bool(config.reconciler_dsn),
+            "cell_executor_dsn": bool(config.cell_executor_dsn),
+            "cell_reconciler_dsn": bool(config.cell_reconciler_dsn),
             "cleanup_dsn": bool(config.cleanup_dsn),
         },
     }

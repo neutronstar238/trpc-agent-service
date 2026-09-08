@@ -95,6 +95,27 @@ def _evidence(
     )
 
 
+def _claimed_execution_row(
+    status: str | ExecutionStatus = ExecutionStatus.AMBIGUOUS,
+    *,
+    attempt: int = 1,
+    owner: str = "reconciler-a",
+    epoch: int = 1,
+    lease_expires_at: datetime | None = None,
+    **extra: object,
+) -> dict[str, object]:
+    row: dict[str, object] = {
+        "status": str(status),
+        "attempt": attempt,
+        "reconciliation_owner": owner,
+        "reconciliation_epoch": epoch,
+        "reconciliation_lease_expires_at": lease_expires_at
+        or (datetime.now(UTC) + timedelta(minutes=1)),
+    }
+    row.update(extra)
+    return row
+
+
 async def _begin(
     ledger: PostgresExecutionLedger,
     *,
@@ -426,7 +447,8 @@ async def test_claim_ambiguous_returns_empty_without_rows() -> None:
 
     assert claims == []
     query, args = connection.calls[1]
-    assert "FOR UPDATE OF execution SKIP LOCKED" in query
+    assert "claim_tool_execution_ambiguous" in query
+    assert "UPDATE tool_executions" not in query
     assert args == ("tenant-a", 3, "reconciler-a", 12.5)
 
 
@@ -611,17 +633,11 @@ async def test_list_evidence_rejects_malformed_rows(row: dict[str, object], erro
 
 
 @pytest.mark.asyncio
-async def test_reconcile_unknown_without_claim_converges_to_unknown() -> None:
+async def test_reconcile_with_claim_converges_to_unknown() -> None:
     evidence = _evidence(ReconciliationOutcome.UNKNOWN)
     connection = _FakeConnection(
         rows=[
-            {
-                "status": "unknown",
-                "attempt": 1,
-                "reconciliation_owner": None,
-                "reconciliation_epoch": 0,
-                "reconciliation_lease_expires_at": None,
-            },
+            _claimed_execution_row("unknown"),
             None,
             {"execution_key": "execution-a", "status": "unknown", "attempt": 1},
         ],
@@ -633,6 +649,8 @@ async def test_reconcile_unknown_without_claim_converges_to_unknown() -> None:
         tenant_id="tenant-a",
         expected_attempt=1,
         evidence=evidence,
+        claim_owner="reconciler-a",
+        claim_epoch=1,
     )
 
     assert result.status is ExecutionStatus.UNKNOWN
@@ -647,13 +665,7 @@ async def test_reconcile_duplicate_same_digest_returns_current_record() -> None:
     evidence = _evidence(ReconciliationOutcome.APPLIED)
     connection = _FakeConnection(
         rows=[
-            {
-                "status": "ambiguous",
-                "attempt": 1,
-                "reconciliation_owner": None,
-                "reconciliation_epoch": 0,
-                "reconciliation_lease_expires_at": None,
-            },
+            _claimed_execution_row(),
             None,
             {"outcome": "applied"},
         ],
@@ -665,6 +677,8 @@ async def test_reconcile_duplicate_same_digest_returns_current_record() -> None:
         tenant_id="tenant-a",
         expected_attempt=1,
         evidence=evidence,
+        claim_owner="reconciler-a",
+        claim_epoch=1,
     )
 
     assert result.status is ExecutionStatus.AMBIGUOUS
@@ -672,10 +686,64 @@ async def test_reconcile_duplicate_same_digest_returns_current_record() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconcile_exact_terminal_duplicate_is_read_only_without_claim() -> None:
+    evidence = _evidence(ReconciliationOutcome.APPLIED)
+    connection = _FakeConnection(
+        rows=[
+            _claimed_execution_row(
+                "succeeded",
+                lease_expires_at=datetime.now(UTC) - timedelta(minutes=1),
+                owner="reconciler-a",
+                epoch=1,
+            ),
+            {"outcome": "applied", "evidence_digest": evidence.evidence_digest},
+        ],
+    )
+
+    result = await PostgresExecutionLedger(_FakePool(connection)).reconcile(
+        "execution-a",
+        tenant_id="tenant-a",
+        expected_attempt=1,
+        evidence=evidence,
+    )
+
+    assert result.status is ExecutionStatus.SUCCEEDED
+    assert not any("INSERT INTO tool_execution_reconciliations" in q for q, _ in connection.calls)
+    assert not any("reconcile_tool_execution_cas" in q for q, _ in connection.calls)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_exact_unknown_duplicate_is_read_only_without_claim() -> None:
+    evidence = _evidence(ReconciliationOutcome.UNKNOWN)
+    connection = _FakeConnection(
+        rows=[
+            _claimed_execution_row(
+                "unknown",
+                lease_expires_at=datetime.now(UTC) - timedelta(minutes=1),
+                owner="reconciler-a",
+                epoch=1,
+            ),
+            {"outcome": "unknown", "evidence_digest": evidence.evidence_digest},
+        ],
+    )
+
+    result = await PostgresExecutionLedger(_FakePool(connection)).reconcile(
+        "execution-a",
+        tenant_id="tenant-a",
+        expected_attempt=1,
+        evidence=evidence,
+    )
+
+    assert result.status is ExecutionStatus.UNKNOWN
+    assert not any("INSERT INTO tool_execution_reconciliations" in q for q, _ in connection.calls)
+    assert not any("reconcile_tool_execution_cas" in q for q, _ in connection.calls)
+
+
+@pytest.mark.asyncio
 async def test_reconcile_duplicate_missing_row_is_concurrent_conflict() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "ambiguous", "attempt": 1},
+            _claimed_execution_row(),
             None,
             None,
         ],
@@ -688,6 +756,8 @@ async def test_reconcile_duplicate_missing_row_is_concurrent_conflict() -> None:
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.APPLIED),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -695,7 +765,7 @@ async def test_reconcile_duplicate_missing_row_is_concurrent_conflict() -> None:
 async def test_reconcile_duplicate_digest_with_different_outcome_conflicts() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "ambiguous", "attempt": 1},
+            _claimed_execution_row(),
             None,
             {"outcome": "not_applied"},
         ],
@@ -708,6 +778,8 @@ async def test_reconcile_duplicate_digest_with_different_outcome_conflicts() -> 
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.APPLIED),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -715,7 +787,7 @@ async def test_reconcile_duplicate_digest_with_different_outcome_conflicts() -> 
 async def test_reconcile_prior_evidence_conflict_is_rejected_before_insert() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "ambiguous", "attempt": 1},
+            _claimed_execution_row(),
             {"outcome": "not_applied"},
         ],
     )
@@ -726,6 +798,8 @@ async def test_reconcile_prior_evidence_conflict_is_rejected_before_insert() -> 
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.APPLIED),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -733,7 +807,7 @@ async def test_reconcile_prior_evidence_conflict_is_rejected_before_insert() -> 
 async def test_reconcile_prior_matching_evidence_continues_to_append_and_update() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "ambiguous", "attempt": 1},
+            _claimed_execution_row(),
             {"outcome": "applied"},
             {"execution_key": "execution-a", "status": "succeeded", "attempt": 1},
         ],
@@ -745,6 +819,8 @@ async def test_reconcile_prior_matching_evidence_continues_to_append_and_update(
         tenant_id="tenant-a",
         expected_attempt=1,
         evidence=_evidence(ReconciliationOutcome.APPLIED),
+        claim_owner="reconciler-a",
+        claim_epoch=1,
     )
 
     assert result.status is ExecutionStatus.SUCCEEDED
@@ -754,7 +830,7 @@ async def test_reconcile_prior_matching_evidence_continues_to_append_and_update(
 async def test_reconcile_terminal_state_conflict_is_rejected() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "succeeded", "attempt": 1},
+            _claimed_execution_row("succeeded"),
             None,
         ],
     )
@@ -765,14 +841,16 @@ async def test_reconcile_terminal_state_conflict_is_rejected() -> None:
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.NOT_APPLIED),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
 @pytest.mark.asyncio
-async def test_reconcile_terminal_matching_state_continues_to_cas() -> None:
+async def test_reconcile_terminal_matching_state_is_read_only() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "succeeded", "attempt": 1},
+            _claimed_execution_row("succeeded"),
             None,
             None,
             {"status": "succeeded", "attempt": 1},
@@ -785,9 +863,13 @@ async def test_reconcile_terminal_matching_state_continues_to_cas() -> None:
         tenant_id="tenant-a",
         expected_attempt=1,
         evidence=_evidence(ReconciliationOutcome.APPLIED),
+        claim_owner="reconciler-a",
+        claim_epoch=1,
     )
 
     assert result.status is ExecutionStatus.SUCCEEDED
+    assert not any("INSERT INTO tool_execution_reconciliations" in q for q, _ in connection.calls)
+    assert not any("reconcile_tool_execution_cas" in q for q, _ in connection.calls)
 
 
 @pytest.mark.asyncio
@@ -800,6 +882,8 @@ async def test_reconcile_started_state_is_not_reconcilable() -> None:
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.UNKNOWN),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -818,6 +902,8 @@ async def test_reconcile_missing_or_stale_execution(rows: list[object], error: s
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.UNKNOWN),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -889,13 +975,7 @@ async def test_reconcile_rejects_stale_claim(current: dict[str, object]) -> None
 async def test_reconcile_cas_loss_accepts_matching_terminal_completion() -> None:
     connection = _FakeConnection(
         rows=[
-            {
-                "status": "ambiguous",
-                "attempt": 1,
-                "reconciliation_owner": None,
-                "reconciliation_epoch": 0,
-                "reconciliation_lease_expires_at": None,
-            },
+            _claimed_execution_row(),
             None,
             None,
             {"status": "succeeded", "attempt": 1},
@@ -908,6 +988,8 @@ async def test_reconcile_cas_loss_accepts_matching_terminal_completion() -> None
         tenant_id="tenant-a",
         expected_attempt=1,
         evidence=_evidence(ReconciliationOutcome.APPLIED),
+        claim_owner="reconciler-a",
+        claim_epoch=1,
     )
 
     assert result.status is ExecutionStatus.SUCCEEDED
@@ -918,7 +1000,7 @@ async def test_reconcile_cas_loss_accepts_matching_terminal_completion() -> None
 async def test_reconcile_cas_loss_with_missing_latest_row_conflicts() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "ambiguous", "attempt": 1},
+            _claimed_execution_row(),
             None,
             None,
         ],
@@ -931,6 +1013,8 @@ async def test_reconcile_cas_loss_with_missing_latest_row_conflicts() -> None:
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.APPLIED),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -938,7 +1022,7 @@ async def test_reconcile_cas_loss_with_missing_latest_row_conflicts() -> None:
 async def test_reconcile_cas_loss_with_different_latest_status_conflicts() -> None:
     connection = _FakeConnection(
         rows=[
-            {"status": "ambiguous", "attempt": 1},
+            _claimed_execution_row(),
             None,
             None,
             {"status": "failed", "attempt": 1},
@@ -952,6 +1036,8 @@ async def test_reconcile_cas_loss_with_different_latest_status_conflicts() -> No
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.APPLIED),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 
@@ -966,6 +1052,8 @@ async def test_reconcile_rejects_cross_tenant_evidence_before_database_access() 
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=evidence,
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
     assert connection.calls == []
@@ -979,6 +1067,8 @@ async def test_reconcile_rejects_stale_attempt_and_execution_key_evidence() -> N
             tenant_id="tenant-a",
             expected_attempt=2,
             evidence=_evidence(ReconciliationOutcome.UNKNOWN, attempt=1),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
     with pytest.raises(ReconciliationConflict, match="execution key does not match"):
@@ -987,6 +1077,8 @@ async def test_reconcile_rejects_stale_attempt_and_execution_key_evidence() -> N
             tenant_id="tenant-a",
             expected_attempt=1,
             evidence=_evidence(ReconciliationOutcome.UNKNOWN, execution_key="other-key"),
+            claim_owner="reconciler-a",
+            claim_epoch=1,
         )
 
 

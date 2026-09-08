@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 MIGRATION = ROOT / "migrations" / "versions" / "0027_tool_execution_reconciliation.py"
+HARDENING = ROOT / "migrations" / "versions" / "0029_reconciliation_security_hardening.py"
 EXECUTION = ROOT / "trpc_service" / "tool" / "execution.py"
 RECONCILIATION = ROOT / "trpc_service" / "tool" / "reconciliation.py"
 POSTGRES = ROOT / "trpc_service" / "tool" / "postgres.py"
@@ -60,11 +61,17 @@ def test_immutable_trigger_checks_authenticated_session_role() -> None:
 
 def test_reconciler_claim_is_skip_locked_and_provider_path_has_no_tool_call() -> None:
     postgres = POSTGRES.read_text(encoding="utf-8")
+    hardening = HARDENING.read_text(encoding="utf-8")
     reconciliation = RECONCILIATION.read_text(encoding="utf-8")
     execution = EXECUTION.read_text(encoding="utf-8")
-    assert "for update of execution skip locked" in postgres.lower()
-    assert "reconciliation_epoch=execution.reconciliation_epoch+1" in postgres
-    assert "status IN ('ambiguous','unknown')" in postgres
+    claim_fn = hardening.split(
+        "CREATE OR REPLACE FUNCTION public.claim_tool_execution_ambiguous", 1
+    )[1].split("ALTER FUNCTION public.claim_tool_execution_ambiguous", 1)[0]
+    normalized_claim = re.sub(r"\s+", "", claim_fn).lower()
+    assert "forupdateofexecutionskiplocked" in normalized_claim
+    assert "reconciliation_epoch=execution.reconciliation_epoch+1" in normalized_claim
+    assert "statusin('ambiguous','unknown')" in normalized_claim
+    assert "public.claim_tool_execution_ambiguous" in postgres
     assert "class ProviderReconciler" in reconciliation
     assert "class ToolExecutionReconciliationCoordinator" in reconciliation
     assert "self.reconciler.probe" in reconciliation

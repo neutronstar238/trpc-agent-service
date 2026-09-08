@@ -1,5 +1,7 @@
 # 验收追踪矩阵
 
+当前本机实测结果及随仓库归档的证据见 [2026-09-08 本机创新验收](local-acceptance-2026-09-08.md)。
+
 本表把题目验收项拆成三层：**设计**证明方案覆盖了问题，**离线**证明仓库内的协议/模型/模拟
 可以运行，**生产**只接受真实依赖和真实运行态门禁。三层不能互相替代；特别是离线通过不等于
 企业微信、数据库或 Kubernetes 已经通过。
@@ -10,15 +12,15 @@
 
 | # | 题目验收要求 | 设计层证据 | 离线层证据 | 生产层证据/当前结论 |
 |---:|---|---|---|---|
-| 1 | 多租户、节点部署、同步、多后端、IM、治理监控、故障恢复 | `architecture.md`、`consistency.md`、`im-channels.md`、`operations.md`、`security.md`；总图明确 Gateway/Worker/Channel Adapter/Storage Adapter/Admin API/Telemetry Collector | 单元测试、`cell-demo`、Compose/Kustomize 静态渲染与模拟门禁 | 真实多节点、数据库、IM、故障和观测门禁；当前仓库证据为 `not_run` |
-| 2 | tenant、agent、binding、session、event、memory、summary、audit 关系 | `data-model.md` 的 ER 图与字段说明；`0001`—`0028` 迁移（当前唯一 head 为 `0028_evolution_least_privilege`） | 迁移契约/RLS 单元测试、离线 schema 检查 | 本机 kind 可执行真实 PostgreSQL/RLS/迁移预验收；ACK/生产仍为 `not_run` |
-| 3 | 至少两类 IM，且含微信/企业微信 | `im-channels.md` 对比企业微信 AI Bot WebSocket 与飞书加密 HTTP callback | `channels/wecom.py`、`channels/feishu.py` 及 Fake/协议测试 | 真实账号、回调、发送、重试和限流证据；当前为 `not_run` |
-| 4 | 至少三类后端及同步策略 | `consistency.md`、`migration.md`：PostgreSQL、Redis、pgvector/外部向量、S3/MinIO、外部 Memory | 适配器契约、迁移状态机和模拟测试 | 真实 PG/Redis/S3/向量迁移与恢复报告；当前为 `not_run` |
-| 5 | 完整消息链与 trace/request 贯穿 | `architecture.md`、`agent-cell-fabric.md` 时序图和 ID 语义 | 离线事件链、`cell-demo`、`SessionReady v2` W3C `trace_headers` 编解码/提取及 fake `queue.consume` span 契约测试 | 真实 OTel 父子 span 串联 IM→Runner→Tool→存储→回复；当前为 `not_run` |
+| 1 | 多租户、节点部署、同步、多后端、IM、治理监控、故障恢复 | `architecture.md`、`consistency.md`、`im-channels.md`、`operations.md`、`security.md`；总图明确 Gateway/Worker/Channel Adapter/Storage Adapter/Admin API/Telemetry Collector | 单元测试、`cell-demo`、Compose/Kustomize 静态渲染与模拟门禁；后端替代组合依赖预注册 adapter | 真实多节点、数据库、IM、故障和观测门禁；当前仓库证据为 `not_run` |
+| 2 | tenant、agent、binding、session、event、memory、summary、audit 关系 | `data-model.md` 的 ER 图与字段说明；`0001`—`0029` 迁移（当前唯一 head 为 `0029_reconciliation_security_hardening`） | 迁移契约/RLS 单元测试、离线 schema 检查 | 本机 kind 可执行真实 PostgreSQL/RLS/迁移预验收；ACK/生产仍为 `not_run` |
+| 3 | 至少两类 IM，且含微信/企业微信 | `im-channels.md` 对比企业微信 AI Bot WebSocket 与飞书加密 HTTP callback | `channels/wecom.py`、`channels/feishu.py` 及 Fake/协议测试；Kind 只测飞书 HTTP 和直接 WeCom runtime envelope，不测真实 WSS/full reply | 真实账号、WSS/回调、发送、重试和限流证据；当前为 `not_run` |
+| 4 | 至少三类后端及同步策略 | `consistency.md`、`migration.md`：内置 PostgreSQL/S3/pgvector；Redis、InMemory、外部向量/Memory 通过预注册 adapter 扩展 | 适配器契约、迁移状态机和模拟测试，不等于所有后端组合已部署 | 真实 PG/Redis/S3/向量迁移与恢复报告；当前为 `not_run` |
+| 5 | 完整消息链与 trace/request 贯穿 | `architecture.md`、`agent-cell-fabric.md` 时序图和 ID 语义 | 离线事件链、`cell-demo`、`SessionReady v2` W3C `trace_headers` 编解码/提取及 fake `queue.consume` span 契约测试；Kind 不证明 WeCom WSS/full reply | 真实 OTel 父子 span 串联 IM→Runner→Tool→存储→回复；当前为 `not_run` |
 | 6 | 至少八项生产风险 | `risks.md` 统一列出 32 项，包含 Cell/Capsule/Replay/Effect 风险 | 风险对应的负向/模拟门禁 | 真实故障注入、供应链、安全和恢复证据；当前为 `not_run` |
 | 7 | 明确 SDK 复用与平台新增边界 | `agent-cell-fabric.md` §9.1、`requirements.md` | SDK 兼容契约、锁文件与离线测试 | 发布候选仍需锁定 SDK、镜像和外部门禁；当前为 `not_run` |
-| 8 | 不明确副作用的查询与对账 | `agent-cell-fabric.md` §7.1：三态结果、attempt CAS、不可变脱敏证据 | InMemory 对账协调器、重复/并发、stale attempt、冲突证据和跨租户拒绝测试；`cell-demo` 展示供应商执行次数为一次；kind 可执行真实 PG authority/CAS 与假供应商 response-loss 查询 | 真实供应商状态查询和 ACK 恢复报告；当前为 `production=not_run` |
-| 9 | 可证明的候选演进与安全发布 | `agent-cell-fabric.md` §8.3：状态机、Judge、证书绑定、approval/CAS/outbox/rollback | `cell-evolve-demo`、双重 replay、零真实副作用、稳定 Merkle root、篡改/过期/跨租户/stale CAS 拒绝；kind 可执行真实 PG pointer/one-time use/outbox/rollback | 真实模型/工具/KMS、ACK 控制面和生产发布恢复；当前为 `production=not_run` |
+| 8 | 不明确副作用的查询与对账 | `agent-cell-fabric.md` §7.1：三态结果、attempt CAS、不可变脱敏证据 | InMemory 对账协调器、重复/并发、stale attempt、冲突证据和跨租户拒绝测试；Cell reconciliation 的 PostgreSQL authority 为专用 `trpc_cell_reconciler`，与 `trpc_cell_executor`/`trpc_tool_reconciler` 分离；`cell-demo` 展示供应商执行次数为一次；Kind 以 fake provider 的响应丢失/504、query-only 查询和明确的 provider/IM 网络拒绝探针验证隔离，仍不等于真实供应商证据 | 真实供应商状态查询和 ACK 恢复报告；当前为 `production_gate=not_run` |
+| 9 | 可证明的候选演进与安全发布 | `agent-cell-fabric.md` §8.3：状态机、Judge、证书绑定、approval/CAS/outbox/rollback | `cell-evolve-demo`、双重 replay、零真实副作用、稳定 Merkle root、篡改/过期/跨租户/stale CAS 拒绝；Kind 使用专用 `trpc_evolution_authority` PostgreSQL authority，Evolution Pod 的 NetworkPolicy 只允许 PostgreSQL，且拒绝 fake provider/IM egress；Evolution 仍是离线/内部控制面 | 真实模型/工具/KMS、ACK 控制面和生产发布恢复；当前为 `production_gate=not_run` |
 
 ## 当前状态的判定规则
 
@@ -31,7 +33,7 @@
 
 截至本版本，设计与离线验收路径已入库；离线命令的实际结果以当前环境输出为准，本地仓库没有可据此
 宣称真实生产通过的外部运行报告。`scripts/local_innovation_gate.py` 会记录 git SHA、source
-fingerprint、每项 case result、拒绝原因和 `offline/development`、`production` 两套结论。真实门禁命令和所需环境见 [`testing.md`](testing.md)、[`real-runtime.md`](real-runtime.md) 与
+fingerprint、每项 case result、拒绝原因和 `offline/development`、顶层 `production_gate` 两套结论。真实门禁命令和所需环境见 [`testing.md`](testing.md)、[`real-runtime.md`](real-runtime.md) 与
 [`operations.md`](operations.md)。
 
 ## 创新架构的可证伪离线验收
@@ -51,6 +53,7 @@ fingerprint、每项 case result、拒绝原因和 `offline/development`、`prod
 ```bash
 uv sync --extra dev --locked
 uv run trpc-service cell-demo --output runs/cell-fabric-demo.json
+uv run trpc-service cell-evolve-demo --output runs/cell-evolution-demo.json
 uv run python -m scripts.local_innovation_gate --require-core-demo \
   --output runs/multitenant/local-innovation-gate.json
 uv run pytest -q
@@ -63,7 +66,9 @@ docker compose config --quiet
 kubectl kustomize deploy/kustomize/overlays/production >/dev/null
 ```
 
-需要真实 PostgreSQL、Redis、S3、向量库或 IM 凭证的测试保持显式 opt-in；没有外部依赖时跳过并
+需要真实 PostgreSQL、Redis、S3、向量库或 IM 凭证的测试必须使用 `--allow-real-tests` 显式 opt-in，
+并在隔离 namespace/数据库/租户中暂停会消费同一数据的 reconciler、dispatcher、recovery 和 scheduler；
+没有外部依赖时跳过并
 记录 `not_run` 原因，不能把模拟结果标成生产验收。GitHub Actions 的通过范围与生产候选的额外
 门禁见 [`requirements.md`](requirements.md)。
 
@@ -73,7 +78,7 @@ kubectl kustomize deploy/kustomize/overlays/production >/dev/null
 |---|---|---|---|
 | Effect reconciliation | 合入 `observe` 与 query-only reconciler | 先内存/CAS，再 PG/RLS/authority，再真实供应商门禁 | 保持 legacy executor 权威，禁止 `cutover` |
 | Proof-Carrying Evolution | 合入独立控制面/离线工具 | 先 branch/replay/Judge，再 certificate/approval，再 pointer/outbox/rollback | 候选只可离线证明，不改变 active pointer |
-| Native `cutover` | 暂不合入 | 独立 Effect Executor、真实 PG、供应商与回滚证据另行评审 | 明确 `production=not_run` |
+| Native `cutover` | 暂不合入 | 独立 Effect Executor、真实 PG、供应商与回滚证据另行评审 | 明确 `production_gate=not_run` |
 
 ## ACK 验收边界
 

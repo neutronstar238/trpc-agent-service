@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "kind": "local_innovation_gate",
+  "generated_at": "2026-09-08T03:00:09Z",
+  "git_sha": "ff19d6d8a87d3f05c52f99e5d06492de037d12a3",
+  "git_sha_status": "available",
+  "source_fingerprint": {
+    "algorithm": "sha256",
+    "status": "available",
+    "value": "c1f5906237c1793bdb1d1e7655db80944a1773066b410644f5b555e6b4134022",
+    "file_count": 459,
+    "total_bytes": 8472914,
+    "file_count_limit": 10000,
+    "byte_limit": 134217728,
+    "included_roots": [
+      "Dockerfile",
+      ".dockerignore",
+      "alembic.ini",
+      "README.md",
+      "build.sh",
+      "clean.sh",
+      "coverage.sh",
+      "format.sh",
+      "lint.sh",
+      "lint_flake8.sh",
+      "start.sh",
+      "stop.sh",
+      "pyproject.toml",
+      "uv.lock",
+      "docker-compose.yml",
+      ".github/workflows",
+      "deploy",
+      "migrations",
+      "scripts",
+      "tests/integration",
+      "tests/simulation",
+      "trpc_service",
+      "runs/multitenant/ack-runtime-support.yaml",
+      "runs/multitenant/ack-runtime-minio.yaml",
+      "runs/multitenant/project_kubernetes_secrets.py",
+      "tests/unit"
+    ]
+  },
+  "scope": {
+    "mode": "offline",
+    "development": "pass",
+    "credentials_used": false,
+    "external_calls": 0,
+    "production_actions": false
+  },
+  "cases": [
+    {
+      "name": "candidate_lineage",
+      "status": "pass",
+      "assertions": [
+        "git SHA is recorded when local git or CI metadata provides it",
+        "source fingerprint is content-addressed and bounded"
+      ],
+      "git_sha_status": "available",
+      "source_fingerprint_status": "available"
+    },
+    {
+      "name": "offline_scope",
+      "status": "pass",
+      "assertions": [
+        "the gate does not contact PostgreSQL, Kubernetes, IM, model, KMS, or providers",
+        "the gate does not consume credentials or create external side effects",
+        "production status remains not_run regardless of offline results"
+      ],
+      "external_calls": 0,
+      "credentials_used": false
+    },
+    {
+      "name": "core_evolution_demo",
+      "module": "trpc_service.cell.evolution",
+      "cases": [
+        {
+          "name": "fork",
+          "status": "pass"
+        },
+        {
+          "name": "deterministic_replay",
+          "status": "pass"
+        },
+        {
+          "name": "shadow_zero_provider_calls",
+          "status": "pass"
+        },
+        {
+          "name": "certificate_and_promotion",
+          "status": "pass"
+        },
+        {
+          "name": "signed_rollback",
+          "status": "pass"
+        },
+        {
+          "name": "tampered_evidence_rejected",
+          "status": "pass",
+          "reason": "certificate signature is invalid"
+        },
+        {
+          "name": "cross_tenant_rejected",
+          "status": "pass",
+          "reason": "certificate source does not match promotion target"
+        },
+        {
+          "name": "expired_certificate_rejected",
+          "status": "pass",
+          "reason": "certificate is expired"
+        },
+        {
+          "name": "stale_cas_rejected",
+          "status": "pass",
+          "reason": "active pointer changed before CAS"
+        }
+      ],
+      "provider_call_count": 0,
+      "real_provider_calls": 0,
+      "status": "pass"
+    }
+  ],
+  "case_counts": {
+    "total": 3,
+    "pass": 3,
+    "fail": 0,
+    "not_run": 0
+  },
+  "gate": "pass",
+  "offline_gate": "pass",
+  "development_gate": "pass",
+  "production_gate": "not_run",
+  "rejection_reasons": [],
+  "production_rejection_reasons": [
+    "real PostgreSQL/RLS CAS and authority roles were not exercised",
+    "real provider reconciliation and non-idempotent provider semantics were not exercised",
+    "real IM, model, KMS, or supplier credentials were not used",
+    "multi-process scheduling, rollout, and rollback were not exercised"
+  ],
+  "core_demo": {
+    "required": true,
+    "optional_when_mode_is_auto": true,
+    "simulate_only_requested": true
+  }
+}

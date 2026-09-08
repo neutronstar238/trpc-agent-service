@@ -35,7 +35,7 @@ CAS 收敛；Proof-Carrying Evolution 以双重确定性 replay、`simulate_only
 - 企业微信 AI Bot WebSocket 长连接，以及飞书加密 HTTP 事件回调、URL 校验和 OpenAPI 异步回复。
 - OIDC/JWKS、RBAC、ETag 乐观并发、Admin 幂等、审计、DLQ 查询和人工 outbound 重放。
 - 工具白名单、SDK Tool Safety、一次性确认令牌、预算预留和非幂等工具歧义状态。
-- PostgreSQL/RLS、Redis 单调投影、S3/MinIO staged artifact、pgvector 与外部 Memory 扩展口。
+- 内置生产 profile 是 PostgreSQL/RLS（Session、Memory、Summary、Audit）+ S3/MinIO artifact + pgvector knowledge；Redis、InMemory、外部向量库和外部 Memory 是统一协议/扩展口，必须由部署预注册 `ProfileServiceFactory` 适配器，不能据此宣称所有后端组合已开箱即用。
 - 隐私优先 OpenTelemetry、Prometheus 指标、Docker Compose 和 Kubernetes/Kustomize。
 - `prepare → backfill → shadow-read → dual-write → cutover → verify → cleanup/rollback` 迁移状态机。
 - Agent Cell 的 Capsule、确定性调度、因果事件、Intent/Effect 和 Replay 提供离线可验证闭环。真实
@@ -52,6 +52,10 @@ CAS 收敛；Proof-Carrying Evolution 以双重确定性 replay、`simulate_only
 - Proof-Carrying Evolution 的发布证书绑定完整精确 CellAddress、Capsule/head、dataset、runner、
   policy、tool manifest、reducer、evidence digest、有效期、expected active Capsule 和 control
   version；v1 不支持 session/app wildcard。
+- 当前 IM 出站 adapter 已验证文本（企微含 markdown）和失败/未知结果投递状态；stream/card/media/recall、
+  平台级长度切分和限流适配仍是 `ChannelCapabilities` 的目标契约，不能当作本版本已实现能力。
+- Proof-Carrying Evolution 当前是离线 demo 与内部/专用 control-plane adapter；默认 Admin API/Worker
+  不提供租户在线发布候选 Capsule 的完整入口，且不改变 legacy Worker 的生产权威。
 
 项目不包含管理 UI、Telegram、微信公众号或微信客服；InMemory 后端仅用于单进程开发。
 
@@ -167,24 +171,39 @@ uv run python scripts/kind_ack_gate.py --execute `
 未传 `--execute` 时，报告中的 `preflight.status=pass` 只表示静态渲染通过；顶层 `gate` 与
 `local_k8s_gate` 均保持 `not_run`，进程故意返回非零，防止 CI 把静态预检误收为多节点运行通过。
 
-运行态 gate 会记录 git SHA、源码指纹、镜像 digest 和 Kubernetes cluster UID。候选镜像在集群内
-通过两副本 Gateway 验证加密签名 callback 与重复投递，通过真实 PostgreSQL/RLS 验证基线
+运行态 gate 会记录 git SHA、源码指纹、镜像 digest 和报告字段 `cluster.instance_fingerprint`（当前为目标
+集群实例的不可变 namespace 指纹，不把它冒充云厂商的 cluster UID）；报告顶层
+`production_gate` 固定为 `not_run`。候选镜像在集群内
+通过两副本 Gateway 验证飞书加密 HTTP callback 与重复投递；WeCom 场景由候选镜像直接构造
+`TenantRuntime` envelope，验证 session/租户幂等，不经过真实 WeCom WSS Connector，也不覆盖完整
+Agent Runner→outbound reply。通过真实 PostgreSQL/RLS 验证基线
 Session/Mailbox 幂等、`tool_executions` query-only 对账和演进证书/CAS/回滚，并通过生产
 `RedisStreamQueue` 验证发布去重、PEL、`XAUTOCLAIM` 接管和精确 ACK。Gateway 两副本与共享后端被强制
 分居节点，每个候选探针还必须报告实际跨节点路径；随后依次替换 Worker、fake provider 和 PostgreSQL
 Pod，核对副作用计数、同一 PVC UID、持久行哨兵、应用连接恢复及三个 Worker 节点的负载分布。各探针
 只注入所需 Secret，支持镜像使用 registry digest 固定。复用集群时会先删除并重建固定 migration
 Job，随后验证数据库 `alembic_version` 精确等于仓库唯一 head；Kind 专用 Gateway/Worker 滚动策略逐个
-释放被硬反亲和占用的节点，避免零不可用策略与固定节点数互锁。
+释放被硬反亲和占用的节点，避免零不可用策略与固定节点数互锁。fake IM/provider 的 504、响应丢失和
+query-only 状态只模拟确定性故障；它们不是 TCP 中断、真实供应商语义或真实 IM 账号证据。
 为验证 PostgreSQL Pod 替换后的持久性，运行态探针会保留使用随机租户 ID 的少量合成哨兵行；因此该
 namespace 仅用于可删除的本机验收，长期重复复用前应整体重建，不能把它当作零写入的共享开发库。
 `local_k8s_gate=pass` 不会升级为 `production_gate=pass`；ACK 的 Terway/ENI、RAM/RRSA、SLB、
 云盘/OSS、RDS/云 Redis、多可用区和云监控仍必须在真实 ACK 中单独验收。
 
-验收报告统一区分 `offline/development=pass` 与 `production=not_run`。未来合入 main 时，副作用
+验收报告统一区分 `offline/development=pass` 与 `production_gate=not_run`。真实 integration/外部依赖测试
+必须显式使用 `--allow-real-tests`，并在一次性隔离数据库、namespace 和凭证下运行；运行期间暂停会
+消费同一租户数据的后台 reconciler/dispatcher，避免后台任务改变断言结果。未来合入 main 时，副作用
 对账应先以 `observe` 形式独立合入，Proof-Carrying Evolution 以控制面/离线工具独立合入；只有
 独立 Effect Executor、真实 PostgreSQL/RLS、供应商 query-only 对账、KMS 和回滚证据齐全后，才另行
 评审 `cutover`。
+
+供应链证据也采用 fail-closed 绑定：依赖审计必须是非空且结构完整的 pip-audit JSON；Trivy SARIF
+每个 `runs[]` 的 `properties.imageID` 必须等于当前 `docker image inspect .Id`；不同 image store
+可能返回 config 或 manifest digest，不能直接代入 BuildKit 输出的 config digest。Syft SPDX 若没有
+对应镜像 digest 只标记 `sbom_provenance=unbound`，绝不伪造已绑定；若明确提供 digest 则必须
+匹配候选镜像。Kind 运行态验收共 8 个场景，包含 Redis Pod 替换和 Evolution Pod 的 fake
+provider/IM 网络否定探针；这些只产生 `local_k8s_gate=pass`，报告顶层生产结论仍固定为
+`production_gate=not_run`。
 
 ## 文档
 

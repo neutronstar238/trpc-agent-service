@@ -1027,11 +1027,9 @@ class InMemoryEffectLedger:
             if current.status in {EffectStatus.SUCCEEDED, EffectStatus.FAILED}:
                 if current.status != _reconciliation_status(evidence.outcome):
                     raise ReconciliationConflict("effect has already reached a final state")
-                # A subsequent probe that confirms the same final outcome is
-                # retained as immutable evidence without rewriting the effect
-                # receipt.  Only contradictory evidence is rejected.
-                self.reconciliations[key] = evidence
-                self.reconciliation_history.setdefault(key, []).append(evidence)
+                # Match the durable adapter: a final row is authoritative and
+                # becomes read-only.  Repeated confirmation must not create
+                # unbounded audit rows after the convergence fence is gone.
                 return current
             if current.status not in {EffectStatus.AMBIGUOUS, EffectStatus.UNKNOWN}:
                 raise ReconciliationConflict(

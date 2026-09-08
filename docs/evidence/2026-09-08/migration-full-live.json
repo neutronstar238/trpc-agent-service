@@ -1,0 +1,601 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "source": "independent Redis migration source",
+    "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+    "migration_id": "migration-acceptance-kind-migration-20260908110433",
+    "expected_records": 200,
+    "batch_size": 100,
+    "source_snapshot": {
+      "source_snapshot_id": "e926a50a62c9e51d876a347877d512661dfeb99ed64558af58e2e522bca4b77c",
+      "source_count": 200,
+      "source_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de"
+    }
+  },
+  "candidate": {
+    "target": "independent PostgreSQL migration target",
+    "phases": [
+      "prepare",
+      "backfill",
+      "shadow-read",
+      "dual-write",
+      "cutover",
+      "verify",
+      "cleanup",
+      "rollback"
+    ],
+    "control_hook": "deployment-owned MigrationControl",
+    "mailbox_v2_control": {
+      "required": true,
+      "state_field": "mailbox_v2",
+      "states": [
+        "ready",
+        "dual-write",
+        "target",
+        "source"
+      ]
+    }
+  },
+  "case_deltas": {
+    "checkpoint_persistence": "pass",
+    "checkpoint_resume": "pass",
+    "branch_migration_ids": {
+      "rollback_before_cleanup": "migration-acceptance-kind-migration-20260908110433-rollback",
+      "final_cleanup": "migration-acceptance-kind-migration-20260908110433-cleanup"
+    },
+    "cutover": "pass",
+    "cleanup": "pass",
+    "rollback": "pass",
+    "mailbox_v2": "pass",
+    "source_count": 200,
+    "target_count": 200,
+    "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+    "differences": [],
+    "target_extra_records": "verified",
+    "phase_evidence": {
+      "rollback_branch": {
+        "phases": {
+          "prepare": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "prepare",
+              "cursor": null,
+              "source_count": 0,
+              "target_count": 0,
+              "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 0,
+            "target_count": 0,
+            "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+            "target_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "backfill": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "backfill",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "shadow-read": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "shadow-read",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "independent"
+          },
+          "dual-write": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "dual-write",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "cutover": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "cutover",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "verify": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "verify",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "independent"
+          },
+          "rollback": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+              "phase": "rollback",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          }
+        },
+        "control_state": {
+          "after_prepare": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "ready"
+          },
+          "after_backfill": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "ready"
+          },
+          "after_shadow_read": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "ready"
+          },
+          "after_dual_write": {
+            "dual_write": true,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "dual-write"
+          },
+          "after_cutover": {
+            "dual_write": true,
+            "active_profile": "target",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "target"
+          },
+          "after_verify": {
+            "dual_write": true,
+            "active_profile": "target",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "target"
+          },
+          "after_rollback": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": true,
+            "mailbox_v2": "source"
+          }
+        }
+      },
+      "cleanup_branch": {
+        "phases": {
+          "prepare": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "prepare",
+              "cursor": null,
+              "source_count": 0,
+              "target_count": 0,
+              "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 0,
+            "target_count": 0,
+            "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+            "target_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "backfill": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "backfill",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "shadow-read": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "shadow-read",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "independent"
+          },
+          "dual-write": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "dual-write",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "cutover": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "cutover",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          },
+          "verify": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "verify",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "independent"
+          },
+          "cleanup": {
+            "gate": "pass",
+            "checkpoint": {
+              "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+              "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+              "phase": "cleanup",
+              "cursor": null,
+              "source_count": 200,
+              "target_count": 200,
+              "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+              "differences": [],
+              "completed": true
+            },
+            "source_count": 200,
+            "target_count": 200,
+            "checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "target_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+            "differences": [],
+            "target_enumeration": "deferred_until_shadow_read"
+          }
+        },
+        "control_state": {
+          "after_prepare": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "ready"
+          },
+          "after_backfill": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "ready"
+          },
+          "after_shadow_read": {
+            "dual_write": false,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "ready"
+          },
+          "after_dual_write": {
+            "dual_write": true,
+            "active_profile": "source",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "dual-write"
+          },
+          "after_cutover": {
+            "dual_write": true,
+            "active_profile": "target",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "target"
+          },
+          "after_verify": {
+            "dual_write": true,
+            "active_profile": "target",
+            "cleaned": false,
+            "rolled_back": false,
+            "mailbox_v2": "target"
+          },
+          "after_cleanup": {
+            "dual_write": false,
+            "active_profile": "target",
+            "cleaned": true,
+            "rolled_back": false,
+            "mailbox_v2": "target"
+          }
+        }
+      }
+    },
+    "source_endpoint_sha256": "1e3cf88d6f15be02c136daf20263d09aae2a206f7d215feec12837199a7459a5",
+    "target_endpoint_sha256": "60008e041835d1eb01b85148d87857b5481edcbcf84ab1d600307ab26b745341",
+    "target_empty_preflight": {
+      "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+      "checked_tables": [
+        "inbound_messages",
+        "outbound_messages",
+        "delivery_attempts",
+        "sessions",
+        "session_turns",
+        "turn_intents",
+        "session_events",
+        "memories",
+        "session_summaries",
+        "artifacts",
+        "knowledge_items",
+        "knowledge_embeddings",
+        "outbox_events",
+        "dead_letters",
+        "tool_executions",
+        "confirmation_challenges",
+        "audit_logs",
+        "session_mailboxes",
+        "session_mailbox_items",
+        "migration_checkpoints",
+        "migration_scope_manifests",
+        "migration_leases"
+      ],
+      "table_counts": {
+        "inbound_messages": 0,
+        "outbound_messages": 0,
+        "delivery_attempts": 0,
+        "sessions": 0,
+        "session_turns": 0,
+        "turn_intents": 0,
+        "session_events": 0,
+        "memories": 0,
+        "session_summaries": 0,
+        "artifacts": 0,
+        "knowledge_items": 0,
+        "knowledge_embeddings": 0,
+        "outbox_events": 0,
+        "dead_letters": 0,
+        "tool_executions": 0,
+        "confirmation_challenges": 0,
+        "audit_logs": 0,
+        "session_mailboxes": 0,
+        "session_mailbox_items": 0,
+        "migration_checkpoints": 0,
+        "migration_scope_manifests": 0,
+        "migration_leases": 0
+      },
+      "non_empty_tables": []
+    },
+    "branch_manifests": {
+      "rollback": {
+        "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+        "migration_id": "migration-acceptance-kind-migration-20260908110433-rollback",
+        "source_kind": "redis",
+        "kinds": [
+          "session",
+          "memory"
+        ],
+        "source_snapshot_id": "e926a50a62c9e51d876a347877d512661dfeb99ed64558af58e2e522bca4b77c",
+        "source_count": 200,
+        "source_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+        "app_id": "migration-acceptance-kind-app-20260908110433",
+        "app_revision": 1,
+        "config_version": 1,
+        "binding_id": "migration-acceptance-kind-binding-20260908110433",
+        "binding_revision": 1
+      },
+      "cleanup": {
+        "tenant_id": "migration-acceptance-kind-tenant-20260908110433",
+        "migration_id": "migration-acceptance-kind-migration-20260908110433-cleanup",
+        "source_kind": "redis",
+        "kinds": [
+          "session",
+          "memory"
+        ],
+        "source_snapshot_id": "e926a50a62c9e51d876a347877d512661dfeb99ed64558af58e2e522bca4b77c",
+        "source_count": 200,
+        "source_checksum": "bd4c6e028e3e4d99a0f096b0930cd827d1af92aa226fa419cf6e4946cd0251de",
+        "app_id": "migration-acceptance-kind-app-20260908110433",
+        "app_revision": 3,
+        "config_version": 1,
+        "binding_id": "migration-acceptance-kind-binding-20260908110433",
+        "binding_revision": 1
+      }
+    }
+  },
+  "gate": "pass",
+  "rejection_reasons": [],
+  "production_gate": "not_run",
+  "production_rejection_reasons": [
+    "full acceptance is scoped to a dedicated test tenant and includes rollback",
+    "production promotion requires separately reviewed independent source/target evidence",
+    "production promotion requires independent evidence for Mailbox v2 table/state transitions"
+  ],
+  "caveats": [],
+  "run_id": "scripts.migration_full_acceptance-3ce1b0dce9254b2c8e0ad7d4d9804da2",
+  "evidence": {
+    "schema_version": 1,
+    "kind": "current_candidate",
+    "producer": "scripts.migration_full_acceptance",
+    "generated_at": "2026-09-08T03:04:56Z",
+    "run_id": "scripts.migration_full_acceptance-3ce1b0dce9254b2c8e0ad7d4d9804da2",
+    "run_nonce": "0c6952ff89cc44afa07f815d52fb9d72",
+    "source_fingerprint": {
+      "algorithm": "sha256",
+      "status": "available",
+      "value": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+      "file_count": 285,
+      "total_bytes": 5567410,
+      "file_count_limit": 10000,
+      "byte_limit": 134217728,
+      "included_roots": [
+        "Dockerfile",
+        ".dockerignore",
+        "alembic.ini",
+        "README.md",
+        "build.sh",
+        "clean.sh",
+        "coverage.sh",
+        "format.sh",
+        "lint.sh",
+        "lint_flake8.sh",
+        "start.sh",
+        "stop.sh",
+        "pyproject.toml",
+        "uv.lock",
+        "docker-compose.yml",
+        ".github/workflows",
+        "deploy",
+        "migrations",
+        "scripts",
+        "tests/integration",
+        "tests/simulation",
+        "trpc_service",
+        "runs/multitenant/ack-runtime-support.yaml",
+        "runs/multitenant/ack-runtime-minio.yaml",
+        "runs/multitenant/project_kubernetes_secrets.py"
+      ]
+    },
+    "runtime_fingerprint": {
+      "algorithm": "sha256",
+      "status": "unavailable",
+      "reason": "runtime_not_available"
+    },
+    "release_binding": {
+      "release_id": "kind-migration-20260908110433",
+      "nonce_sha256": "df96c9589ec9b3af2c4d036809fe81a50b823f997687e8bf31d53edaa09702ed"
+    }
+  }
+}

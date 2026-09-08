@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -82,6 +83,7 @@ class InMemoryExecutionLedger:
         self._identities: dict[str, tuple[str, str, str, str]] = {}
         self._attempts: dict[str, int] = {}
         self._reconciliation_claims: dict[str, tuple[str, int, datetime]] = {}
+        self._reconciliation_epochs: dict[str, int] = {}
         self._reconciliation_evidence: dict[str, list[object]] = {}
         self._lock = asyncio.Lock()
 
@@ -257,7 +259,7 @@ class InMemoryExecutionLedger:
             raise ValueError("reconciliation owner_id is required")
         if not isinstance(lease_seconds, (int, float)) or isinstance(lease_seconds, bool):
             raise ValueError("reconciliation lease must be positive")
-        if lease_seconds <= 0 or lease_seconds > 3600:
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0 or lease_seconds > 3600:
             raise ValueError("reconciliation lease must be between 0 and 3600 seconds")
         candidates = await self.list_ambiguous(tenant_id=tenant_id, limit=limit)
         now = datetime.now(UTC)
@@ -266,13 +268,19 @@ class InMemoryExecutionLedger:
             for candidate in candidates:
                 candidate = cast(Any, candidate)
                 execution_key = candidate.execution_key
+                record = self.records[execution_key]
+                if (
+                    record.status not in {ExecutionStatus.AMBIGUOUS, ExecutionStatus.UNKNOWN}
+                    or self._attempts.get(execution_key, record.attempt) != candidate.attempt
+                ):
+                    continue
                 previous = self._reconciliation_claims.get(execution_key)
                 if previous is not None and previous[2] > now:
                     continue
-                epoch = (previous[1] if previous is not None else 0) + 1
+                epoch = self._reconciliation_epochs.get(execution_key, 0) + 1
+                self._reconciliation_epochs[execution_key] = epoch
                 expires = now + timedelta(seconds=float(lease_seconds))
                 self._reconciliation_claims[execution_key] = (owner_id, epoch, expires)
-                record = self.records[execution_key]
                 claims.append(
                     ExecutionReconciliationClaim(
                         intent=candidate,
@@ -322,7 +330,13 @@ class InMemoryExecutionLedger:
             if attempt != expected_attempt:
                 raise ReconciliationConflict("reconciliation attempt is stale")
             if claim_owner is not None or claim_epoch is not None:
-                if not isinstance(claim_owner, str) or not isinstance(claim_epoch, int):
+                if (
+                    not isinstance(claim_owner, str)
+                    or not claim_owner.strip()
+                    or isinstance(claim_epoch, bool)
+                    or not isinstance(claim_epoch, int)
+                    or claim_epoch < 1
+                ):
                     raise ReconciliationConflict("reconciliation claim is invalid")
                 claim = self._reconciliation_claims.get(execution_key)
                 if (
@@ -342,7 +356,11 @@ class InMemoryExecutionLedger:
                     "only ambiguous or unknown executions may be reconciled"
                 )
             history = self._reconciliation_evidence.setdefault(execution_key, [])
-            typed_history = [cast(Any, item) for item in history]
+            typed_history = [
+                item
+                for item in history
+                if isinstance(item, ReconciliationEvidence) and item.attempt == expected_attempt
+            ]
             previous_same = next(
                 (
                     item
@@ -359,6 +377,11 @@ class InMemoryExecutionLedger:
                     raise ReconciliationConflict(
                         "reconciliation evidence conflicts with final execution state"
                     )
+                # A terminal execution is authoritative and read-only.  A
+                # later provider probe that reaches the same conclusion must
+                # not grow immutable audit history after the CAS fence has
+                # already been consumed.
+                return current
             elif any(
                 reconciliation_status(item.outcome)
                 in {

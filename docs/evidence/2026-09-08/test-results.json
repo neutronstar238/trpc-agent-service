@@ -1,0 +1,65 @@
+{
+  "scope": "offline_and_local_infrastructure",
+  "production_gate": "not_run",
+  "tested_base_git_sha": "ff19d6d8a87d3f05c52f99e5d06492de037d12a3",
+  "runtime_source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+  "unit_source_fingerprint": "c1f5906237c1793bdb1d1e7655db80944a1773066b410644f5b555e6b4134022",
+  "junit_results": [
+    {
+      "report": "unit-final.xml",
+      "tests": 2733,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 8,
+      "seconds": 141.239,
+      "timestamp": "2026-09-08T10:55:36.628403+08:00",
+      "sha256": "80c25d840767feee1abf80b6f2535e722c6f4b615616d3523687789228e8178b"
+    },
+    {
+      "report": "contracts-simulation-final.xml",
+      "tests": 40,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 1.372,
+      "timestamp": "2026-09-08T11:00:04.828833+08:00",
+      "sha256": "df1b33ba7d02f6fbdebd9d3b871706f528fd992276a2b97eed5059d1d99bd6cc"
+    },
+    {
+      "report": "integration-final.xml",
+      "tests": 16,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 38.936,
+      "timestamp": "2026-09-08T11:04:41.158185+08:00",
+      "sha256": "ad798112ca1b1a8a51b7f9a0cf25ef1d88eb1bea8297d76cbcb70f2a72f0d26e"
+    },
+    {
+      "report": "s3-integration-final.xml",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 0.983,
+      "timestamp": "2026-09-08T10:24:29.667197+08:00",
+      "sha256": "6b493181ca4984126524d723565049636557af03ca10902e7f59dcf90efb17ea"
+    },
+    {
+      "report": "linux-symlink-final.xml",
+      "tests": 8,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 1.96,
+      "timestamp": "2026-09-08T03:02:24.641091+00:00",
+      "sha256": "509f62e174a9e80a730569cd55866109787a2dd9018cee28074ac89bac35d6f7"
+    }
+  ],
+  "notes": [
+    "Original JUnit reports remain in runs/multitenant; hostnames are omitted from this summary.",
+    "The 8 Windows symlink skips were rerun on the final Linux candidate image with 8 passes and zero skips.",
+    "Integration ran 16 tests; the separately executed MinIO test accounts for its one deselection.",
+    "No artifact changes source to bypass a failing test or coverage threshold."
+  ]
+}

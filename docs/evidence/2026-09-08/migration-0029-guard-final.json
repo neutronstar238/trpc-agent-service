@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "status": "pass",
+  "scope": "isolated_postgresql_validation",
+  "migration_path": {
+    "base": "0028_evolution_least_privilege",
+    "head": "0029_reconciliation_security_hardening",
+    "upgrade_to_0028": "pass",
+    "upgrade_0028_to_0029": "pass"
+  },
+  "guard_probe": {
+    "database": "temporary PostgreSQL 16",
+    "function_selects_composite_fields": true,
+    "authorized_runtime_insert_with_active_fence": "pass",
+    "migration_head": "0029_reconciliation_security_hardening"
+  },
+  "kind_forward_repair": {
+    "context": "kind-trpc-cell-19472b",
+    "namespace": "trpc-cell-kind",
+    "operation": "transactional CREATE OR REPLACE FUNCTION migration_write_barrier_guard",
+    "function_selects_composite_fields": true,
+    "security_definer": true,
+    "owner": "trpc_migration",
+    "barrier_lease_manifest_counts_before": [1, 1, 1],
+    "barrier_lease_manifest_counts_after": [1, 1, 1]
+  },
+  "root_cause": "PL/pgSQL SELECT b/l/m INTO %ROWTYPE assigned a composite value to the first field; the guard then saw NULL migration, lease, and manifest fields.",
+  "caveats": [
+    "The retained Kind barrier was not released and no fixture or evidence was deleted.",
+    "The Kind function replacement is an isolated development-database forward repair; the corrected 0029 migration is the release path."
+  ]
+}

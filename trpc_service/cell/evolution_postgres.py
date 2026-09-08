@@ -62,6 +62,14 @@ class PromotionOutboxConflict(PromotionError):
     """A stale worker tried to acknowledge or release an outbox lease."""
 
 
+# The reader is deliberately a very small dependency-injection boundary.  A
+# production caller should implement it with the authoritative cell branch
+# head store (and, where supported, a lock/fence on that head).  Keeping the
+# callback out of this adapter avoids importing the event-store implementation
+# and makes the proof boundary testable with deterministic doubles.
+CandidateHeadReader = Callable[[Any, CellAddress], object | Awaitable[object | None] | None]
+
+
 @dataclass(frozen=True, slots=True)
 class PromotionOutboxClaim:
     """An epoch-fenced delivery lease returned by :meth:`claim_outbox`."""
@@ -218,11 +226,14 @@ class PostgresPromotionStore:
     ``pool`` is an asyncpg-compatible pool.  A shared pool is safe: every
     method derives the tenant from the exact target/receipt and sets
     ``app.tenant_id`` in a transaction-local setting before touching rows.
-    Certificate promotions require ``certificate_verifier``.  An approval can
-    be cryptographically checked by passing ``approval_secret``; callers that
-    already verified an approval with the in-memory authority may pass
-    ``approval_consumed=True`` and an ``approval_id`` so the durable unique
-    use fence is still written in the same transaction as the pointer CAS.
+    Production promotions require all of the following: a durable receipt
+    signing key, a certificate verifier, a candidate-head reader, and an
+    approval credential that can be verified with ``approval_secret``.  The
+    durable use table consumes the certificate and approval exactly once in
+    the same transaction as the pointer CAS.  ``bootstrap_mode`` is an
+    explicit offline escape hatch for initializing a local demo; it is the
+    only mode that permits an ephemeral receipt key, manual CAS, or a
+    pre-verified boolean approval marker.
     """
 
     def __init__(
@@ -234,23 +245,42 @@ class PostgresPromotionStore:
         receipt_key_id: str = "evolution-online",
         certificate_verifier: CertificateVerifier | None = None,
         approval_secret: bytes | None = None,
+        candidate_head_reader: CandidateHeadReader | None = None,
+        bootstrap_mode: bool = False,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not callable(getattr(pool, "acquire", None)):
             raise TypeError("pool must expose asyncpg-compatible acquire()")
         if tenant_id is not None:
             _text("tenant_id", tenant_id)
+        if not isinstance(bootstrap_mode, bool):
+            raise TypeError("bootstrap_mode must be a boolean")
+        if candidate_head_reader is not None and not callable(candidate_head_reader):
+            raise TypeError("candidate_head_reader must be callable")
+        normalized_receipt_key_id = _text("receipt_key_id", receipt_key_id)
+        if receipt_signing_key is None and not bootstrap_mode:
+            raise PromotionReceiptError(
+                "a persistent receipt signing key is required outside bootstrap mode"
+            )
         self.pool = pool
         self.tenant_id = tenant_id
+        self._bootstrap_mode = bootstrap_mode
         self._receipt_key = (
             _private_key(receipt_signing_key)
             if receipt_signing_key is not None
             else Ed25519PrivateKey.generate()
         )
-        self.receipt_key_id = _text("receipt_key_id", receipt_key_id)
+        self.receipt_key_id = normalized_receipt_key_id
         self.certificate_verifier = certificate_verifier
         self.approval_secret = approval_secret
+        self.candidate_head_reader = candidate_head_reader
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    @property
+    def bootstrap_mode(self) -> bool:
+        """Whether this adapter was explicitly created for offline bootstrap."""
+
+        return self._bootstrap_mode
 
     @property
     def receipt_public_key(self) -> Ed25519PublicKey:
@@ -291,7 +321,10 @@ class PostgresPromotionStore:
 
     async def _database_now(self, connection: asyncpg.Connection) -> datetime:
         value = await connection.fetchval("SELECT clock_timestamp()")
-        return _aware(value) or self._clock().astimezone(UTC)
+        observed = _aware(value)
+        if observed is None:
+            raise PromotionError("database clock returned an invalid timestamp")
+        return observed
 
     @staticmethod
     async def _fetch_many(
@@ -379,6 +412,8 @@ class PostgresPromotionStore:
         self,
         certificate: EvolutionCertificate,
         target: PromotionTarget,
+        *,
+        database_now: datetime,
     ) -> None:
         if not isinstance(certificate, EvolutionCertificate):
             raise CertificateError("certificate is invalid")
@@ -387,6 +422,16 @@ class PostgresPromotionStore:
         result = self.certificate_verifier.verify(certificate, target)
         if not result.valid:
             raise CertificateError(result.reason or "certificate verification failed")
+        # The generic verifier uses its caller's clock.  Online promotion must
+        # additionally fence expiry with the authoritative database clock
+        # from this same transaction so a slow/skewed Pod cannot consume an
+        # already-expired certificate.
+        if certificate.expires_at <= certificate.issued_at:
+            raise CertificateError("certificate validity interval is invalid")
+        if certificate.issued_at.astimezone(UTC) > database_now.astimezone(UTC):
+            raise CertificateError("certificate is not valid yet according to the database clock")
+        if certificate.expires_at.astimezone(UTC) <= database_now.astimezone(UTC):
+            raise CertificateError("certificate is expired according to the database clock")
 
     def _verify_approval(
         self,
@@ -406,16 +451,81 @@ class PostgresPromotionStore:
             raise NamespaceViolation("approval target does not match")
         if approval.expires_at.astimezone(UTC) <= now.astimezone(UTC):
             raise ApprovalError("manual approval is expired")
-        if self.approval_secret is not None:
-            expected = _encode_b64(
-                hmac.new(
-                    self.approval_secret,
-                    _canonical(approval.unsigned_dict()).encode("utf-8"),
-                    hashlib.sha256,
-                ).digest()
-            )
-            if not hmac.compare_digest(expected, approval.mac):
-                raise ApprovalError("manual approval signature is invalid")
+        if not isinstance(self.approval_secret, bytes) or not self.approval_secret:
+            raise ApprovalError("a persistent approval verifier is required")
+        expected = _encode_b64(
+            hmac.new(
+                self.approval_secret,
+                _canonical(approval.unsigned_dict()).encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+        )
+        if not hmac.compare_digest(expected, approval.mac):
+            raise ApprovalError("manual approval signature is invalid")
+
+    async def _read_branch_head(
+        self,
+        connection: Any,
+        address: CellAddress,
+        *,
+        branch_label: str,
+    ) -> str:
+        """Read one authoritative branch head on the promotion connection.
+
+        The callback receives the same transaction connection that already
+        holds the exact promotion-pointer ``FOR UPDATE`` lock.  A production
+        callback must use that connection for its branch-head read/fence; it
+        must not open a second connection or silently fall back to a stale
+        replica.  ``None`` is not a valid online result: both certified
+        branches must still exist at promotion time.
+        """
+
+        reader = self.candidate_head_reader
+        if reader is None:
+            if self.bootstrap_mode:
+                raise CertificateError(f"a {branch_label} head verifier is required")
+            raise CertificateError("a candidate head verifier is required")
+        observed = reader(connection, address)
+        if inspect.isawaitable(observed):
+            observed = await observed
+        if observed is None:
+            raise CertificateError(f"certified {branch_label} branch does not exist")
+        if not isinstance(observed, str):
+            # ``PostgresEventStore.head`` returns a CausalEvent.  Accepting
+            # its immutable ``event_hash`` keeps the boundary small for
+            # callers while still rejecting arbitrary provider responses.
+            observed = getattr(observed, "event_hash", None)
+        if not isinstance(observed, str):
+            raise CertificateError(f"{branch_label} head verifier returned an invalid hash")
+        return observed
+
+    async def _assert_candidate_head(
+        self, connection: Any, certificate: EvolutionCertificate
+    ) -> None:
+        """Reject a certificate if either certified branch head drifted.
+
+        Both reads happen on ``connection`` inside the promotion transaction,
+        after ``_load_pointer`` has acquired the exact pointer ``FOR UPDATE``
+        lock and before the certificate-use/CAS writes.  The reader is called
+        once for the source branch and once for the candidate branch, so the
+        two hashes cannot be mixed across transactions or tenants.
+        """
+
+        if self.candidate_head_reader is None and self.bootstrap_mode:
+            # Explicit offline bootstrap remains able to exercise pointer/CAS
+            # wiring without an event-store dependency.  Any online path with
+            # a certificate must provide the reader and validate both heads.
+            return
+        source_head = await self._read_branch_head(
+            connection, certificate.source_address, branch_label="source"
+        )
+        if source_head != certificate.source_head_hash:
+            raise PromotionCASConflict("source branch head changed since certification")
+        candidate_head = await self._read_branch_head(
+            connection, certificate.candidate_address, branch_label="candidate"
+        )
+        if candidate_head != certificate.candidate_head_hash:
+            raise PromotionCASConflict("candidate branch head changed since certification")
 
     async def _assert_unused_certificate(
         self,
@@ -571,7 +681,8 @@ class PostgresPromotionStore:
 
             next_digest = new_active_capsule
             if certificate is not None:
-                self._verify_certificate(certificate, current)
+                now = await self._database_now(connection)
+                self._verify_certificate(certificate, current, database_now=now)
                 if next_digest is None:
                     next_digest = certificate.candidate_capsule_digest
                 if certificate.source_address != current.address:
@@ -582,16 +693,22 @@ class PostgresPromotionStore:
                     raise PromotionCASConflict("certificate expected active Capsule is stale")
                 if certificate.control_version != expected_version:
                     raise PromotionCASConflict("certificate control version is stale")
+                await self._assert_candidate_head(connection, certificate)
                 await self._assert_unused_certificate(connection, tenant, certificate)
-                now = await self._database_now(connection)
                 if approval is not None:
+                    if approval_id is not None and approval_id != approval.approval_id:
+                        raise NamespaceViolation("approval id does not match approval credential")
                     self._verify_approval(approval, certificate, current, now=now)
                     consumed_approval_id = approval.approval_id
-                elif not approval_consumed:
-                    raise ApprovalError("promotion requires a consumed manual approval")
+                elif self.bootstrap_mode and approval_consumed:
+                    consumed_approval_id = approval_id or f"bootstrap:{certificate.certificate_id}"
                 else:
-                    consumed_approval_id = approval_id or f"external:{certificate.certificate_id}"
+                    raise ApprovalError("promotion requires a verifiable manual approval")
             else:
+                if not self.bootstrap_mode:
+                    raise CertificateError(
+                        "production promotion requires a verifiable evolution certificate"
+                    )
                 consumed_approval_id = None
                 now = await self._database_now(connection)
             if next_digest is None:

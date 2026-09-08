@@ -23,8 +23,8 @@ Effect Executor、真实 PostgreSQL 和供应商证据时制造双写或重复�
 
 | 轨道 | 本轮闭环 | 离线证据 | 生产边界 |
 |---|---|---|---|
-| 副作用对账 | `ambiguous` → 供应商只读查询 → `applied`/`not_applied`/`unknown` → Ledger CAS 收敛 | InMemory ledger、对账证据脱敏、并发/过期 attempt/冲突/跨租户拒绝测试 | `production=not_run`；不重新调用副作用接口，不启用 `cutover` |
-| Proof-Carrying Evolution | fork → 双重 replay → `simulate_only` shadow → Judge → Ed25519 certificate → approval + pointer CAS → receipt rollback | `cell-evolve-demo`、稳定 evidence Merkle root、篡改/过期/跨租户/stale CAS 拒绝演示 | `production=not_run`；不使用真实模型、工具、KMS 或供应商凭据 |
+| 副作用对账 | `ambiguous` → 供应商只读查询 → `applied`/`not_applied`/`unknown` → Ledger CAS 收敛 | InMemory ledger、对账证据脱敏、并发/过期 attempt/冲突/跨租户拒绝测试 | `production_gate=not_run`；不重新调用副作用接口，不启用 `cutover` |
+| Proof-Carrying Evolution | fork → 双重 replay → `simulate_only` shadow → Judge → Ed25519 certificate → approval + pointer CAS → receipt rollback | `cell-evolve-demo`、稳定 evidence Merkle root、篡改/过期/跨租户/stale CAS 拒绝演示 | `production_gate=not_run`；不使用真实模型、工具、KMS 或供应商凭据 |
 
 配置默认是 `observe`：它只投影当前 legacy 决策和 effect key。显式 `shadow` 时，系统只构造并校验
 native `ToolIntent`、namespace 与 effect key，仍不增加供应商调用。本轮没有 `cutover` 配置；只有
@@ -372,8 +372,9 @@ CAS：
 
 `cell_effect_reconciliations` 是不可变证据表，只保存 effect key、attempt、结果、证据摘要、trace、
 时间和对账器身份；不保存原始参数、密钥或供应商敏感响应。过期 attempt、跨租户 intent、重复
-消费和互相冲突的证据全部拒绝。内存实现用于本机验收，PostgreSQL adapter 的 RLS、专用 authority
-角色和 trigger 是生产切换前的独立门禁。
+消费和互相冲突的证据全部拒绝。内存实现用于本机验收，PostgreSQL adapter 的 RLS、专用
+`trpc_cell_reconciler` 登录角色（与 `trpc_cell_executor`、`trpc_tool_reconciler` 分离）和 trigger
+是生产切换前的独立门禁。
 
 默认模式为 `observe`：真实 Worker 仍由 `GovernancePipeline + ToolExecutor +
 PostgresExecutionLedger` 执行，新的对账器只观察并收敛可确认状态。`shadow` 只构造并校验 native
@@ -440,10 +441,15 @@ expected active Capsule 和 control version。证书只证明候选证据，不�
 Promotion 同时要求证书验证、租户范围一致、一次性人工 approval 和 pointer CAS；发布事件与 pointer
 不能原子提交时由 outbox/reconciler 补偿，重复消费证书必须是幂等的。回滚使用签名 promotion receipt，
 先校验当前 active digest 与 receipt，再以 CAS 恢复 expected Capsule；stale pointer、重复 approval、
-错误 Capsule、跨租户或过期证书都必须拒绝。除进程内参考实现外，`0026` 与
-`PostgresEvolutionControlPlane` 已实现 tenant RLS、证书/approval 一次性消费、pointer CAS、epoch-fenced
-outbox 和 receipt 回滚；本机 kind 门禁可在一次性 PostgreSQL 上验证该适配器。它仍不等于生产控制面：
+错误 Capsule、跨租户或过期证书都必须拒绝。除进程内参考实现外，`0026` 控制面 schema 及
+`0028`/`0029` least-privilege/security hardening 迁移与 `PostgresEvolutionControlPlane` 已实现 tenant RLS、
+证书/approval 一次性消费、pointer CAS、epoch-fenced outbox 和 receipt 回滚；本机 kind 门禁可在一次性
+PostgreSQL 上验证该适配器。它仍不等于生产控制面：
 真实 KMS、模型/工具 Judge、托管数据库、多可用区与 ACK 故障恢复尚未验收。
+
+Kind 的 Evolution Pod 使用专用 `trpc_evolution_authority` PostgreSQL 身份；NetworkPolicy 只允许其访问
+PostgreSQL，并对 fake provider 与 fake IM 执行出站拒绝探针。这是本机隔离证据，不代表 ACK 云网络策略或
+生产模型/供应商门禁。
 
 ```mermaid
 sequenceDiagram
@@ -513,7 +519,7 @@ sequenceDiagram
 | 生产热路径 | legacy `TenantRuntime`、Mailbox、`GovernancePipeline`、fenced `ToolExecutor`、`CellTurnJournal` | 现有多租户消息与 effect 投影边界保持不变 | 原生 Cell Effect Executor 已接管默认 Worker |
 | 离线完整实现 | InMemory/纯函数协议、shadow Judge、证书与 Promotion store、`cell-demo`/`cell-evolve-demo`、local gate | 协议、拒绝条件、确定性与零真实副作用可在本机复现 | 真实 PG 锁/RLS、供应商语义、KMS 或多节点恢复已经通过 |
 | 本机多节点预验收 | `kind_ack_gate --execute`；候选 Gateway/Worker、一次性 PostgreSQL/Redis、假 IM/供应商 | 可在 1 控制面 + 3 Worker 上验证真实 Pod/Service/DNS、PG/RLS/CAS、Redis PEL、重复回调和 Pod 替换 | ACK 网络/存储/IAM 等价，或真实供应商、真实 IM、模型与 KMS 已通过 |
-| 生产证据 | 当前创新轮不访问真实 IM、模型、供应商、KMS 或 ACK | `production=not_run` 及明确拒绝原因 | 用离线/kind `pass`、静态 SQL 或 mock 报告升级为生产通过 |
+| 生产证据 | 当前创新轮不访问真实 IM、模型、供应商、KMS 或 ACK | `production_gate=not_run` 及明确拒绝原因 | 用离线/kind `pass`、静态 SQL 或 mock 报告升级为生产通过 |
 
 两个创新轨道应按边界分块合入稳定基线：
 
@@ -540,7 +546,7 @@ sequenceDiagram
 9. 篡改 evidence、跨租户、过期、错误 Capsule、重复 approval 和 stale pointer 均不能签发或发布；
    有效 Promotion receipt 可验证当前 active digest 后回滚。
 10. `local_innovation_gate` 输出 git SHA、source fingerprint、每项 case result、
-    `offline/development=pass` 和 `production=not_run`。
+    `offline/development=pass` 和顶层 `production_gate=not_run`。
 11. trace_id 串联 IM 入站、Cell 调度、Runner、Intent、Effect、投影和 IM 回复。
 
 第 11 项是目标生产验收：当前 Feishu HTTP callback 已建立入口 span，WeCom 入站及完整存储子 span 仍需
@@ -571,5 +577,5 @@ Worker 只能登记不可调度的 `runtime_projection` Capsule；可授权 plac
 KMS 信任根、模型质量 Judge 和生产回放批处理也未完成验证。副作用对账和 Proof-Carrying Evolution 的
 离线拒绝路径由本地 gate/演示复现，PostgreSQL authority/CAS/outbox 与多 Pod 恢复则由显式
 `kind_ack_gate --execute` 预验收；真实供应商 query-only 语义、ACK、KMS、在线 IM、模型和生产发布恢复
-仍保持 `production=not_run`。不能用离线 `cell-demo`、`cell-evolve-demo`、静态 SQL 或本机 kind
+仍保持 `production_gate=not_run`。不能用离线 `cell-demo`、`cell-evolve-demo`、静态 SQL 或本机 kind
 冒充生产通过。

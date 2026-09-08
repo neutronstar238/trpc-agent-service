@@ -1,0 +1,92 @@
+{
+  "baseline": {
+    "sbom_required": true,
+    "critical_high_vulnerabilities_max": 0,
+    "dependency_audit_required": true,
+    "image_digest_required": true,
+    "image_source_fingerprint_required": true,
+    "all_sarif_runs_scanned": true
+  },
+  "candidate": {
+    "sbom": "runs\\multitenant\\sbom-final.spdx.json",
+    "sbom_provenance": {
+      "status": "unbound",
+      "image_digest": null,
+      "digest_binding": "trivy_sarif_imageID"
+    },
+    "vulnerability_report": "runs\\multitenant\\image-vulnerabilities-final.sarif.json",
+    "sbom_packages": 195,
+    "vulnerability_reports": [
+      "runs\\multitenant\\image-vulnerabilities-final.sarif.json"
+    ],
+    "sarif_runs": 1,
+    "critical_high_vulnerabilities": 0,
+    "dependency_audit": "pass",
+    "dependency_audit_report": "runs\\multitenant\\dependency-audit-final.json",
+    "image": {
+      "configured": true,
+      "digest": "sha256:609b8b54c990d8525acc24d98fe1cb0489c26f661635024f9459ae66317c8a8c",
+      "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+      "source_fingerprint_matches": true
+    },
+    "source_fingerprint": {
+      "algorithm": "sha256",
+      "status": "available",
+      "value": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+      "file_count": 285,
+      "total_bytes": 5567410,
+      "file_count_limit": 10000,
+      "byte_limit": 134217728,
+      "included_roots": [
+        "Dockerfile",
+        ".dockerignore",
+        "alembic.ini",
+        "README.md",
+        "build.sh",
+        "clean.sh",
+        "coverage.sh",
+        "format.sh",
+        "lint.sh",
+        "lint_flake8.sh",
+        "start.sh",
+        "stop.sh",
+        "pyproject.toml",
+        "uv.lock",
+        "docker-compose.yml",
+        ".github/workflows",
+        "deploy",
+        "migrations",
+        "scripts",
+        "tests/integration",
+        "tests/simulation",
+        "trpc_service",
+        "runs/multitenant/ack-runtime-support.yaml",
+        "runs/multitenant/ack-runtime-minio.yaml",
+        "runs/multitenant/project_kubernetes_secrets.py"
+      ]
+    },
+    "lock_source_fingerprint": {
+      "algorithm": "sha256",
+      "status": "available",
+      "value": "5b59e3b2e88163facd9e5323c0252ceeb38de126c613235c84b1d4edcd26522c",
+      "file_count": 2,
+      "total_bytes": 653376,
+      "file_count_limit": 10000,
+      "byte_limit": 134217728,
+      "included_roots": [
+        "pyproject.toml",
+        "uv.lock"
+      ]
+    }
+  },
+  "case_deltas": {
+    "critical_high_vulnerabilities": 0,
+    "missing_package_inventory": 0,
+    "missing_image_lineage": 0
+  },
+  "gate": "pass",
+  "production_gate": "pass",
+  "image_gate": "pass",
+  "rejection_reasons": [],
+  "production_rejection_reasons": []
+}

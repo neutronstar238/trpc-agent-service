@@ -246,6 +246,37 @@ async def test_real_runner_and_tool_boundaries_form_one_private_causal_chain() -
 
 
 @pytest.mark.asyncio
+async def test_shadow_journal_commits_private_identifiers_without_exposing_them() -> None:
+    store = MemoryProjectionStore()
+    journal = _journal(store)
+    acceptance, config, lease = _fixture()
+    turn = await journal.begin_turn(acceptance, config, lease)
+    intent_id = "shadow-private-parameter-derived-id"
+    native_key = "trpc-agent-effect/v1:" + "b" * 64
+    legacy_key = "d" * 64
+    arguments_hash = "f" * 64
+    await journal.shadow_intent_validated(
+        acceptance.context,
+        turn_id=lease.turn_id,
+        invocation_id="shadow-invocation",
+        tool_name="refund.create",
+        intent_id=intent_id,
+        arguments_hash=arguments_hash,
+        native_effect_key=native_key,
+        legacy_effect_key=legacy_key,
+        risk=ToolRisk.NON_IDEMPOTENT,
+    )
+    event = store.events.read(turn.address)[-1]
+    assert event.event_type == "tool.intent.shadow.validated"
+    assert event.payload["intent_id_commitment"]
+    assert event.payload["real_provider_call_count"] == 0
+    rendered = json.dumps(event.to_dict())
+    for private_value in (intent_id, native_key, legacy_key, arguments_hash):
+        assert private_value not in rendered
+    store.events.verify_chain(turn.address)
+
+
+@pytest.mark.asyncio
 async def test_tool_observer_fails_closed_without_an_active_turn() -> None:
     store = MemoryProjectionStore()
     journal = _journal(store)

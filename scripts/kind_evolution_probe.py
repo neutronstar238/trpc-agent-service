@@ -34,6 +34,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -44,10 +46,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from scripts.evidence_lineage import source_fingerprint
 from scripts.report_io import atomic_write_json
 from trpc_service.cell.capsule import AgentCapsule, CapsuleMetadata, CapsuleSpec
-from trpc_service.cell.events import CellAddress, NamespaceViolation
+from trpc_service.cell.events import GENESIS_HASH, CellAddress, NamespaceViolation
 from trpc_service.cell.evolution import (
     CertificateVerifier,
     EvolutionCertificate,
+    JudgePolicy,
     PromotionAlreadyUsed,
     PromotionApprovalAuthority,
     PromotionCASConflict,
@@ -69,6 +72,12 @@ _DEFAULT_OUTPUT = Path("runs/multitenant/kind-evolution-probe.json")
 _SOURCE_ENV = "TRPC_EVOLUTION_PROBE_SOURCE_CAPSULE_DIGEST"
 _CANDIDATE_ENV = "TRPC_EVOLUTION_PROBE_CANDIDATE_CAPSULE_DIGEST"
 _FIXTURE_FUNCTION = "public.ensure_runtime_projection_capsule(text,text,text,jsonb,text,text)"
+# These endpoints are deliberately fixed to the two in-cluster fake services.
+# The evolution cell is simulate-only and its NetworkPolicy must make both
+# requests fail; a response (including an HTTP error) proves that egress was
+# accidentally opened.  They are never copied into the report.
+_FAKE_PROVIDER_METRICS_URL = "http://kind-fake-provider:8080/v1/metrics"
+_FAKE_IM_HEALTH_URL = "http://kind-fake-im:8080/health"
 PROBE_SCENARIO = "kind_evolution_postgres_control"
 PROBE_ASSERTION = "candidate evolution control proves certificate, CAS and rollback invariants"
 
@@ -204,6 +213,44 @@ def _redacted_case(name: str, *, passed: bool, **details: object) -> dict[str, o
     return result
 
 
+def _network_request_is_denied(url: str, timeout_seconds: float) -> bool:
+    """Return whether an HTTP request cannot reach the target service.
+
+    This helper intentionally collapses all transport failures to a boolean.
+    HTTP responses, including 4xx/5xx, are *reachable* and therefore fail the
+    denial proof.  No URL or exception is ever included in probe evidence.
+    """
+
+    try:
+        with urllib_request.urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310
+            response.read(1)
+        return False
+    except urllib_error.HTTPError:
+        return False
+    except (urllib_error.URLError, OSError, TimeoutError):
+        return True
+
+
+async def _network_denial_proof(timeout_seconds: float) -> tuple[bool, bool]:
+    """Prove the evolution Pod cannot reach either fake side-effect service."""
+
+    return cast(
+        tuple[bool, bool],
+        await asyncio.gather(
+            asyncio.to_thread(
+                _network_request_is_denied,
+                _FAKE_PROVIDER_METRICS_URL,
+                timeout_seconds,
+            ),
+            asyncio.to_thread(
+                _network_request_is_denied,
+                _FAKE_IM_HEALTH_URL,
+                timeout_seconds,
+            ),
+        ),
+    )
+
+
 def _base_report(config: ProbeConfig | None, *, gate: str) -> dict[str, object]:
     try:
         raw_lineage = source_fingerprint(ROOT)
@@ -303,8 +350,11 @@ def _make_certificate(
         candidate_capsule_digest=config.candidate_capsule_digest,
         fork_sequence=0,
         fork_hash=_sha256_digest(f"fork:{certificate_id}"),
-        source_head_hash=_sha256_digest(f"source-head:{certificate_id}"),
-        candidate_head_hash=_sha256_digest(f"candidate-head:{certificate_id}"),
+        # The fixture creates the source root and candidate fork at sequence
+        # zero, so both authoritative heads are the genesis hash.  The
+        # promotion store verifies both heads in the promotion transaction.
+        source_head_hash=GENESIS_HASH,
+        candidate_head_hash=GENESIS_HASH,
         dataset_id="dataset://kind-evolution-probe",
         runner_id="runner://kind-evolution-probe",
         model_id="model://kind-evolution-probe",
@@ -312,7 +362,11 @@ def _make_certificate(
         tool_manifest_digest=_sha256_digest("tools:kind-evolution-probe"),
         reducer_id="reducer://kind-evolution-probe",
         evidence_digest=_sha256_digest(f"evidence:{certificate_id}"),
-        judge_policy={"mode": "probe"},
+        # Keep the probe certificate aligned with the production verifier's
+        # hard gate: an accepted candidate must strictly improve at least one
+        # judged metric.  Serialise the canonical policy rather than carrying
+        # an ad-hoc probe-only mapping that the verifier cannot accept.
+        judge_policy=JudgePolicy().to_dict(),
         expected_active_capsule=target.active_capsule_digest,
         control_version=target.control_version,
         signing_key_id="kind-evolution-certificate",
@@ -440,12 +494,26 @@ async def _provision_fixture(
         count = int(capsule_count or 0)
         if count != 2:
             raise FixtureProvisionError(role="trpc_worker", capsule_count=count)
+        configured = replace(
+            config,
+            source_capsule_digest=source_digest,
+            candidate_capsule_digest=candidate_digest,
+        )
+        for target_suffix, candidate_suffix in (
+            ("cas", "cas"),
+            ("certificate", "certificate-duplicate"),
+            ("approval", "approval-duplicate"),
+        ):
+            source_address = configured.address(target_suffix)
+            await event_store.ensure_cell(source_address)
+            await event_store.fork(
+                source_address,
+                0,
+                new_branch_id=f"candidate-{configured.run_token}-{candidate_suffix}",
+                target_capsule_digest=configured.candidate_capsule_digest,
+            )
         return (
-            replace(
-                config,
-                source_capsule_digest=source_digest,
-                candidate_capsule_digest=candidate_digest,
-            ),
+            configured,
             {"status": "pass", "role": "trpc_worker", "capsule_count": count},
         )
     finally:
@@ -530,6 +598,24 @@ def _store(
     approval_secret: bytes,
     receipt_signing_key: Ed25519PrivateKey,
 ) -> PostgresPromotionStore:
+    async def candidate_head_reader(connection: Any, address: CellAddress) -> str | None:
+        return cast(
+            str | None,
+            await connection.fetchval(
+                """
+                SELECT public.read_cell_branch_head_hash(
+                    $1, $2, $3, $4, $5, $6
+                )
+                """,
+                address.tenant_id,
+                address.app_id,
+                address.cell_id,
+                address.session_id,
+                address.capsule_digest,
+                address.branch_id,
+            ),
+        )
+
     return PostgresPromotionStore(
         pool,
         tenant_id=config.tenant_id,
@@ -537,6 +623,7 @@ def _store(
         receipt_key_id="kind-evolution-receipt",
         certificate_verifier=certificate_verifier,
         approval_secret=approval_secret,
+        candidate_head_reader=candidate_head_reader,
         clock=_utc_now,
     )
 
@@ -548,6 +635,24 @@ def _assert(condition: bool, case: str, **details: object) -> None:
 
 async def _run_live(config: ProbeConfig, pool: Any) -> dict[str, object]:
     report = _base_report(config, gate="fail")
+    provider_egress_denied, im_egress_denied = await _network_denial_proof(
+        min(config.timeout_seconds, 2.0)
+    )
+    _assert(
+        provider_egress_denied and im_egress_denied,
+        "network_egress_denial",
+        provider_egress_denied=provider_egress_denied,
+        im_egress_denied=im_egress_denied,
+    )
+    _append_case(
+        report,
+        _redacted_case(
+            "network_egress_denial",
+            passed=True,
+            provider_egress_denied=True,
+            im_egress_denied=True,
+        ),
+    )
     preflight = await _database_preflight(pool)
     report["database"] = preflight
     _assert(

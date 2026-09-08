@@ -33,6 +33,7 @@ def _compose_override() -> dict[str, object]:
 def test_candidate_dockerfile_exposes_only_safe_source_fingerprint_labels() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
+    assert "ARG PYTHON_IMAGE=python:3.12-alpine3.24@sha256:" in dockerfile
     assert 'ARG TRPC_SOURCE_FINGERPRINT=""' in dockerfile
     assert 'org.opencontainers.image.revision="${TRPC_SOURCE_FINGERPRINT}"' in dockerfile
     assert 'io.trpc.agent-service.source-fingerprint="${TRPC_SOURCE_FINGERPRINT}"' in dockerfile

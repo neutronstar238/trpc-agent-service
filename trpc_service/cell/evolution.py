@@ -662,6 +662,8 @@ class JudgePolicy:
             isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values
         ):
             raise EvolutionValidationError("Judge regression bounds must be non-negative integers")
+        if not isinstance(require_strict_improvement, bool):
+            raise EvolutionValidationError("require_strict_improvement must be boolean")
         findings = frozenset(
             _require_text("high-risk finding", value).lower() for value in high_risk_findings
         )
@@ -673,7 +675,7 @@ class JudgePolicy:
         object.__setattr__(self, "max_quality_regression_bps", values[0])
         object.__setattr__(self, "max_cost_regression_units", values[1])
         object.__setattr__(self, "max_latency_regression_ms", values[2])
-        object.__setattr__(self, "require_strict_improvement", bool(require_strict_improvement))
+        object.__setattr__(self, "require_strict_improvement", require_strict_improvement)
         object.__setattr__(self, "high_risk_findings", findings)
         object.__setattr__(self, "expected_sample_ids", tuple(sorted(expected)))
 
@@ -936,7 +938,12 @@ class EvolutionCertificate:
             raise CertificateError("only Ed25519 certificate signatures are supported")
         if self.schema_version != 1:
             raise CertificateError("unsupported certificate schema version")
-        if self.issued_at.tzinfo is None or self.expires_at.tzinfo is None:
+        if (
+            self.issued_at.tzinfo is None
+            or self.issued_at.utcoffset() is None
+            or self.expires_at.tzinfo is None
+            or self.expires_at.utcoffset() is None
+        ):
             raise CertificateError("certificate timestamps must be timezone-aware")
         # A verifier must be able to inspect an already-expired certificate
         # and return a structured rejection.  Issuance itself always creates
@@ -1073,7 +1080,10 @@ class MappingProxyObject(Mapping[str, object]):
         self._values = copy.deepcopy(dict(values))
 
     def __getitem__(self, key: str) -> object:
-        return self._values[key]
+        # Never expose a nested list/dict owned by the signed certificate.
+        # Otherwise a caller could mutate the apparently frozen dataclass and
+        # silently change its canonical bytes after verification.
+        return copy.deepcopy(self._values[key])
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         return iter(self._values)
@@ -1170,17 +1180,47 @@ class CertificateVerifier:
         try:
             if not isinstance(certificate, EvolutionCertificate):
                 raise CertificateError("certificate type is invalid")
+            if isinstance(target, CellAddress):
+                raise CertificateError(
+                    "certificate verification requires observed active Capsule and control version"
+                )
+            if isinstance(target, Mapping) and (
+                "control_version" not in target
+                or not any(
+                    name in target for name in ("active_capsule_digest", "expected_active_capsule")
+                )
+            ):
+                raise CertificateError(
+                    "certificate verification requires observed active Capsule and control version"
+                )
             target_obj = self._target(target, certificate)
             checks["signature"] = False
             certificate.verify_signature(self.trusted_keys)
             checks["signature"] = True
             now = self.clock()
+            if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+                raise CertificateError("certificate verifier clock must be timezone-aware")
+            if certificate.expires_at <= certificate.issued_at:
+                raise CertificateError("certificate validity interval is invalid")
+            if certificate.issued_at > now:
+                raise CertificateError("certificate is not valid yet")
+            checks["validity_interval"] = True
             if certificate.is_expired(now=now):
                 raise CertificateError("certificate is expired")
             checks["not_expired"] = True
+            if certificate.judge_policy.get("require_strict_improvement") is not True:
+                raise CertificateError(
+                    "certificate Judge policy must require a strict Pareto improvement"
+                )
+            checks["strict_pareto_policy"] = True
             if certificate.source_address != target_obj.address:
                 raise NamespaceViolation("certificate source does not match promotion target")
             checks["exact_cell_scope"] = True
+            if certificate.source_capsule_digest != certificate.expected_active_capsule:
+                raise CertificateError(
+                    "certificate baseline Capsule does not match expected active Capsule"
+                )
+            checks["active_baseline"] = True
             if certificate.expected_active_capsule != target_obj.active_capsule_digest:
                 raise CertificateError("certificate expected active Capsule is stale")
             checks["expected_active_capsule"] = True
@@ -1271,7 +1311,9 @@ class PromotionApprovalAuthority:
     def __init__(
         self, secret: bytes | None = None, *, clock: Callable[[], datetime] | None = None
     ) -> None:
-        self._secret = secret or hashlib.sha256(uuid.uuid4().bytes).digest()
+        if secret is not None and (not isinstance(secret, bytes) or not secret):
+            raise ApprovalError("approval secret cannot be empty")
+        self._secret = secret if secret is not None else hashlib.sha256(uuid.uuid4().bytes).digest()
         if not self._secret:
             raise ApprovalError("approval secret cannot be empty")
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -1474,7 +1516,14 @@ class PromotionPointer:
 
 
 class PromotionStore:
-    """Thread-safe in-memory pointer/CAS/outbox reference implementation."""
+    """Thread-safe in-memory pointer/CAS/outbox reference implementation.
+
+    The default mode keeps the same proof boundary as the durable adapter:
+    certificate promotions require a real :class:`PromotionApproval` object
+    and the caller must explicitly mark that credential as consumed.  Manual
+    CAS and boolean-only approval markers are available only through the
+    explicit ``bootstrap_mode`` escape hatch used by offline fixtures.
+    """
 
     def __init__(
         self,
@@ -1482,10 +1531,14 @@ class PromotionStore:
         *,
         receipt_signing_key: Ed25519PrivateKey | bytes | None = None,
         receipt_key_id: str = "promotion-store",
+        bootstrap_mode: bool = False,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if not isinstance(bootstrap_mode, bool):
+            raise TypeError("bootstrap_mode must be a boolean")
         self._lock = threading.RLock()
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._bootstrap_mode = bootstrap_mode
         self._receipt_key = (
             _private_key(receipt_signing_key)
             if receipt_signing_key is not None
@@ -1506,6 +1559,12 @@ class PromotionStore:
     @property
     def receipt_public_key(self) -> Ed25519PublicKey:
         return self._receipt_key.public_key()
+
+    @property
+    def bootstrap_mode(self) -> bool:
+        """Whether this store was explicitly created for offline bootstrap."""
+
+        return self._bootstrap_mode
 
     @staticmethod
     def _key(address: CellAddress) -> tuple[str, str, str, str]:
@@ -1531,12 +1590,17 @@ class PromotionStore:
         expected_control_version: int | None = None,
         control_version: int | None = None,
         certificate: EvolutionCertificate | None = None,
+        approval: PromotionApproval | None = None,
         approval_consumed: bool = False,
     ) -> PromotionReceipt:
         target_obj = target if isinstance(target, PromotionTarget) else None
         address = target_obj.address if target_obj is not None else cast(CellAddress, target)
         key = self._key(address)
         with self._lock:
+            if certificate is None and not self.bootstrap_mode:
+                raise CertificateError(
+                    "production promotion requires a verifiable evolution certificate"
+                )
             pointer = self._pointers.get(key)
             if pointer is None:
                 if target_obj is None:
@@ -1575,7 +1639,19 @@ class PromotionStore:
                     raise PromotionCASConflict("certificate control version is stale")
                 if certificate.certificate_id in self._used_certificates:
                     raise PromotionAlreadyUsed("certificate was already consumed")
-                if not approval_consumed:
+                if approval is not None and not isinstance(approval, PromotionApproval):
+                    raise ApprovalError("approval credential is invalid")
+                if approval is not None:
+                    if approval.certificate_id != certificate.certificate_id:
+                        raise NamespaceViolation("approval certificate id does not match")
+                    if approval.certificate_digest != certificate.digest:
+                        raise NamespaceViolation("approval certificate digest does not match")
+                    expected_target = target_obj if target_obj is not None else current
+                    if approval.target != expected_target:
+                        raise NamespaceViolation("approval target does not match")
+                if not self.bootstrap_mode and approval is None:
+                    raise ApprovalError("promotion requires a verifiable manual approval")
+                if not self.bootstrap_mode and not approval_consumed:
                     raise ApprovalError("promotion requires a consumed manual approval")
             if next_digest is None:
                 raise PromotionError("new active Capsule is required")
@@ -1834,6 +1910,10 @@ class EvolutionCoordinator:
         if expected_active_capsule is None:
             expected_active_capsule = source_address.capsule_digest
         _require_sha256("expected_active_capsule", expected_active_capsule)
+        if expected_active_capsule != source_address.capsule_digest:
+            raise EvolutionValidationError(
+                "evolution baseline Capsule must match the expected active Capsule"
+            )
         for name, value in (
             ("dataset_id", dataset_id),
             ("runner_id", runner_id),
@@ -2056,6 +2136,8 @@ class EvolutionCoordinator:
         self._require_live(current, EvolutionState.EVIDENCE_SEALED)
         if current.evidence is None or current.candidate_address is None:
             raise CertificateError("sealed evidence is missing")
+        if not policy.require_strict_improvement:
+            raise CertificateError("certification requires at least one strict Pareto improvement")
         decision = self.judge.evaluate(current.evidence, policy)
         if not decision.accepted:
             updated = replace(
@@ -2134,6 +2216,7 @@ class EvolutionCoordinator:
             else None,
             expected_control_version=target.control_version,
             certificate=current.certificate,
+            approval=approval,
             approval_consumed=True,
         )
         self._save(replace(current, state=EvolutionState.PROMOTED, promotion_receipt=receipt))
@@ -2336,12 +2419,13 @@ def run_evolution_demo() -> dict[str, object]:
     cross_tenant = not cross_tenant_result.valid
     expired_certificate = replace(
         certificate,
+        issued_at=datetime.now(UTC) - timedelta(minutes=2),
         expires_at=datetime.now(UTC) - timedelta(seconds=1),
         signature="",
     ).with_signature(judge_key)
     expired_result = verifier.verify(expired_certificate, target)
     expired = not expired_result.valid
-    stale_store = PromotionStore(initial=(target,))
+    stale_store = PromotionStore(initial=(target,), bootstrap_mode=True)
     stale_store.compare_and_swap(target, new_active_capsule=candidate_capsule.content_digest)
     stale_cas_reason = ""
     try:

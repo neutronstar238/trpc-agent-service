@@ -1,0 +1,833 @@
+{
+  "schema_version": 1,
+  "kind": "kind_ack_gate",
+  "generated_at": "2026-09-08T02:57:49Z",
+  "mode": "execute",
+  "lineage": {
+    "git_sha": "ff19d6d8a87d3f05c52f99e5d06492de037d12a3",
+    "source_fingerprint": {
+      "algorithm": "sha256",
+      "status": "available",
+      "value": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+      "file_count": 285,
+      "total_bytes": 5567410
+    },
+    "image": {
+      "reference": "trpc-agent-cell-fabric:kind-f5d6315ec949",
+      "registry": "trpc-agent-cell-fabric:kind-f5d6315ec949",
+      "digest": "sha256:f4b57ee3eb38459eebf1d6c01b542b145d39699d58c0e0ef9e97bc2d8807fe97",
+      "immutable": true,
+      "source": "local-loaded",
+      "shape_valid": true
+    }
+  },
+  "topology": {
+    "kind_config": "E:\\trpc-agent-cell-fabric\\deploy\\kind\\cluster.yaml",
+    "control_plane": 1,
+    "workers": 3,
+    "namespace": "trpc-cell-kind",
+    "context": "kind-trpc-cell-19472b"
+  },
+  "cluster": {
+    "name": "trpc-cell-19472b",
+    "context": "kind-trpc-cell-19472b",
+    "instance_fingerprint": "cfdcc55bf2dbcb254e2a799b021e83d1a274d0998b6b769c81d213fd543ad1cc",
+    "status": "observed",
+    "nodes": {
+      "control_plane": 1,
+      "workers": 3,
+      "total": 4
+    },
+    "created_by_gate": false,
+    "namespace": "trpc-cell-kind"
+  },
+  "preflight": {
+    "status": "pass",
+    "rejection_reasons": [],
+    "checks": {
+      "kind_files": {
+        "status": "pass"
+      },
+      "topology": {
+        "status": "pass",
+        "roles": [
+          "control-plane",
+          "worker",
+          "worker",
+          "worker"
+        ],
+        "counts": {
+          "worker": 3,
+          "control-plane": 1
+        }
+      },
+      "image": {
+        "status": "pass",
+        "reference": "trpc-agent-cell-fabric:kind-f5d6315ec949",
+        "registry": "trpc-agent-cell-fabric:kind-f5d6315ec949",
+        "digest": null,
+        "immutable": true,
+        "source": "local-loaded",
+        "shape_valid": true
+      },
+      "kustomize_render": {
+        "status": "pass",
+        "output": "E:\\trpc-agent-cell-fabric\\runs\\multitenant\\kind-ack-manifests-final.yaml",
+        "reason": null,
+        "inventory": {
+          "object_count": 58,
+          "objects": [
+            "ConfigMap/kind-fake-im-code",
+            "ConfigMap/kind-fake-provider-code",
+            "ConfigMap/kind-postgres-init",
+            "ConfigMap/trpc-service-config",
+            "Deployment/trpc-admin",
+            "Deployment/trpc-artifact-gc",
+            "Deployment/trpc-backlog-exporter",
+            "Deployment/trpc-channel-dispatcher",
+            "Deployment/trpc-gateway",
+            "Deployment/trpc-outbox-dispatcher",
+            "Deployment/trpc-post-turn-projector",
+            "Deployment/trpc-session-recovery",
+            "Deployment/trpc-wecom-connector",
+            "Deployment/trpc-worker",
+            "HorizontalPodAutoscaler/trpc-gateway",
+            "HorizontalPodAutoscaler/trpc-worker",
+            "Job/trpc-schema-migration",
+            "Namespace/trpc-cell-kind",
+            "NetworkPolicy/kind-allow-app-to-datastores",
+            "NetworkPolicy/kind-allow-app-to-support",
+            "NetworkPolicy/kind-allow-datastore-ingress",
+            "NetworkPolicy/kind-allow-dns",
+            "NetworkPolicy/kind-allow-driver-to-gateway",
+            "NetworkPolicy/kind-allow-driver-to-support",
+            "NetworkPolicy/kind-allow-evolution-driver-to-postgres",
+            "NetworkPolicy/kind-allow-support-ingress",
+            "NetworkPolicy/trpc-allow-admin-ingress",
+            "NetworkPolicy/trpc-allow-backlog-exporter",
+            "NetworkPolicy/trpc-allow-runtime",
+            "NetworkPolicy/trpc-default-deny",
+            "PodDisruptionBudget/trpc-channel-dispatcher",
+            "PodDisruptionBudget/trpc-gateway",
+            "PodDisruptionBudget/trpc-outbox-dispatcher",
+            "PodDisruptionBudget/trpc-post-turn-projector",
+            "PodDisruptionBudget/trpc-wecom-connector",
+            "PodDisruptionBudget/trpc-worker",
+            "Secret/trpc-cell-executor-secrets",
+            "Secret/trpc-cell-reconciler-secrets",
+            "Secret/trpc-evolution-authority-secrets",
+            "Secret/trpc-im-secrets",
+            "Secret/trpc-metrics-secrets",
+            "Secret/trpc-migration-secrets",
+            "Secret/trpc-redis-probe-secrets",
+            "Secret/trpc-service-secrets",
+            "Secret/trpc-tool-reconciler-secrets",
+            "Secret/trpc-worker-secrets",
+            "Service/kind-fake-im",
+            "Service/kind-fake-provider",
+            "Service/postgres",
+            "Service/redis",
+            "Service/trpc-admin",
+            "Service/trpc-backlog-exporter",
+            "Service/trpc-gateway",
+            "ServiceAccount/trpc-service",
+            "StatefulSet/kind-fake-im",
+            "StatefulSet/kind-fake-provider",
+            "StatefulSet/kind-postgres",
+            "StatefulSet/kind-redis"
+          ],
+          "namespaces": [
+            "trpc-cell-kind"
+          ],
+          "deployments": {
+            "trpc-admin": 1,
+            "trpc-artifact-gc": 0,
+            "trpc-backlog-exporter": 1,
+            "trpc-channel-dispatcher": 2,
+            "trpc-gateway": 2,
+            "trpc-outbox-dispatcher": 2,
+            "trpc-post-turn-projector": 1,
+            "trpc-session-recovery": 2,
+            "trpc-wecom-connector": 1,
+            "trpc-worker": 3
+          },
+          "missing_objects": [],
+          "missing_deployments": [],
+          "insecure_objects": []
+        }
+      }
+    }
+  },
+  "schema_migration": {
+    "status": "pass",
+    "evidence": {
+      "job": "trpc-schema-migration",
+      "namespace": "trpc-cell-kind",
+      "status": "pass"
+    },
+    "reason": null
+  },
+  "schema_migration_head": {
+    "status": "pass",
+    "evidence": {
+      "pod": "kind-postgres-0",
+      "expected_head": "0029_reconciliation_security_hardening",
+      "observed_heads": [
+        "0029_reconciliation_security_hardening"
+      ],
+      "observed_count": 1,
+      "status": "pass"
+    },
+    "reason": null
+  },
+  "workload_distribution": {
+    "status": "pass",
+    "evidence": {
+      "pod_count": 19,
+      "worker_node_count": 3,
+      "required_worker_nodes": 3,
+      "gateway_nodes": [
+        "trpc-cell-19472b-worker",
+        "trpc-cell-19472b-worker2"
+      ],
+      "backend_nodes": {
+        "kind-postgres": [
+          "trpc-cell-19472b-worker3"
+        ],
+        "kind-redis": [
+          "trpc-cell-19472b-worker3"
+        ],
+        "kind-fake-provider": [
+          "trpc-cell-19472b-worker3"
+        ]
+      },
+      "gateway_backend_cross_node": true,
+      "by_node": {
+        "trpc-cell-19472b-worker2": {
+          "kind-fake-im": 1,
+          "trpc-admin": 1,
+          "trpc-channel-dispatcher": 1,
+          "trpc-gateway": 1,
+          "trpc-session-recovery": 1,
+          "trpc-wecom-connector": 1,
+          "trpc-worker": 1
+        },
+        "trpc-cell-19472b-worker3": {
+          "kind-fake-provider": 1,
+          "kind-postgres": 1,
+          "kind-redis": 1,
+          "trpc-outbox-dispatcher": 1,
+          "trpc-post-turn-projector": 1,
+          "trpc-session-recovery": 1,
+          "trpc-worker": 1
+        },
+        "trpc-cell-19472b-worker": {
+          "trpc-backlog-exporter": 1,
+          "trpc-channel-dispatcher": 1,
+          "trpc-gateway": 1,
+          "trpc-outbox-dispatcher": 1,
+          "trpc-worker": 1
+        }
+      }
+    },
+    "reason": null
+  },
+  "node_pools": {
+    "status": "pass",
+    "evidence": {
+      "label": "trpc.io/kind-pool",
+      "control_plane_nodes": [
+        "trpc-cell-19472b-control-plane"
+      ],
+      "worker_nodes": [
+        "trpc-cell-19472b-worker",
+        "trpc-cell-19472b-worker2",
+        "trpc-cell-19472b-worker3"
+      ],
+      "worker_pools": {
+        "trpc-cell-19472b-worker": "gateway",
+        "trpc-cell-19472b-worker2": "gateway",
+        "trpc-cell-19472b-worker3": "support"
+      },
+      "mutation_attempted": false
+    },
+    "reason": null
+  },
+  "final_stability": {
+    "status": "pass",
+    "evidence": {
+      "window_seconds": 3.0,
+      "observations": [
+        {
+          "deployments": {
+            "trpc-gateway": true,
+            "trpc-worker": true,
+            "trpc-admin": true,
+            "trpc-outbox-dispatcher": true,
+            "trpc-channel-dispatcher": true,
+            "trpc-post-turn-projector": true,
+            "trpc-session-recovery": true,
+            "trpc-backlog-exporter": true,
+            "trpc-wecom-connector": true
+          },
+          "statefulsets": {
+            "kind-postgres": true,
+            "kind-redis": true,
+            "kind-fake-provider": true,
+            "kind-fake-im": true
+          },
+          "application_pod_counts": {
+            "trpc-gateway": 2,
+            "trpc-worker": 3,
+            "trpc-admin": 1,
+            "trpc-outbox-dispatcher": 2,
+            "trpc-channel-dispatcher": 2,
+            "trpc-post-turn-projector": 1,
+            "trpc-session-recovery": 2,
+            "trpc-backlog-exporter": 1,
+            "trpc-wecom-connector": 1
+          },
+          "support_pod_counts": {
+            "kind-postgres": 1,
+            "kind-redis": 1,
+            "kind-fake-provider": 1,
+            "kind-fake-im": 1
+          },
+          "support_image_ids": {
+            "kind-postgres": [
+              "sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b"
+            ],
+            "kind-redis": [
+              "sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf"
+            ],
+            "kind-fake-provider": [
+              "sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a"
+            ],
+            "kind-fake-im": [
+              "sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a"
+            ]
+          },
+          "current_replicaset_names": {
+            "trpc-gateway": "trpc-gateway-7877f88f75",
+            "trpc-worker": "trpc-worker-765444b5cc",
+            "trpc-admin": "trpc-admin-88785bbc7",
+            "trpc-outbox-dispatcher": "trpc-outbox-dispatcher-5879bfd679",
+            "trpc-channel-dispatcher": "trpc-channel-dispatcher-7699cb7546",
+            "trpc-post-turn-projector": "trpc-post-turn-projector-66c4bcdf99",
+            "trpc-session-recovery": "trpc-session-recovery-7fb6bfcd9",
+            "trpc-backlog-exporter": "trpc-backlog-exporter-64dbb6d5f9",
+            "trpc-wecom-connector": "trpc-wecom-connector-654cf6446d"
+          },
+          "candidate_probe_pods": 0,
+          "candidate_image_ids": [
+            "sha256:f4b57ee3eb38459eebf1d6c01b542b145d39699d58c0e0ef9e97bc2d8807fe97"
+          ],
+          "expected_runtime_digest": "sha256:f4b57ee3eb38459eebf1d6c01b542b145d39699d58c0e0ef9e97bc2d8807fe97",
+          "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+          "pod_set_sha256": "5b11f8402cc7de793c6a00936bc97eb641957666c5cb3a3142d0d9a7dc2fab52"
+        },
+        {
+          "deployments": {
+            "trpc-gateway": true,
+            "trpc-worker": true,
+            "trpc-admin": true,
+            "trpc-outbox-dispatcher": true,
+            "trpc-channel-dispatcher": true,
+            "trpc-post-turn-projector": true,
+            "trpc-session-recovery": true,
+            "trpc-backlog-exporter": true,
+            "trpc-wecom-connector": true
+          },
+          "statefulsets": {
+            "kind-postgres": true,
+            "kind-redis": true,
+            "kind-fake-provider": true,
+            "kind-fake-im": true
+          },
+          "application_pod_counts": {
+            "trpc-gateway": 2,
+            "trpc-worker": 3,
+            "trpc-admin": 1,
+            "trpc-outbox-dispatcher": 2,
+            "trpc-channel-dispatcher": 2,
+            "trpc-post-turn-projector": 1,
+            "trpc-session-recovery": 2,
+            "trpc-backlog-exporter": 1,
+            "trpc-wecom-connector": 1
+          },
+          "support_pod_counts": {
+            "kind-postgres": 1,
+            "kind-redis": 1,
+            "kind-fake-provider": 1,
+            "kind-fake-im": 1
+          },
+          "support_image_ids": {
+            "kind-postgres": [
+              "sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b"
+            ],
+            "kind-redis": [
+              "sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf"
+            ],
+            "kind-fake-provider": [
+              "sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a"
+            ],
+            "kind-fake-im": [
+              "sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a"
+            ]
+          },
+          "current_replicaset_names": {
+            "trpc-gateway": "trpc-gateway-7877f88f75",
+            "trpc-worker": "trpc-worker-765444b5cc",
+            "trpc-admin": "trpc-admin-88785bbc7",
+            "trpc-outbox-dispatcher": "trpc-outbox-dispatcher-5879bfd679",
+            "trpc-channel-dispatcher": "trpc-channel-dispatcher-7699cb7546",
+            "trpc-post-turn-projector": "trpc-post-turn-projector-66c4bcdf99",
+            "trpc-session-recovery": "trpc-session-recovery-7fb6bfcd9",
+            "trpc-backlog-exporter": "trpc-backlog-exporter-64dbb6d5f9",
+            "trpc-wecom-connector": "trpc-wecom-connector-654cf6446d"
+          },
+          "candidate_probe_pods": 0,
+          "candidate_image_ids": [
+            "sha256:f4b57ee3eb38459eebf1d6c01b542b145d39699d58c0e0ef9e97bc2d8807fe97"
+          ],
+          "expected_runtime_digest": "sha256:f4b57ee3eb38459eebf1d6c01b542b145d39699d58c0e0ef9e97bc2d8807fe97",
+          "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+          "pod_set_sha256": "5b11f8402cc7de793c6a00936bc97eb641957666c5cb3a3142d0d9a7dc2fab52"
+        }
+      ],
+      "stable": true
+    },
+    "reason": null
+  },
+  "scenarios": {
+    "candidate_im_gateway_probe": {
+      "status": "pass",
+      "evidence": {
+        "script": "scripts/kind_im_gateway_probe.py",
+        "pod_cleanup": {
+          "status": true
+        },
+        "placement": {
+          "status": "pass",
+          "evidence": {
+            "driver_node": "trpc-cell-19472b-worker3",
+            "remote_workload_nodes": {
+              "trpc-gateway": [
+                "trpc-cell-19472b-worker",
+                "trpc-cell-19472b-worker2"
+              ]
+            },
+            "cross_node": true
+          },
+          "reason": null
+        },
+        "probe": {
+          "schema_version": 1,
+          "probe": "kind_im_gateway_probe",
+          "scenario": "real_feishu_gateway_postgres_idempotency",
+          "status": "pass",
+          "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+          "verified_checks": [
+            "duplicate_callbacks",
+            "tenant_isolation",
+            "signature_rejection"
+          ],
+          "unknown_fields_discarded": true,
+          "callbacks_sent": 102,
+          "duplicate_callback_status_counts": {
+            "200": 100
+          },
+          "second_tenant_status": 200,
+          "invalid_signature_status": 403,
+          "secrets_reported": false
+        },
+        "probe_contract": {
+          "status": "pass",
+          "reason": null
+        }
+      },
+      "reason": null
+    },
+    "candidate_runtime_probe": {
+      "status": "pass",
+      "evidence": {
+        "script": "scripts/kind_runtime_probe.py",
+        "pod_cleanup": {
+          "status": true
+        },
+        "placement": {
+          "status": "pass",
+          "evidence": {
+            "driver_node": "trpc-cell-19472b-worker",
+            "remote_workload_nodes": {
+              "kind-postgres": [
+                "trpc-cell-19472b-worker3"
+              ],
+              "kind-fake-provider": [
+                "trpc-cell-19472b-worker3"
+              ]
+            },
+            "cross_node": true
+          },
+          "reason": null
+        },
+        "probe": {
+          "schema_version": 1,
+          "probe": "kind_runtime_probe",
+          "scenario": "kind_runtime_postgres_reconciliation",
+          "status": "pass",
+          "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+          "verified_checks": [
+            "tool_reconciliation",
+            "cell_effect_reconciliation",
+            "im_idempotency"
+          ],
+          "unknown_fields_discarded": true,
+          "provider_execute_calls": 1,
+          "provider_status_queries": 2,
+          "cell_provider_execute_calls": 1,
+          "cell_provider_status_queries": 2,
+          "rejection_reasons": [],
+          "cell_effect_reconciliation": {
+            "status": "pass",
+            "checks": {
+              "applied_to_succeeded": {
+                "status": "pass",
+                "executor_status": "ambiguous",
+                "reconciled_status": "succeeded",
+                "evidence_rows": 1,
+                "provider_execution_delta": 1
+              },
+              "unknown_blocks_replay": {
+                "status": "pass",
+                "reconciled_status": "unknown",
+                "evidence_rows": 1,
+                "automatic_replay": false
+              },
+              "stale_attempt_rejected": {
+                "status": "pass"
+              },
+              "cross_tenant_rejected": {
+                "status": "pass"
+              }
+            },
+            "rejection_reasons": []
+          }
+        },
+        "probe_contract": {
+          "status": "pass",
+          "reason": null
+        }
+      },
+      "reason": null
+    },
+    "candidate_evolution_probe": {
+      "status": "pass",
+      "evidence": {
+        "script": "scripts/kind_evolution_probe.py",
+        "pod_cleanup": {
+          "status": true
+        },
+        "placement": {
+          "status": "pass",
+          "evidence": {
+            "driver_node": "trpc-cell-19472b-worker",
+            "remote_workload_nodes": {
+              "kind-postgres": [
+                "trpc-cell-19472b-worker3"
+              ]
+            },
+            "cross_node": true
+          },
+          "reason": null
+        },
+        "probe": {
+          "schema_version": 1,
+          "probe": "kind_evolution_postgres",
+          "scenario": "kind_evolution_postgres_control",
+          "status": "pass",
+          "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+          "verified_checks": [
+            "network_egress_denial",
+            "database_identity_and_schema",
+            "concurrent_cas",
+            "certificate_approval_one_time",
+            "outbox_lease_takeover",
+            "receipt_rollback",
+            "stale_aba_rejection",
+            "cross_tenant_rejection"
+          ],
+          "unknown_fields_discarded": true,
+          "provider_calls": 0,
+          "network_egress_denied": {
+            "provider": true,
+            "im": true
+          },
+          "passed_cases": [
+            "network_egress_denial",
+            "database_identity_and_schema",
+            "concurrent_cas",
+            "certificate_approval_one_time",
+            "outbox_lease_takeover",
+            "receipt_rollback",
+            "stale_aba_rejection",
+            "cross_tenant_rejection"
+          ]
+        },
+        "probe_contract": {
+          "status": "pass",
+          "reason": null
+        },
+        "independent_provider_oracle": {
+          "status": "pass",
+          "before": {
+            "effects": 9,
+            "provider_calls": 9
+          },
+          "after": {
+            "effects": 9,
+            "provider_calls": 9
+          }
+        }
+      },
+      "reason": null
+    },
+    "candidate_redis_probe": {
+      "status": "pass",
+      "evidence": {
+        "script": "scripts/kind_redis_probe.py",
+        "pod_cleanup": {
+          "status": true
+        },
+        "placement": {
+          "status": "pass",
+          "evidence": {
+            "driver_node": "trpc-cell-19472b-worker",
+            "remote_workload_nodes": {
+              "kind-redis": [
+                "trpc-cell-19472b-worker3"
+              ]
+            },
+            "cross_node": true
+          },
+          "reason": null
+        },
+        "probe": {
+          "schema_version": 1,
+          "probe": "kind_redis_probe",
+          "scenario": "publish_idempotency_pel_takeover",
+          "status": "pass",
+          "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+          "verified_checks": [
+            "publish_once",
+            "consumer_a_pel",
+            "consumer_b_takeover",
+            "stale_owner_defer_rejected",
+            "consumer_b_ack_pel_empty",
+            "cleanup"
+          ],
+          "unknown_fields_discarded": true
+        },
+        "probe_contract": {
+          "status": "pass",
+          "reason": null
+        }
+      },
+      "reason": null
+    },
+    "worker_pod_replacement": {
+      "status": "pass",
+      "evidence": {
+        "worker_restarted": true,
+        "worker_pod_uid_changed": true,
+        "provider_metrics_preserved": true,
+        "provider_counts_before": {
+          "effects": 9,
+          "provider_calls": 9
+        },
+        "provider_counts_after": {
+          "effects": 9,
+          "provider_calls": 9
+        }
+      },
+      "reason": null
+    },
+    "provider_endpoint_recovery": {
+      "status": "pass",
+      "evidence": {
+        "provider_restarted": true,
+        "pod_uid_changed": true,
+        "provider_metrics_preserved": true,
+        "effects": 9,
+        "provider_calls": 9
+      },
+      "reason": null
+    },
+    "postgres_pod_replacement": {
+      "status": "pass",
+      "evidence": {
+        "pod_uid_changed": true,
+        "pvc_preserved": true,
+        "pvc_uid_sha256": "8e92daebcc044e83b2879489946be6cfbc385e466839ecb82d6edaebf7585235",
+        "persistent_rows_before": 1,
+        "persistent_rows_after": 1,
+        "persistent_rows_preserved": true,
+        "runtime_role_rls_marker": {
+          "created": true,
+          "survived_restart": true,
+          "cleaned": true
+        },
+        "health_smoke": true,
+        "schema_head_smoke": true,
+        "application_deployments_ready": true,
+        "application_deployments_checked": 9,
+        "db_backed_callback": {
+          "status": "pass",
+          "evidence": {
+            "script": "scripts/kind_im_gateway_probe.py",
+            "pod_cleanup": {
+              "status": true
+            },
+            "placement": {
+              "status": "pass",
+              "evidence": {
+                "driver_node": "trpc-cell-19472b-worker3",
+                "remote_workload_nodes": {
+                  "trpc-gateway": [
+                    "trpc-cell-19472b-worker",
+                    "trpc-cell-19472b-worker2"
+                  ]
+                },
+                "cross_node": true
+              },
+              "reason": null
+            },
+            "probe": {
+              "schema_version": 1,
+              "probe": "kind_im_gateway_probe",
+              "scenario": "real_feishu_gateway_postgres_idempotency",
+              "status": "pass",
+              "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+              "verified_checks": [
+                "duplicate_callbacks",
+                "tenant_isolation",
+                "signature_rejection"
+              ],
+              "unknown_fields_discarded": true,
+              "callbacks_sent": 102,
+              "duplicate_callback_status_counts": {
+                "200": 100
+              },
+              "second_tenant_status": 200,
+              "invalid_signature_status": 403,
+              "secrets_reported": false
+            },
+            "probe_contract": {
+              "status": "pass",
+              "reason": null
+            }
+          },
+          "reason": null
+        }
+      },
+      "reason": null
+    },
+    "redis_pod_replacement": {
+      "status": "pass",
+      "evidence": {
+        "pod_uid_changed": true,
+        "pvc_preserved": true,
+        "pvc_uid_sha256": "2500414e1b874f69a7e63982ab3af9bce1b2181b8bc681e8fed5275b2c0bf49a",
+        "sentinel_preserved": true,
+        "sentinel_cleaned": true,
+        "queue_after_recovery": {
+          "status": "pass",
+          "evidence": {
+            "script": "scripts/kind_redis_probe.py",
+            "pod_cleanup": {
+              "status": true
+            },
+            "placement": {
+              "status": "pass",
+              "evidence": {
+                "driver_node": "trpc-cell-19472b-worker",
+                "remote_workload_nodes": {
+                  "kind-redis": [
+                    "trpc-cell-19472b-worker3"
+                  ]
+                },
+                "cross_node": true
+              },
+              "reason": null
+            },
+            "probe": {
+              "schema_version": 1,
+              "probe": "kind_redis_probe",
+              "scenario": "publish_idempotency_pel_takeover",
+              "status": "pass",
+              "source_fingerprint": "f5d6315ec949527b928d29e6e0690fea57136b285c16ae578f87f615862d2a06",
+              "verified_checks": [
+                "publish_once",
+                "consumer_a_pel",
+                "consumer_b_takeover",
+                "stale_owner_defer_rejected",
+                "consumer_b_ack_pel_empty",
+                "cleanup"
+              ],
+              "unknown_fields_discarded": true
+            },
+            "probe_contract": {
+              "status": "pass",
+              "reason": null
+            }
+          },
+          "reason": null
+        }
+      },
+      "reason": null
+    }
+  },
+  "scenario_plan": {
+    "candidate_im_gateway_probe": {
+      "assertion": "candidate image proves Feishu callback idempotency, RLS and signature rejection",
+      "fault": "100 concurrent encrypted callbacks and one invalid signature"
+    },
+    "candidate_runtime_probe": {
+      "assertion": "candidate repositories prove duplicate IM and effect reconciliation against PostgreSQL",
+      "fault": "cross-Pod provider response loss and concurrent duplicate delivery"
+    },
+    "candidate_evolution_probe": {
+      "assertion": "candidate evolution control proves certificate, CAS and rollback invariants",
+      "fault": "tampered, expired, cross-tenant and stale promotion evidence"
+    },
+    "candidate_redis_probe": {
+      "assertion": "production RedisStreamQueue proves publish idempotency, PEL takeover and exact ACK",
+      "fault": "duplicate publish, abandoned PEL owner and XAUTOCLAIM transfer"
+    },
+    "worker_pod_replacement": {
+      "assertion": "a replacement worker becomes ready without a second provider call",
+      "fault": "worker process/pod failure"
+    },
+    "provider_endpoint_recovery": {
+      "assertion": "provider restart restores endpoint and preserves idempotency state",
+      "fault": "temporary provider endpoint outage"
+    },
+    "postgres_pod_replacement": {
+      "assertion": "PostgreSQL replacement keeps the same PVC and persistent rows while applications recover",
+      "fault": "database Pod failure and connection pool recovery"
+    },
+    "redis_pod_replacement": {
+      "assertion": "Redis replacement keeps the same PVC, preserves a sentinel and accepts a fresh RedisStreamQueue probe",
+      "fault": "Redis Pod failure, AOF recovery and client reconnect"
+    }
+  },
+  "local_k8s_gate": "pass",
+  "ack_compatibility": "not_run",
+  "production_gate": "not_run",
+  "gate": "pass",
+  "rejection_reasons": [],
+  "runtime": {
+    "status": "pass"
+  },
+  "summary": "local kind runtime gate passed; ACK and production remain not_run"
+}

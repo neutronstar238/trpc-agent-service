@@ -323,7 +323,7 @@ def test_replay_and_promotion_reject_effects_tampering_and_stale_cas() -> None:
     assert coordinator.get_run(run.run_id).state is EvolutionState.REJECTED
 
     target = PromotionTarget(address=address, active_capsule_digest=address.capsule_digest)
-    pointer_store = PromotionStore()
+    pointer_store = PromotionStore(bootstrap_mode=True)
     pointer_store.compare_and_swap(target, new_active_capsule="sha256:" + "c" * 64)
     with pytest.raises(PromotionCASConflict):
         pointer_store.compare_and_swap(

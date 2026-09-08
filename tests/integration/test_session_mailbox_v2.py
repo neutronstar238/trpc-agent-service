@@ -315,6 +315,7 @@ async def _publish_next_ready(
         "generation",
         "priority",
         "trace_id",
+        "trace_headers",
         "created_at",
     }
     ready = SessionReadyCodec.decode(fields)

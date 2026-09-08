@@ -44,8 +44,13 @@ metadata:
   name: kind-allow-driver-to-support
 spec:
   podSelector:
-    matchLabels:
-      trpc.io/component: acceptance-driver
+    matchExpressions:
+      - key: trpc.io/component
+        operator: In
+        values: [acceptance-driver]
+      - key: trpc.io/probe
+        operator: NotIn
+        values: [kind_evolution_probe]
   policyTypes: [Egress]
   egress:
     - to:
@@ -77,6 +82,29 @@ spec:
               app.kubernetes.io/name: kind-redis
       ports:
         - port: 6379
+          protocol: TCP
+---
+# Evolution evidence is generated in a simulate-only cell.  Keep the driver
+# physically unable to reach the provider/fake-IM services; PostgreSQL is its
+# sole non-DNS dependency.  The gate also compares the provider's independent
+# counters before and after the run.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kind-allow-evolution-driver-to-postgres
+spec:
+  podSelector:
+    matchLabels:
+      trpc.io/component: acceptance-driver
+      trpc.io/probe: kind_evolution_probe
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kind-postgres
+      ports:
+        - port: 5432
           protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1

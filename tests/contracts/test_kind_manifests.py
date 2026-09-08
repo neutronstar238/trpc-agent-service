@@ -332,17 +332,23 @@ def test_kind_probe_secrets_are_split_by_authority() -> None:
             secrets[metadata["name"]] = values
 
     assert set(secrets["trpc-tool-reconciler-secrets"]) == {"TRPC_KIND_TOOL_RECONCILER_DSN"}
+    assert set(secrets["trpc-cell-executor-secrets"]) == {"TRPC_KIND_CELL_EXECUTOR_DSN"}
+    assert set(secrets["trpc-cell-reconciler-secrets"]) == {"TRPC_KIND_CELL_RECONCILER_DSN"}
     assert set(secrets["trpc-evolution-authority-secrets"]) == {"TRPC_KIND_EVOLUTION_DATABASE_DSN"}
     assert set(secrets["trpc-redis-probe-secrets"]) == {"TRPC_SERVICE_REDIS_URL"}
     assert "trpc-probe-secrets" not in secrets
 
     authority_keys = {
         "TRPC_KIND_TOOL_RECONCILER_DSN",
+        "TRPC_KIND_CELL_EXECUTOR_DSN",
+        "TRPC_KIND_CELL_RECONCILER_DSN",
         "TRPC_KIND_EVOLUTION_DATABASE_DSN",
     }
     for name, values in secrets.items():
         if name not in {
             "trpc-tool-reconciler-secrets",
+            "trpc-cell-executor-secrets",
+            "trpc-cell-reconciler-secrets",
             "trpc-evolution-authority-secrets",
         }:
             assert authority_keys.isdisjoint(values)

@@ -1,8 +1,17 @@
 # ACK 验收记录
 
-本页记录 2026-09-02 对当前创新候选执行的 ACK 功能与性能验收结论，便于评审区分“真实集群验证”与
-“完整生产发布门禁”。运行报告、kubeconfig、Secret 和测试夹具均属于环境产物，不进入 Git 历史；
-仓库只保留可复现的门禁代码、部署模板和脱敏结论。
+当前本机 kind 门禁使用报告字段 `cluster.instance_fingerprint` 标识测试集群实例；它不是 ACK 的云端
+cluster UID，也不能替代 ACK/Terway/RAM/SLB 等生产证据。本页历史报告不得复制为当前版本的
+`production_gate=pass`。
+
+> **历史证据声明（重要）**：本页只记录 2026-09-02 旧候选的 ACK 运行结果，绑定下方旧
+> release、源码指纹和镜像 digest。它不属于当前 checkout 的证据，不能升级当前 HEAD 的状态。
+> 当前 checkout 的生产结论固定为 `production_gate=not_run`；除非使用当前 HEAD、同一候选
+> digest、同一 release binding 和完整外部报告重新执行，否则不得引用本页宣称当前版本已通过 ACK。
+
+本页保留旧候选的脱敏功能与性能记录，便于评审区分“历史集群验证”与“当前生产发布门禁”。运行报告、
+kubeconfig、Secret 和测试夹具均属于环境产物，不进入 Git 历史；仓库只保留可复现的门禁代码、部署模板
+和脱敏结论。
 
 ## 候选绑定
 
@@ -13,7 +22,7 @@
 - candidate binding SHA-256：`6b1a0a3fe78640def283fbdcc1029a77b44bf1c45df4dc9d4882c2adca0be614`
 - ACK 运行时通过轩辕代理拉取同一不可变 digest；候选锁复核通过。
 
-## 已通过的真实 ACK 验收
+## 旧候选的历史 ACK 验收（不可迁移到当前 HEAD）
 
 Kubernetes 运行时门禁的 `gate` 与 `production_gate` 均为 `pass`，失败和未运行检查均为 0：
 
@@ -34,7 +43,7 @@ Kubernetes 运行时门禁的 `gate` 与 `production_gate` 均为 `pass`，失�
 mailbox unresolved 均为 0。内存观测覆盖 4 个 Worker 与 1 个 Outbox Dispatcher，短时单次采样合计
 约 972 MiB；该采样不替代长时间 soak、泄漏趋势和峰值容量测试。
 
-## 本地质量门禁
+## 旧候选的历史本地质量门禁
 
 - 单元测试：2371 passed，8 skipped。
 - statement coverage：95.314%；branch coverage：90.820%；两项独立 90% 门禁通过。
@@ -48,8 +57,9 @@ mailbox unresolved 均为 0。内存观测覆盖 4 个 Worker 与 1 个 Outbox D
 
 ## 未完成的生产发布条件
 
-上述结果证明当前候选在租用 ACK 环境中的节点化部署、HPA、升级回滚、驱逐恢复和规定性能场景已经
-通过；它不等价于完整生产发布。最终 release gate 仍保持 `not_run`，主要缺少：
+上述结果只证明当时绑定的旧候选在租用 ACK 环境中的节点化部署、HPA、升级回滚、驱逐恢复和规定性能
+场景曾经通过；它不等价于当前 HEAD 或完整生产发布。当前 checkout 的 release gate 必须重新生成并
+保持 `production_gate=not_run`，主要缺少：
 
 - 企业微信与飞书真实账号、签名探针、限流、媒体和长断线接管证据；
 - 独立生产后端的 Compose/control-plane E2E、完整 Toxiproxy 故障集合；

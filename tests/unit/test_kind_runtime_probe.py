@@ -32,6 +32,8 @@ def _env_without_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         "TRPC_KIND_PROBE_RUNTIME_DSN",
         "TRPC_KIND_TOOL_RECONCILER_DSN",
         "TRPC_KIND_PROBE_RECONCILER_DSN",
+        "TRPC_KIND_CELL_EXECUTOR_DSN",
+        "TRPC_KIND_CELL_RECONCILER_DSN",
         "TRPC_KIND_PROBE_CLEANUP_DSN",
         "TRPC_KIND_PROBE_MIGRATION_DSN",
         "TRPC_KIND_PROVIDER_URL",
@@ -49,6 +51,10 @@ def test_config_reads_kind_aliases_without_printing_or_normalizing_secrets(
     monkeypatch.setenv(
         "TRPC_KIND_TOOL_RECONCILER_DSN", "postgresql://reconciler:secret@postgres/db"
     )
+    monkeypatch.setenv("TRPC_KIND_CELL_EXECUTOR_DSN", "postgresql://executor:secret@postgres/db")
+    monkeypatch.setenv(
+        "TRPC_KIND_CELL_RECONCILER_DSN", "postgresql://cell-reconciler:secret@postgres/db"
+    )
     monkeypatch.setenv("TRPC_KIND_PROVIDER_URL", "http://kind-fake-provider:8080/")
 
     config = probe.RuntimeProbeConfig.from_env()
@@ -56,6 +62,8 @@ def test_config_reads_kind_aliases_without_printing_or_normalizing_secrets(
     assert config.fixture_dsn.startswith("postgresql://runtime:")
     assert config.runtime_dsn == config.fixture_dsn
     assert config.reconciler_dsn.startswith("postgresql://reconciler:")
+    assert config.cell_executor_dsn.startswith("postgresql://executor:")
+    assert config.cell_reconciler_dsn.startswith("postgresql://cell-reconciler:")
     assert config.provider_execute_url == "http://kind-fake-provider:8080/v1/effects"
     assert config.provider_status_url.endswith("/v1/effects/{execution_key}")
     assert config.provider_metrics_url == "http://kind-fake-provider:8080/v1/metrics"
@@ -228,6 +236,16 @@ def test_source_contract_uses_real_repositories_and_has_no_http_cas() -> None:
         "asyncpg.create_pool",
         "PostgresExecutionLedger",
         "ToolExecutionReconciliationCoordinator",
+        "PostgresEffectLedger",
+        "PostgresEventStore",
+        "cell_effect_reconciliation",
+        "TRPC_KIND_CELL_EXECUTOR_DSN",
+        "TRPC_KIND_CELL_RECONCILER_DSN",
+        "applied_to_succeeded",
+        "unknown_blocks_replay",
+        "cross_tenant_rejected",
+        "lease_owner=OWNER_ID",
+        "lease_epoch=1",
         "PostgresRuntimeRepository",
         "TenantRuntime",
         "claim_ambiguous",

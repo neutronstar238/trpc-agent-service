@@ -1226,13 +1226,22 @@ class PostgresEffectLedger(_TenantRepository):
         effect_key: str,
         *,
         for_update: bool = False,
+        tenant_id: str | None = None,
     ) -> Mapping[str, object] | None:
-        row = await connection.fetchrow(
-            f"SELECT {_LEDGER_COLUMNS} FROM cell_effect_ledger "  # noqa: S608
-            "WHERE tenant_id = current_setting('app.tenant_id', true) "
-            "AND effect_key=$1" + (" FOR UPDATE" if for_update else ""),
-            effect_key,
-        )
+        if for_update and tenant_id is not None:
+            row = await connection.fetchrow(
+                f"SELECT {_LEDGER_COLUMNS} "  # noqa: S608
+                "FROM public.lock_cell_effect_reconciliation($1,$2)",
+                tenant_id,
+                effect_key,
+            )
+        else:
+            row = await connection.fetchrow(
+                f"SELECT {_LEDGER_COLUMNS} FROM cell_effect_ledger "  # noqa: S608
+                "WHERE tenant_id = current_setting('app.tenant_id', true) "
+                "AND effect_key=$1" + (" FOR UPDATE" if for_update else ""),
+                effect_key,
+            )
         return cast(Mapping[str, object] | None, dict(row) if row is not None else None)
 
     async def _ensure_ledger_placeholder(
@@ -1757,7 +1766,12 @@ class PostgresEffectLedger(_TenantRepository):
         tenant_id = self._assert_tenant(intent.tenant_id)
         async with self._tenant_transaction(tenant_id) as connection:
             await self._ensure_intent(connection, intent)
-            row = await self._get_ledger(connection, intent.effect_key, for_update=True)
+            row = await self._get_ledger(
+                connection,
+                intent.effect_key,
+                for_update=True,
+                tenant_id=tenant_id,
+            )
             if row is None:
                 raise EffectLeaseConflict("effect was not claimed")
             current = await self._with_latest_receipt(connection, row, intent=intent)
@@ -1776,9 +1790,9 @@ class PostgresEffectLedger(_TenantRepository):
             if current.status in {EffectStatus.SUCCEEDED, EffectStatus.FAILED}:
                 if current.status != expected_status:
                     raise ReconciliationConflict("effect has already reached a final state")
-                # Keep each confirming probe, but never rewrite a terminal
-                # receipt or ledger row after final convergence.
-                await self._write_reconciliation(connection, intent, evidence)
+                # A terminal row is authoritative.  Do not append a new
+                # provider proof after convergence; exact duplicate evidence
+                # was handled by the idempotency check above.
                 return current
             if current.status not in {EffectStatus.AMBIGUOUS, EffectStatus.UNKNOWN}:
                 raise ReconciliationConflict(
@@ -1787,19 +1801,25 @@ class PostgresEffectLedger(_TenantRepository):
             # Insert the immutable evidence in the same transaction as the
             # status transition.  A failed CAS rolls both writes back.
             await self._write_reconciliation(connection, intent, evidence)
-            transitioned = await connection.fetchval(
+            transitioned = await connection.fetchrow(
                 """
-                UPDATE cell_effect_ledger
-                   SET status=$3, lease_owner=NULL, lease_expires_at=NULL,
-                       updated_at=clock_timestamp()
-                 WHERE tenant_id=$1 AND effect_key=$2 AND attempt=$4
-                   AND status IN ('ambiguous', 'unknown')
-                 RETURNING effect_key
+                SELECT effect_key,status,attempt
+                  FROM public.reconcile_cell_effect_cas(
+                       $1,$2,$3,$4,$5,$6,$7,$8
+                  )
                 """,
                 intent.tenant_id,
                 intent.effect_key,
-                expected_status.value,
                 expected_attempt,
+                expected_status.value,
+                {
+                    ReconciliationOutcome.APPLIED: None,
+                    ReconciliationOutcome.NOT_APPLIED: "provider_not_applied",
+                    ReconciliationOutcome.UNKNOWN: "provider_outcome_unknown",
+                }[evidence.outcome],
+                evidence.reconciler_id,
+                evidence.outcome.value,
+                evidence.evidence_digest,
             )
             if transitioned is None:
                 latest_row = await self._get_ledger(connection, intent.effect_key)
@@ -1812,29 +1832,6 @@ class PostgresEffectLedger(_TenantRepository):
                     if latest.attempt == expected_attempt and latest.status == expected_status:
                         return latest
                 raise ReconciliationConflict("effect changed concurrently during reconciliation")
-            # The execution receipt is the current projection for an attempt;
-            # the append-only reconciliation table retains every proof that
-            # caused it to converge.  Updating only an ambiguous/unknown row
-            # avoids the old ON CONFLICT no-op leaving a stale error/status.
-            await connection.execute(
-                """
-                UPDATE cell_effect_receipts
-                   SET status=$4, error_type=$5, provider_reference=$6,
-                       attempted_at=clock_timestamp()
-                 WHERE tenant_id=$1 AND effect_key=$2 AND attempt=$3
-                   AND status IN ('ambiguous', 'unknown')
-                """,
-                intent.tenant_id,
-                intent.effect_key,
-                expected_attempt,
-                expected_status.value,
-                {
-                    ReconciliationOutcome.APPLIED: None,
-                    ReconciliationOutcome.NOT_APPLIED: "provider_not_applied",
-                    ReconciliationOutcome.UNKNOWN: "provider_outcome_unknown",
-                }[evidence.outcome],
-                evidence.reconciler_id,
-            )
             final_row = await self._get_ledger(connection, intent.effect_key)
             if final_row is None:
                 raise ReconciliationConflict("effect disappeared after reconciliation")

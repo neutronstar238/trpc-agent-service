@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -162,6 +162,19 @@ async def test_concurrent_duplicate_evidence_is_idempotent_and_conflicts_are_rej
         ledger.reconcile(intent, attempt, evidence),
     )
     assert receipts[0] == receipts[1]
+    assert len(ledger.reconciliation_history[(intent.effect_key, attempt)]) == 1
+
+    confirming = ReconciliationEvidence(
+        intent.effect_key,
+        attempt,
+        result="applied",
+        evidence_summary="provider_status_still_applied",
+        trace_id="trace-b",
+        reconciler_id="fake-provider-2",
+        observed_at=observed,
+        tenant_id=intent.tenant_id,
+    )
+    assert await ledger.reconcile(intent, attempt, confirming) == receipts[0]
     assert len(ledger.reconciliation_history[(intent.effect_key, attempt)]) == 1
 
     conflict = ReconciliationEvidence(
@@ -368,9 +381,9 @@ async def test_postgres_reconcile_is_tenant_scoped_and_uses_ambiguous_cas() -> N
         "intent_id": intent.intent_id,
         "status": "ambiguous",
         "attempt": 1,
-        "lease_owner": "worker-a",
-        "lease_epoch": 1,
-        "lease_expires_at": None,
+        "lease_owner": "reconciler-a",
+        "lease_epoch": 3,
+        "lease_expires_at": datetime.now(UTC) + timedelta(minutes=1),
         "updated_at": observed,
         "tenant_id": intent.tenant_id,
         "app_id": intent.app_id,
@@ -393,9 +406,14 @@ async def test_postgres_reconcile_is_tenant_scoped_and_uses_ambiguous_cas() -> N
             intent_row,
             ledger_row,
             receipt_row,
-            None,
+            {"effect_key": intent.effect_key, "status": "succeeded", "attempt": 1},
             {**ledger_row, "status": "succeeded"},
-            {**receipt_row, "error_type": None, "provider_reference": "fake-provider"},
+            {
+                **receipt_row,
+                "status": "succeeded",
+                "error_type": None,
+                "provider_reference": "fake-provider",
+            },
         ],
         values=[True, True],
     )
@@ -414,12 +432,22 @@ async def test_postgres_reconcile_is_tenant_scoped_and_uses_ambiguous_cas() -> N
         "ON CONFLICT (tenant_id, effect_key, attempt, evidence_digest)" in query
         for query in reconciliation_queries
     )
-    cas_queries = [query for query, _ in connection.calls if "UPDATE cell_effect_ledger" in query]
-    assert any("status IN ('ambiguous', 'unknown')" in query for query in cas_queries)
-    assert any(
-        "UPDATE cell_effect_receipts" in query and "status IN ('ambiguous', 'unknown')" in query
-        for query, _ in connection.calls
+    cas_queries = [query for query, _ in connection.calls if "reconcile_cell_effect_cas" in query]
+    assert cas_queries
+    assert all("UPDATE cell_effect_ledger" not in query for query in cas_queries)
+    assert all("UPDATE cell_effect_receipts" not in query for query in cas_queries)
+    cas_args = next(
+        args for query, args in connection.calls if "reconcile_cell_effect_cas" in query
     )
+    assert cas_args[-2:] == (evidence.outcome.value, evidence.evidence_digest)
+    lock_queries = [
+        (query, args)
+        for query, args in connection.calls
+        if "lock_cell_effect_reconciliation" in query
+    ]
+    assert lock_queries
+    assert lock_queries[0][1] == (intent.tenant_id, intent.effect_key)
+    assert "FOR UPDATE" not in lock_queries[0][0]
     assert all("raw provider" not in query.lower() for query in reconciliation_queries)
 
 
